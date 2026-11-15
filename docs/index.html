@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Omi — a small operating system with a real network stack</title>
-<meta name="description" content="Omi is a fork of vib-OS: custom kernel, flat cream shell, working TCP/IP, sound, and a browser that renders plain HTTP.">
-<meta property="og:title" content="Omi — a small operating system with a real network stack">
-<meta property="og:description" content="Custom kernel, TCP/IP from the wire up, Intel HDA sound, and a browser that renders pages it actually fetched. Forked from vib-OS.">
+<title>Omi — a flat midnight shell with its own network stack and scheduler</title>
+<meta name="description" content="Omi is a fork of vib-OS: custom kernel, flat midnight shell, TCP/IP and TLS from the wire up, own CSS engine, and a scheduler with a task manager.">
+<meta property="og:title" content="Omi — a flat midnight shell with its own network stack and scheduler">
+<meta property="og:description" content="Custom kernel: TCP/IP and TLS from the wire up, an own CSS engine, a midnight shell, and a round-robin scheduler with a task manager. Forked from vib-OS.">
 <meta property="og:type" content="website">
-<meta property="og:image" content="assets/desktop.png">
+<meta property="og:image" content="assets/context-menu.png">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -170,6 +170,7 @@
     <span class="sp"></span>
     <a class="lnk" href="#inside">inside</a>
     <a class="lnk" href="#stack">stack</a>
+    <a class="lnk" href="#processes">processes</a>
     <a class="lnk" href="#holes">limits</a>
     <a class="btn ghost" href="https://github.com/viralcode/vib-OS">upstream ↗</a>
     <a class="btn" href="#run">boot it</a>
@@ -179,27 +180,28 @@
 <main id="top">
 <div class="wrap hero">
   <div>
-    <span class="chip">forked from vib-OS · 60 files changed</span>
+    <span class="chip">forked from vib-OS · networking · css engine · processes</span>
     <h1>An operating system <em>you can read</em> in a weekend.</h1>
     <p class="lede">Omi is a small operating system you boot from a USB stick: it draws its own
-      desktop, fetches web pages over a TCP/IP stack, and plays MP3s — all from kernel code you can
-      read end to end. Forked from vib-OS, with the network, the sound and the shell added here.</p>
+      desktop, fetches pages over its own TCP/IP and TLS stacks, lays them out with its own CSS
+      engine, and switches between tasks on a 100 Hz timer. Forked from vib-OS, with the network,
+      the renderer, the shell and the first slice of a process model added here.</p>
     <div class="cta">
       <a class="btn" href="#run">Run it in QEMU</a>
       <a class="btn ghost" href="#inside">See the screens</a>
     </div>
     <div class="facts">
-      <div class="fact"><b>13,225</b><span>lines added</span></div>
-      <div class="fact"><b>7.4 MB</b><span>bootable ISO</span></div>
+      <div class="fact"><b>17,600</b><span>lines of our own</span></div>
+      <div class="fact"><b>11 MB</b><span>bootable ISO</span></div>
       <div class="fact"><b>0.7 s</b><span>limine → kernel</span></div>
-      <div class="fact"><b>0</b><span>runtime deps</span></div>
+      <div class="fact"><b>3</b><span>tasks on boot</span></div>
     </div>
   </div>
   <div class="hero-shot">
     <div class="win plain">
-      <img src="assets/omi-net-window.png" alt="Omi Net rendering the first web page, fetched over TLS">
+      <img src="assets/context-menu.png" alt="The Omi shell in midnight: task manager open, right-click menu above the taskbar">
     </div>
-    <div class="cap"><b>live capture</b><i></i>httpforever.com · 200 · 80 lines · rendered by a tag stripper</div>
+    <div class="cap"><b>live capture</b><i></i>midnight · task manager · 3 tasks · 100 hz round robin</div>
   </div>
 </div>
 
@@ -209,32 +211,56 @@
     <span><b>dhcp</b> lease 10.0.2.15</span><span><b>dns</b> A records</span>
     <span><b>tcp</b> handshake + retries</span><span><b>http/1.1</b> client</span>
     <span><b>minimp3</b> decoder</span><span><b>hda</b> 48 khz stereo</span>
-    <span><b>limine</b> timeout 0</span><span><b>no tls</b> (yet)</span>
+    <span><b>tls 1.2</b> · bearssl</span><span><b>pit</b> 100 hz</span>
+    <span><b>tasks</b> round robin</span><span><b>limine</b> timeout 0</span>
     <span>·</span><span><b>e1000</b> driver</span><span><b>arp</b> · ipv4 · icmp · udp</span>
     <span><b>dhcp</b> lease 10.0.2.15</span><span><b>dns</b> A records</span>
     <span><b>tcp</b> handshake + retries</span><span><b>http/1.1</b> client</span>
     <span><b>minimp3</b> decoder</span><span><b>hda</b> 48 khz stereo</span>
-    <span><b>limine</b> timeout 0</span><span><b>no tls</b> (yet)</span>
+    <span><b>tls 1.2</b> · bearssl</span><span><b>pit</b> 100 hz</span>
+    <span><b>tasks</b> round robin</span><span><b>limine</b> timeout 0</span>
   </div>
 </div>
 
 <section id="inside">
   <div class="wrap">
     <span class="eyebrow">what's inside</span>
-    <h2>Four apps, one address space,<br>zero servers.</h2>
-    <p class="sub">Everything runs in the kernel, because there is nothing else to run in. Each
-      window is a struct and a draw function; each driver is a file you can finish reading before
-      the coffee goes cold.</p>
+    <h2>Five apps, one address space,<br>zero servers.</h2>
+    <p class="sub">Everything still runs in the kernel, because nothing runs in user space yet. Each
+      window is a struct and a draw function, each driver is a file you can finish reading before the
+      coffee goes cold — and the newest window watches the scheduler that now sits under all of it.</p>
 
     <div class="grid2">
+      <article class="card">
+        <div class="shot"><img src="assets/start-menu.png" alt="The Omi start menu open over the midnight desktop"></div>
+        <div class="body">
+          <h3>The shell</h3>
+          <p>Windows-style bottom bar: the Omi mark is the start button, running apps become buttons,
+            and the clock sits right. Midnight is the boot appearance, drawn flat — no bevels, no drop
+            shadows, hairline borders and one accent.</p>
+          <div class="meta"><span>kernel/gui/</span> compositor.c · icons_ri.h</div>
+        </div>
+      </article>
+
       <article class="card">
         <div class="shot"><img src="assets/omi-net.png" alt="Omi Net with a real page laid out: heading, paragraphs and links"></div>
         <div class="body">
           <h3>Omi Net</h3>
-          <p>Bookmarks, an address bar you can type into, scrolling and a status strip. The page
-            comes off a real socket; the renderer is a tag stripper that wraps to a width measured
-            from the font.</p>
-          <div class="meta"><span>kernel/net/</span> http.c · tcp.c · net.c</div>
+          <p>An address bar, tabs, scrolling and a status strip — over real Gumbo HTML, a CSS box
+            model of our own, stb_truetype text, decoded images, clickable links and tables with
+            per-column widths. Over TLS, too.</p>
+          <div class="meta"><span>kernel/gui/</span> omiweb.c · net/http.c · net/tls</div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="shot"><img src="assets/task-manager.png" alt="Omi task manager listing task, state, ticks and switches"></div>
+        <div class="body">
+          <h3>Task manager</h3>
+          <p>Every task with its state, ticks, switches and share of the CPU — opened with
+            Ctrl+Alt+Del or by right-clicking the taskbar. The numbers are real: the workers do work
+            and yield, the timer counts.</p>
+          <div class="meta"><span>kernel/</span> kernel_task.c · gdt.c</div>
         </div>
       </article>
 
@@ -271,9 +297,9 @@
     <div class="wide">
       <div class="win">
         <div class="bar"><i></i><i></i><i></i><span style="margin-left:6px">the shell — 1280×800</span></div>
-        <img src="assets/start-menu.png" alt="The Omi shell with the start menu open over the desktop">
+        <img src="assets/midnight-desktop.png" alt="The Omi desktop in its default midnight appearance">
       </div>
-      <div class="cap">midnight by default · the Omi mark is the start button · every app is a window in the kernel</div>
+      <div class="cap">midnight is the boot appearance · the Omi mark is the start button · widgets report the stack, not a drawing of the weather</div>
     </div>
   </div>
 </section>
@@ -294,8 +320,9 @@
           <div class="c">// serial log, boot to first page</div>
           <div>[net] dhcp lease ip=10.0.2.15 gw=10.0.2.2 dns=10.0.2.3</div>
           <div>[net] gateway mac resolved</div>
-          <div>[net] http get example.com ...</div>
-          <div>[net] http <span class="a">200</span> len=577 title="Example Domain"</div>
+          <div>[dns] via 8.8.8.8</div>
+          <div>[net] tls 1.2 session up, root verified</div>
+          <div>[net] http <span class="a">200</span> len=577 tls=yes title="Example Domain"</div>
           <div>[net] ping 10.0.2.2 REPLY - configured and reachable</div>
         </div>
       </div>
@@ -307,8 +334,45 @@
         <div class="layer"><b>dhcp</b><span>discover → offer → request → ack, lease + gw + dns</span></div>
         <div class="layer"><b>dns</b><span>A-record query against the DHCP-provided resolver</span></div>
         <div class="layer"><b>tcp</b><span>handshake, seq/ack, retries with fresh source ports</span></div>
-        <div class="layer"><b>http/1.1</b><span>GET, header parse, content-length, failure codes</span></div>
-        <div class="layer"><b>omi net</b><span>tag stripper, wrap to measured width, status strip</span></div>
+        <div class="layer"><b>http/1.1</b><span>GET, header parse, content-length, redirects, failure codes</span></div>
+        <div class="layer"><b>tls 1.2</b><span>bearssl with a pinned root bundle, so https just works</span></div>
+        <div class="layer"><b>omi net</b><span>gumbo html, our css box model, stb_truetype, links, tables</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="processes" style="padding-top:0">
+  <div class="wrap">
+    <span class="eyebrow">starting on processes</span>
+    <h2>Three tasks,<br>one timer.</h2>
+    <p class="sub">Up to v0.2 the kernel was one loop that drew a frame and read a mouse. It now has
+      a descriptor table, a task structure and a scheduler — the floor a real process model has to
+      stand on before anything can run outside the kernel.</p>
+
+    <div class="stack">
+      <div>
+        <h3>What is actually running</h3>
+        <p>The compositor is task 0, with two workers beside it that burn measurable time and hand
+          over. The task manager reads that table directly, so a stalled scheduler is visible
+          immediately rather than silent.</p>
+        <div class="term">
+          <div class="c">// task manager, live</div>
+          <div>task      state    ticks   switches</div>
+          <div><span class="a">kernel</span>    running   2599    1185</div>
+          <div>netd      ready      460    1185</div>
+          <div>idle      ready       98    1185</div>
+          <div class="c">scheduler: round robin, 100 hz tick</div>
+        </div>
+      </div>
+      <div class="layers">
+        <div class="layer"><b>gdt + tss</b><span>installed by the kernel; limine's table is not guaranteed</span></div>
+        <div class="layer"><b>pit</b><span>100 hz on irq0, the only clock in the system</span></div>
+        <div class="layer"><b>stacks</b><span>16 kb per task, eight slots, allocated from the heap</span></div>
+        <div class="layer"><b>switch</b><span>pure assembly: six callee-saved registers and rsp</span></div>
+        <div class="layer"><b>scheduler</b><span>round robin, cooperative hand-over at yield</span></div>
+        <div class="layer"><b>accounting</b><span>ticks per task, switches per task, cpu share bar</span></div>
+        <div class="layer"><b>shell</b><span>ctrl+alt+del, or right-click the taskbar</span></div>
       </div>
     </div>
   </div>
@@ -323,9 +387,9 @@
     <div class="holes">
       <div class="hole">
         <div class="n">01</div>
-        <h4>No TLS</h4>
-        <p>There is no crypto in the kernel, so https is refused up front instead of failing
-          mysteriously. That also means no weather forecast — the widget reports link state instead.</p>
+        <h4>No user mode</h4>
+        <p>No ring 3, no page tables, no syscalls, no ELF loader. Every app is still a window inside
+          the kernel, so one bad pointer still takes the shell with it.</p>
       </div>
       <div class="hole">
         <div class="n">02</div>
@@ -336,9 +400,9 @@
       </div>
       <div class="hole">
         <div class="n">03</div>
-        <h4>No processes</h4>
-        <p>Apps are kernel-resident windows, exactly as upstream. One address space means one bug
-          can take the shell down — and no, there is no permission model.</p>
+        <h4>Cooperative, not preemptive</h4>
+        <p>The timer accounts for time but does not force a switch — tasks hand over at a yield
+          point. There is no FPU/SSE state save yet either, so both land before user space does.</p>
       </div>
     </div>
   </div>
@@ -365,8 +429,8 @@ sudo dd if=omi.iso of=/dev/sdX bs=4M status=progress</pre>
         <dl class="kv">
           <dt>base</dt><dd>viralcode/vib-OS @ 73b6429</dd>
           <dt>target</dt><dd>x86_64, BIOS + UEFI via Limine</dd>
-          <dt>diff</dt><dd>60 files, +13,225 / −807</dd>
-          <dt>iso</dt><dd>7.4 MB, boots to midnight</dd>
+          <dt>diff</dt><dd>+17,600 / −793 of our own code, plus vendored gumbo, bearssl, stb, minimp3</dd>
+          <dt>iso</dt><dd>11 MB, boots straight to midnight</dd>
           <dt>media</dt><dd>generated placeholders, not licensed music</dd>
           <dt>license</dt><dd>same as upstream</dd>
         </dl>

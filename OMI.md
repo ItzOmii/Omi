@@ -23,13 +23,19 @@ Iconography is [Remix Icon](https://icon-sets.iconify.design/ri/), baked to bitm
 Limine boots straight through — `timeout: 0`, no menu, no countdown.
 
 **Networking.** A real stack, no shims: e1000 driver, ARP, IPv4, ICMP, UDP, DHCP, DNS and TCP,
-with an HTTP/1.1 client on top (`kernel/net/`). The weather widget reports link state and whether
+with an HTTP/1.1 client on top (`kernel/net/`). The network widget reports link state and whether
 `tcp + http` actually answer; Omi Net uses the same stack for pages.
 
-**Omi Net.** A browser window with bookmark chips, a typed address bar, scrolling and a status
-strip (`http 200 · lines · scroll`). Pages are fetched over TCP and rendered by a small tag
-stripper that wraps text to a width measured from the font. HTTP only — there is no TLS in the
-kernel, so https hosts are refused up front with a plain-language reason.
+**Omi Net.** A browser window with a typed address bar, tabs, scrolling and a status strip
+(`http 200 · lines · scroll`). Pages are fetched over TCP and rendered by Gumbo plus a CSS box model
+of our own (`kernel/gui/omiweb.c`), with stb_truetype text, decoded images, clickable links and
+tables. HTTPS works: TLS 1.2 through BearSSL with a pinned root bundle (`kernel/net/roots.c`).
+
+**Processes.** GDT + TSS, a 100 Hz PIT, and a cooperative round-robin scheduler over eight task
+slots with 16 KB kernel stacks (`kernel/kernel_task.c`). The task manager window lists every task
+with state, ticks, switches and a CPU-share bar, and is reachable with Ctrl+Alt+Del or from the
+taskbar's right-click menu. There is still no ring 3, no page tables, no syscalls and no ELF
+loader — see the README's honesty section.
 
 **Sound.** Intel HDA output with a streaming API (`hda_stream_start/write/free/stop`) and an MP3
 decoder (minimp3) in `kernel/media/`. The media player streams the track from disk while it plays,
