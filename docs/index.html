@@ -180,28 +180,29 @@
 <main id="top">
 <div class="wrap hero">
   <div>
-    <span class="chip">forked from vib-OS · networking · css engine · processes</span>
+    <span class="chip">forked from vib-OS · networking · css engine · ring 3</span>
     <h1>An operating system <em>you can read</em> in a weekend.</h1>
     <p class="lede">Omi is a small operating system you boot from a USB stick: it draws its own
       desktop, fetches pages over its own TCP/IP and TLS stacks, lays them out with its own CSS
-      engine, and switches between tasks on a 100 Hz timer. Forked from vib-OS, with the network,
-      the renderer, the shell and the first slice of a process model added here.</p>
+      engine, and runs programs in user mode — each in its own address space, preempted by the
+      timer, drawing through syscalls. Forked from vib-OS, with the network, the renderer, the
+      shell and a real process model added here.</p>
     <div class="cta">
       <a class="btn" href="#run">Run it in QEMU</a>
       <a class="btn ghost" href="#inside">See the screens</a>
     </div>
     <div class="facts">
-      <div class="fact"><b>17,600</b><span>lines of our own</span></div>
+      <div class="fact"><b>21,750</b><span>lines of our own</span></div>
       <div class="fact"><b>11 MB</b><span>bootable ISO</span></div>
-      <div class="fact"><b>0.7 s</b><span>limine → kernel</span></div>
-      <div class="fact"><b>3</b><span>tasks on boot</span></div>
+      <div class="fact"><b>18</b><span>syscalls</span></div>
+      <div class="fact"><b>9</b><span>tasks on boot</span></div>
     </div>
   </div>
   <div class="hero-shot">
     <div class="win plain">
-      <img src="assets/context-menu.png" alt="The Omi shell in midnight: task manager open, right-click menu above the taskbar">
+      <img src="assets/ring3-tasks.png" alt="A ring-3 process window next to the task manager, showing the process blocked awaiting input">
     </div>
-    <div class="cap"><b>live capture</b><i></i>midnight · task manager · 3 tasks · 100 hz round robin</div>
+    <div class="cap"><b>live capture</b><i></i>ring 3 · 9 tasks · ui blocked · 100 hz preempt</div>
   </div>
 </div>
 
@@ -211,24 +212,27 @@
     <span><b>dhcp</b> lease 10.0.2.15</span><span><b>dns</b> A records</span>
     <span><b>tcp</b> handshake + retries</span><span><b>http/1.1</b> client</span>
     <span><b>minimp3</b> decoder</span><span><b>hda</b> 48 khz stereo</span>
-    <span><b>tls 1.2</b> · bearssl</span><span><b>pit</b> 100 hz</span>
-    <span><b>tasks</b> round robin</span><span><b>limine</b> timeout 0</span>
+    <span><b>tls 1.2</b> · bearssl</span><span><b>ring 3</b> · 18 syscalls</span>
+    <span><b>elf</b> programs from the ISO</span><span><b>pit</b> 100 hz · preempt</span>
+    <span><b>shm</b> between processes</span><span><b>limine</b> timeout 0</span>
     <span>·</span><span><b>e1000</b> driver</span><span><b>arp</b> · ipv4 · icmp · udp</span>
     <span><b>dhcp</b> lease 10.0.2.15</span><span><b>dns</b> A records</span>
     <span><b>tcp</b> handshake + retries</span><span><b>http/1.1</b> client</span>
     <span><b>minimp3</b> decoder</span><span><b>hda</b> 48 khz stereo</span>
-    <span><b>tls 1.2</b> · bearssl</span><span><b>pit</b> 100 hz</span>
-    <span><b>tasks</b> round robin</span><span><b>limine</b> timeout 0</span>
+    <span><b>tls 1.2</b> · bearssl</span><span><b>ring 3</b> · 18 syscalls</span>
+    <span><b>elf</b> programs from the ISO</span><span><b>pit</b> 100 hz · preempt</span>
+    <span><b>shm</b> between processes</span><span><b>limine</b> timeout 0</span>
   </div>
 </div>
 
 <section id="inside">
   <div class="wrap">
     <span class="eyebrow">what's inside</span>
-    <h2>Five apps, one address space,<br>zero servers.</h2>
-    <p class="sub">Everything still runs in the kernel, because nothing runs in user space yet. Each
-      window is a struct and a draw function, each driver is a file you can finish reading before the
-      coffee goes cold — and the newest window watches the scheduler that now sits under all of it.</p>
+    <h2>Six windows inside the kernel.<br>Programs outside it.</h2>
+    <p class="sub">The shell's own apps are still structs and draw functions compiled into the
+      kernel — that keeps the desktop fast and the source small. Anything loaded as a program runs
+      the other way: its own page tables, ring 3, and a compositor it can only talk to through
+      syscalls.</p>
 
     <div class="grid2">
       <article class="card">
@@ -344,34 +348,40 @@
 
 <section id="processes" style="padding-top:0">
   <div class="wrap">
-    <span class="eyebrow">starting on processes</span>
-    <h2>Three tasks,<br>one timer.</h2>
-    <p class="sub">Up to v0.2 the kernel was one loop that drew a frame and read a mouse. It now has
-      a descriptor table, a task structure and a scheduler — the floor a real process model has to
-      stand on before anything can run outside the kernel.</p>
+    <span class="eyebrow">user mode</span>
+    <h2>Programs in ring 3,<br>preempted by the timer.</h2>
+    <p class="sub">Each program gets its own PML4 with the kernel mapped supervisor-only, an
+      <span class="mono">int 0x80</span> gate at DPL 3, and a stack the CPU lands on when a syscall
+      takes it back to ring 0. IRQ0 preempts anything running at CPL 3 a hundred times a second, so a
+      process that never yields still cannot hold the machine.</p>
 
     <div class="stack">
       <div>
         <h3>What is actually running</h3>
-        <p>The compositor is task 0, with two workers beside it that burn measurable time and hand
-          over. The task manager reads that table directly, so a stalled scheduler is visible
-          immediately rather than silent.</p>
+        <p>The compositor is task 0. Beside it are kernel workers, three demo programs and two that
+          only exist to prove shared memory — one writes a string, the other reads it back. The
+          window process sleeps in <span class="mono">blocked</span> and costs nothing until an event
+          arrives; the spinner never yields at all, so its ticks and switches stay equal.</p>
         <div class="term">
           <div class="c">// task manager, live</div>
-          <div>task      state    ticks   switches</div>
-          <div><span class="a">kernel</span>    running   2599    1185</div>
-          <div>netd      ready      460    1185</div>
-          <div>idle      ready       98    1185</div>
-          <div class="c">scheduler: round robin, 100 hz tick</div>
+          <div>task       state    ticks   switches</div>
+          <div><span class="a">kernel</span>     running   2967    2967</div>
+          <div>spin (u)   ready     2967    2967</div>
+          <div>ui (u)     blocked      0      10</div>
+          <div>init (u)   done 7       0       2</div>
+          <div>probe (u)  killed       0       1</div>
+          <div class="c">round robin / 100 hz / (u) = ring 3</div>
         </div>
       </div>
       <div class="layers">
         <div class="layer"><b>gdt + tss</b><span>installed by the kernel; limine's table is not guaranteed</span></div>
         <div class="layer"><b>pit</b><span>100 hz on irq0, the only clock in the system</span></div>
-        <div class="layer"><b>stacks</b><span>16 kb per task, eight slots, allocated from the heap</span></div>
-        <div class="layer"><b>switch</b><span>pure assembly: six callee-saved registers and rsp</span></div>
-        <div class="layer"><b>scheduler</b><span>round robin, cooperative hand-over at yield</span></div>
-        <div class="layer"><b>accounting</b><span>ticks per task, switches per task, cpu share bar</span></div>
+        <div class="layer"><b>address space</b><span>one pml4 per program, kernel mapped supervisor-only</span></div>
+        <div class="layer"><b>syscalls</b><span>int 0x80 at dpl 3, 18 calls, args in rdi/rsi/rdx/r8</span></div>
+        <div class="layer"><b>programs</b><span>elf files on the iso, loaded and mapped by the kernel</span></div>
+        <div class="layer"><b>preemption</b><span>every task is an interrupt frame; irq0 switches at cpl 3</span></div>
+        <div class="layer"><b>sleep</b><span>blocked state + wake on input, no busy polling</span></div>
+        <div class="layer"><b>ipc</b><span>draw commands in, events out, shared frames beside</span></div>
         <div class="layer"><b>shell</b><span>ctrl+alt+del, or right-click the taskbar</span></div>
       </div>
     </div>
@@ -387,9 +397,10 @@
     <div class="holes">
       <div class="hole">
         <div class="n">01</div>
-        <h4>No user mode</h4>
-        <p>No ring 3, no page tables, no syscalls, no ELF loader. Every app is still a window inside
-          the kernel, so one bad pointer still takes the shell with it.</p>
+        <h4>No demand paging, no mmap</h4>
+        <p>User memory is fixed 4 KB frames from a 1 MB pool, with a 32 KB stack behind it. There is
+          no allocator over physical memory and no way to map memory on demand, which is the next
+          blocker for anything bigger than a demo.</p>
       </div>
       <div class="hole">
         <div class="n">02</div>
@@ -400,9 +411,10 @@
       </div>
       <div class="hole">
         <div class="n">03</div>
-        <h4>Cooperative, not preemptive</h4>
-        <p>The timer accounts for time but does not force a switch — tasks hand over at a yield
-          point. There is no FPU/SSE state save yet either, so both land before user space does.</p>
+        <h4>The network is still kernel-only</h4>
+        <p>TCP, DNS and TLS all work, but a ring-3 process cannot open a socket — the in-kernel
+          browser is the only client. Sockets, threads and a filesystem are the gaps between this and
+          anything you would call an application platform.</p>
       </div>
     </div>
   </div>
@@ -429,7 +441,7 @@ sudo dd if=omi.iso of=/dev/sdX bs=4M status=progress</pre>
         <dl class="kv">
           <dt>base</dt><dd>viralcode/vib-OS @ 73b6429</dd>
           <dt>target</dt><dd>x86_64, BIOS + UEFI via Limine</dd>
-          <dt>diff</dt><dd>+17,600 / −793 of our own code, plus vendored gumbo, bearssl, stb, minimp3</dd>
+          <dt>diff</dt><dd>21,750 lines of our own code, plus vendored gumbo, bearssl, stb, minimp3</dd>
           <dt>iso</dt><dd>11 MB, boots straight to midnight</dd>
           <dt>media</dt><dd>generated placeholders, not licensed music</dd>
           <dt>license</dt><dd>same as upstream</dd>

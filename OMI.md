@@ -31,11 +31,18 @@ with an HTTP/1.1 client on top (`kernel/net/`). The network widget reports link 
 of our own (`kernel/gui/omiweb.c`), with stb_truetype text, decoded images, clickable links and
 tables. HTTPS works: TLS 1.2 through BearSSL with a pinned root bundle (`kernel/net/roots.c`).
 
-**Processes.** GDT + TSS, a 100 Hz PIT, and a cooperative round-robin scheduler over eight task
-slots with 16 KB kernel stacks (`kernel/kernel_task.c`). The task manager window lists every task
-with state, ticks, switches and a CPU-share bar, and is reachable with Ctrl+Alt+Del or from the
-taskbar's right-click menu. There is still no ring 3, no page tables, no syscalls and no ELF
-loader — see the README's honesty section.
+**Processes.** GDT + TSS, a 100 Hz PIT, and a round-robin scheduler over twelve task slots with
+16 KB kernel stacks (`kernel/kernel_task.c`). The task manager window lists every task with state,
+ticks, switches and a CPU-share bar, and is reachable with Ctrl+Alt+Del or from the taskbar's
+right-click menu.
+
+**User mode.** Each program gets its own PML4 — the kernel's tables copied in supervisor-only, one
+slot rebuilt for the program — entered by an `iretq` into CPL 3 and served through an `int 0x80`
+gate at DPL 3. Programs are ELF files on the boot medium, loaded by `kernel/elf.c`. Scheduling is
+preemptive for ring 3: every suspended task is an interrupt frame, and IRQ0 switches it away a
+hundred times a second. The compositor acts as a server — a process sends draw commands and receives
+mouse and key events — and `SYS_SHM_GET`/`SYS_SHM_ATTACH` map the same frames into two address
+spaces. The mechanics, and the four bugs that cost a boot each, are in the README.
 
 **Sound.** Intel HDA output with a streaming API (`hda_stream_start/write/free/stop`) and an MP3
 decoder (minimp3) in `kernel/media/`. The media player streams the track from disk while it plays,
