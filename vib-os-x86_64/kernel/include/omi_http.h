@@ -3,8 +3,8 @@
  *
  * Scope: http:// and https:// (TLS 1.2 via tls.c), one request per connection,
  * and the whole body must fit the caller's buffer. Chunked bodies are
- * de-chunked so hosts that stream work anyway; redirects are reported, not
- * followed.
+ * de-chunked so hosts that stream work anyway; http_get follows up to four
+ * 301/302/303/307/308 hops (this is why google.com lands on www.google.com).
  */
 
 #ifndef _OMI_HTTP_H
@@ -18,6 +18,7 @@ typedef struct {
   int len;            /* body bytes written to the buffer */
   int truncated;      /* 1 when the body did not fit */
   int secure;         /* 1 when the fetch went over TLS */
+  char location[192];  /* Location: header of a redirect, resolved by http_get */
   char title[96];     /* <title> from the body, when there is one */
   char err[80];       /* human reason when status < 0 */
 } http_result_t;

@@ -103,15 +103,15 @@ static int dechunk(const char *src, int len, char *dst, int max) {
   dst[o] = 0;
   return o;
 }
-int http_get(const net_cfg_t *cfg, const char *url, char *body, int body_max,
-             http_result_t *res) {
+static int http_get_once(const net_cfg_t *cfg, const char *url, char *body, int body_max,
+                         http_result_t *res) {
   char host[128];
   char path[256];
   uint16_t port = 80;
   uint8_t ip[4];
 
   res->status = 0; res->len = 0; res->truncated = 0; res->secure = 0;
-  res->title[0] = 0; res->err[0] = 0;
+  res->title[0] = 0; res->err[0] = 0; res->location[0] = 0;
   if (body_max <= 0) return 0;
   body[0] = 0;
 
@@ -215,6 +215,29 @@ int http_get(const net_cfg_t *cfg, const char *url, char *body, int body_max,
       break;
     }
   }
+  /* Location: header (redirects). Header names are case-insensitive. */
+  {
+    static const char key[] = "location:";
+    for (int i = 0; i + 9 < total && i < (body_off < 0 ? total : body_off); i++) {
+      if (i && raw[i - 1] != '\n') continue;
+      int k = 0;
+      while (key[k] && i + k < total) {
+        char a = raw[i + k], b = key[k];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != b) break;
+        k++;
+      }
+      if (key[k]) continue;
+      int j = i + k;
+      while (j < total && (raw[j] == ' ' || raw[j] == '\t')) j++;
+      int o = 0;
+      while (j < total && raw[j] != '\r' && raw[j] != '\n' && o < (int)sizeof res->location - 1)
+        res->location[o++] = raw[j++];
+      res->location[o] = 0;
+      break;
+    }
+  }
+
   if (body_off < 0) return 1;         /* headers only */
 
   int chunked = 0;
@@ -234,5 +257,46 @@ int http_get(const net_cfg_t *cfg, const char *url, char *body, int body_max,
     res->len = n;
   }
   copy_title(body, res->title, sizeof res->title);
+  return 1;
+}
+/* Follows a redirect chain. Google (and most big hosts) answer a bare name with
+ * a 301 to the canonical host, so a client that refuses non-200 looks broken. */
+int http_get(const net_cfg_t *cfg, const char *url, char *body, int body_max,
+             http_result_t *res) {
+  char cur[512];
+  int n = 0;
+  for (const char *p = url; *p && n < (int)sizeof cur - 1; p++) cur[n++] = *p;
+  cur[n] = 0;
+
+  for (int hop = 0; hop < 5; hop++) {
+    if (!http_get_once(cfg, cur, body, body_max, res)) return 0;
+    int st = res->status;
+    if (st != 301 && st != 302 && st != 303 && st != 307 && st != 308) return 1;
+    if (!res->location[0]) return 1;
+
+    char next[512];
+    int o = 0;
+    if (res->location[0] == 'h' && res->location[1] == 't' && res->location[2] == 't' &&
+        res->location[3] == 'p') {
+      for (const char *p = res->location; *p && o < (int)sizeof next - 1; p++) next[o++] = *p;
+    } else {
+      /* relative: keep this request's scheme and host */
+      const char *scheme = "http://";
+      if (cur[4] == 's') scheme = "https://";
+      for (const char *p = scheme; *p && o < 200; p++) next[o++] = *p;
+      const char *hs = cur;
+      while (*hs && *hs != ':') hs++;
+      if (*hs == ':') hs++;
+      if (*hs == '/' && hs[1] == '/') hs += 2;
+      while (*hs && *hs != '/' && o < 240) next[o++] = *hs++;
+      if (res->location[0] != '/') { next[o++] = '/'; }
+      for (const char *p = res->location; *p && o < (int)sizeof next - 1; p++) next[o++] = *p;
+    }
+    next[o] = 0;
+    if (o < 8) return 1;
+
+    for (int k = 0; k < o; k++) cur[k] = next[k];
+    cur[o] = 0;
+  }
   return 1;
 }

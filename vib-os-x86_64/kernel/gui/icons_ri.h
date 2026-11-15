@@ -14,9 +14,10 @@ enum {
   ICON_STICKY = 6,         /* ri/sticky-note-line - sticky widget */
   ICON_APPEARANCE = 7,     /* ri/palette-line - appearance toggle */
   ICON_APPS = 8,           /* ri/apps-line - start menu / apps */
-  ICON_CLOSE = 9,          /* ri/close-line - window close */
-  ICON_MIN = 10,            /* ri/subtract-line - window minimise */
-  ICON_MAX = 11,            /* ri/fullscreen-line - window maximise */
+  ICON_TASKS = 9,          /* ri/cpu-line - task manager app */
+  ICON_CLOSE = 10,          /* ri/close-line - window close */
+  ICON_MIN = 11,            /* ri/subtract-line - window minimise */
+  ICON_MAX = 12,            /* ri/fullscreen-line - window maximise */
   ICON_COUNT
 };
 

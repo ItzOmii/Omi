@@ -5,7 +5,9 @@
 
 #include "../include/gui.h"
 #include "../include/limine.h"
+#include "../include/gdt.h"
 #include "../include/idt.h"
+#include "../include/task.h"
 #include "../include/acpi.h"
 #include "../include/string.h"
 #include "../include/types.h"
@@ -303,8 +305,10 @@ void _start(void) {
   cpu_setup_fs_canary();
 
   /* Initialize IDT/PIC (interrupts still disabled by default) */
+  gdt_init();              /* own GDT + TSS before any interrupt */
   idt_init();
   pic_init();
+  task_system_start();     /* PIT + IRQ0, scheduler ready */
 
   /* Verify base revision was accepted */
   if (limine_base_revision[2] != 0) {
@@ -440,6 +444,7 @@ void _start(void) {
   serial_puts("Enabling interrupts...\n");
   __asm__ volatile("sti");
 
+  task_demo_start();
   serial_puts("Starting main loop...\n");
 
   /* Main rendering loop */

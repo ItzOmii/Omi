@@ -62,6 +62,9 @@ int ps2_get_mouse_x(void);
 int ps2_get_mouse_y(void);
 int ps2_get_mouse_buttons(void);
 
+/* Ctrl+Alt+Del was pressed since the last call (latched, then cleared) */
+int ps2_take_ctrl_alt_del(void);
+
 /* External mouse state (for direct access) */
 extern volatile int ps2_mouse_x;
 extern volatile int ps2_mouse_y;

@@ -18,11 +18,16 @@
 #include "meep_font.h"
 #include "icons_ri.h"
 #include "omi_net.h"
+#include "../include/task.h"
 #include "limine_modules.h"
 #include "mp3.h"
 #include "../include/hda.h"
 #include "omi_http.h"
 #include "omiweb.h"
+#include "ttf.h"
+#include "webimg.h"
+
+static const web_image_t *on_page_image(const char *src, int len);
 #include "omi_tls.h"
 
 /* External font data */
@@ -2384,7 +2389,7 @@ typedef struct { const char *label; const char *kbd; } mitem;
 
 /* MeepOS is its own OS, not a front-end for the house dashboard: only the apps
    that were actually asked for live here (plus the widgets, below). */
-enum { APP_NONE = 0, APP_CALC, APP_NOTES, APP_MEDIA, APP_BROWSER, APP_COUNT };
+enum { APP_NONE = 0, APP_CALC, APP_NOTES, APP_MEDIA, APP_BROWSER, APP_TASKS, APP_COUNT };
 
 typedef struct { int open, x, y, w, h; int min; } meep_app_t;
 
@@ -2669,6 +2674,77 @@ static void calc_label(int i, char *out) {
   }
 }
 
+
+/* Task manager: the scheduler's own view of itself. */
+static void u64s(uint64_t v, char *out) {
+  char tmp[24]; int n = 0;
+  if (!v) { out[0] = '0'; out[1] = 0; return; }
+  while (v && n < 23) { tmp[n++] = (char)('0' + (v % 10)); v /= 10; }
+  int i = 0;
+  while (n > 0) out[i++] = tmp[--n];
+  out[i] = 0;
+}
+
+static void draw_tasks(void) {
+  meep_app_t *a = &mapp[APP_TASKS];
+  if (!a->open) return;
+  int nt = task_count();
+  char sub[24];
+  u64s((uint64_t)nt, sub);
+  int sl = 0; while (sub[sl]) sl++;
+  const char *tail = " tasks";
+  for (int i = 0; tail[i] && sl < 22; i++) sub[sl++] = tail[i];
+  sub[sl] = 0;
+  app_win(a->x, a->y, a->w, a->h, "task manager", sub, mapp_focus == APP_TASKS);
+
+  int x0 = a->x + UI_SCALE_VAL(14), y0 = a->y + APP_TITLE_H + UI_SCALE_VAL(14);
+  int lh = meep_line_h(&meep_m100);
+  int cx_name = x0, cx_state = x0 + UI_SCALE_VAL(108);
+  int cx_ticks = x0 + UI_SCALE_VAL(196), cx_sw = x0 + UI_SCALE_VAL(268);
+
+  meep_text(&meep_m100, cx_name,  y0, "task",     MEEP_INK_SOFT);
+  meep_text(&meep_m100, cx_state, y0, "state",    MEEP_INK_SOFT);
+  meep_text(&meep_m100, cx_ticks, y0, "ticks",    MEEP_INK_SOFT);
+  meep_text(&meep_m100, cx_sw,    y0, "switches", MEEP_INK_SOFT);
+  y0 += lh + UI_SCALE_VAL(6);
+  fb_fill_rect(x0, y0, a->w - 2 * UI_SCALE_VAL(14), 1, MEEP_LINE_SOFT);
+  y0 += UI_SCALE_VAL(6);
+
+  uint64_t total = 0;
+  for (int i = 0; i < nt; i++) {
+    task_t *t = task_at(i);
+    if (t) total += t->ticks;
+  }
+  if (!total) total = 1;
+
+  for (int i = 0; i < nt && y0 + lh < a->y + a->h - UI_SCALE_VAL(10); i++) {
+    task_t *t = task_at(i);
+    if (!t) break;
+    uint32_t ink = (t->state == TASK_RUN) ? MEEP_INK : MEEP_INK_SOFT;
+    if (t->state == TASK_RUN)
+      fb_fill_rect(x0 - UI_SCALE_VAL(6), y0 + lh / 2 - 2, 4, 4, MEEP_ACCENT_INK);
+    meep_text(&meep_m100, cx_name,  y0, t->name, ink);
+    meep_text(&meep_m100, cx_state, y0, task_state_name(t->state), ink);
+    char buf[24];
+    u64s(t->ticks, buf);
+    meep_text(&meep_m100, cx_ticks, y0, buf, ink);
+    u64s(t->switches, buf);
+    meep_text(&meep_m100, cx_sw, y0, buf, ink);
+
+    /* share of cpu, as a bar under the row */
+    int bw = a->w - 2 * UI_SCALE_VAL(14);
+    int filled = (int)((t->ticks * (uint64_t)bw) / total);
+    if (filled > bw) filled = bw;
+    int by = y0 + lh + 1;
+    fb_fill_rect(x0, by, bw, 2, MEEP_LINE_SOFT);
+    if (filled > 0) fb_fill_rect(x0, by, filled, 2, MEEP_ACCENT);
+    y0 += lh + UI_SCALE_VAL(8);
+  }
+
+  meep_text(&meep_m100, x0, a->y + a->h - UI_SCALE_VAL(18),
+            "scheduler: round robin, 100 hz tick", MEEP_INK_SOFT);
+}
+
 static void draw_calc(void) {
   meep_app_t *a = &mapp[APP_CALC];
   if (!a->open) return;
@@ -2917,11 +2993,16 @@ static void draw_bigclock(void) {
   int apw = meep_text_w(&meep_m115, ampm);
   int avail = w->w - 24 - apw - 6;
   int h = 34;
-  int tw = big_w(h, hm);
-  while (tw > avail && h > 18) { h -= 2; tw = big_w(h, hm); }
+  int ttf = ttf_ready();
+  int tw = ttf ? ttf_width(TTF_DISPLAY, h, hm) : big_w(h, hm);
+  while (tw > avail && h > 18) {
+    h -= 2;
+    tw = ttf ? ttf_width(TTF_DISPLAY, h, hm) : big_w(h, hm);
+  }
   int x = w->x + 12;
   int ty = by + 9;
-  big_text(x, ty, h, hm, MEEP_INK);
+  if (ttf) ttf_draw(TTF_DISPLAY, h, x, ty + ttf_ascent(TTF_DISPLAY, h), hm, MEEP_INK);
+  else big_text(x, ty, h, hm, MEEP_INK);
   meep_text(&meep_m115, x + tw + 9, ty + h - meep_line_h(&meep_m115) - 3, ampm,
             MEEP_INK_SOFT);
 
@@ -3227,10 +3308,6 @@ static int  on_caret;
 static int  on_status;
 static http_result_t on_res;
 
-static const char *on_bm[] = {"example.com", "info.cern.ch", "https://example.com",
-                              "https://info.cern.ch"};
-#define ON_NBM 3
-
 static int on_lc(char c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
 static int on_tag(const char *s, int len, int i, const char *name, int *closing) {
@@ -3269,7 +3346,58 @@ static void web_relayout(void) {
   if (on_state != 2 || !on_text[0]) return;
   int cw = mapp[APP_BROWSER].w - 2 * ON_PAD_L;
   if (cw < 120) cw = 120;
+  web_image_provider(on_page_image);
   if (web_build(on_text, (int)strlen(on_text), cw, web_measure) == 0) on_nlines = web_height();
+}
+
+
+/* page images: bilinear, 16.16 fixed point, clipped to the window.
+ * Weights are 0..256 in each axis and the four of them sum to 65536, so the
+ * accumulation must be shifted by 16 - dividing by 256 lets a channel spill
+ * into the next one and the result looks like noise. */
+static void blit_scaled(int dx, int dy, int dw, int dh, const uint32_t *src,
+                        int sw, int sh, int clip_y, int clip_b) {
+  if (!backbuffer || !src || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+  uint32_t sx = (uint32_t)((sw << 16) / dw), sy = (uint32_t)((sh << 16) / dh);
+  int W = (int)screen_width;
+  for (int y = 0; y < dh; y++) {
+    int py = dy + y;
+    if (py < clip_y || py >= clip_b) continue;
+    uint32_t fy = (uint32_t)y * sy;
+    int y0 = (int)(fy >> 16), y1 = y0 + 1 < sh ? y0 + 1 : sh - 1;
+    int wy = (int)((fy >> 8) & 0xFF);
+    const uint32_t *r0 = src + (size_t)y0 * sw, *r1 = src + (size_t)y1 * sw;
+    uint32_t *dst = backbuffer + (size_t)py * W;
+    for (int x = 0; x < dw; x++) {
+      int px = dx + x;
+      if (px < 0 || px >= W) continue;
+      uint32_t fx = (uint32_t)x * sx;
+      int x0 = (int)(fx >> 16), x1 = x0 + 1 < sw ? x0 + 1 : sw - 1;
+      int wx = (int)((fx >> 8) & 0xFF);
+      int w00 = (256 - wx) * (256 - wy), w01 = wx * (256 - wy);
+      int w10 = (256 - wx) * wy,        w11 = wx * wy;
+      uint32_t c00 = r0[x0], c01 = r0[x1], c10 = r1[x0], c11 = r1[x1];
+      uint32_t r = (uint32_t)((((c00 >> 16) & 0xFF) * w00 + ((c01 >> 16) & 0xFF) * w01 +
+                               ((c10 >> 16) & 0xFF) * w10 + ((c11 >> 16) & 0xFF) * w11) >> 16);
+      uint32_t g = (uint32_t)((((c00 >> 8) & 0xFF) * w00 + ((c01 >> 8) & 0xFF) * w01 +
+                               ((c10 >> 8) & 0xFF) * w10 + ((c11 >> 8) & 0xFF) * w11) >> 16);
+      uint32_t b = (uint32_t)(((c00 & 0xFF) * w00 + (c01 & 0xFF) * w01 +
+                               (c10 & 0xFF) * w10 + (c11 & 0xFF) * w11) >> 16);
+      if (r > 255) r = 255;
+      if (g > 255) g = 255;
+      if (b > 255) b = 255;
+      dst[px] = (r << 16) | (g << 8) | b;
+    }
+  }
+}
+
+
+static const web_image_t *on_page_image(const char *src, int len) {
+  static web_image_t v;
+  const oweb_image_t *im = webimg_get(src, len);
+  if (!im) return 0;
+  v.w = im->w; v.h = im->h; v.px = im->px;
+  return &v;
 }
 
 static void draw_web(int x, int y, int bottom) {
@@ -3283,7 +3411,9 @@ static void draw_web(int x, int y, int bottom) {
     if (oy + oh < y - 2) continue;
     if (o->kind == 0) {
       if (o->h <= 0) continue;
-      meep_box(x + o->x, oy, o->w, o->h, 0, o->color, o->color);
+      meep_box(x + o->x, oy, o->w, o->h, o->radius, o->color, o->color);
+    } else if (o->kind == 3 && o->px) {
+      blit_scaled(x + o->x, oy, o->w, o->h, o->px, o->iw, o->ih, y, bottom);
     } else if (o->kind == 2) {
       meep_hline(x + o->x, oy, o->w, 1, o->color);
     } else if (o->text) {
@@ -3326,22 +3456,11 @@ static void on_load(void) {
   {
     int cw = mapp[APP_BROWSER].w - 2 * ON_PAD_L;
     if (cw < 120) cw = 120;
+    web_image_provider(on_page_image);
     if (web_build(on_text, n, cw, web_measure) != 0) { on_state = 3; on_status = -4; return; }
 
   }
   on_nlines = web_height();
-}
-
-static void on_chip_rect(int i, int *x, int *y, int *w, int *h) {
-  meep_app_t *a = &mapp[APP_BROWSER];
-  int ty = a->y + APP_TITLE_H;
-  int x0 = a->x + 10;
-  for (int k = 0; k < i; k++)
-    x0 += meep_text_w(&meep_m100, on_bm[k]) + 26;
-  *x = x0;
-  *y = ty + 8;
-  *w = meep_text_w(&meep_m100, on_bm[i]) + 16;
-  *h = 20;
 }
 
 static void draw_browser(void) {
@@ -3354,17 +3473,8 @@ static void draw_browser(void) {
 
   int ty = a->y + APP_TITLE_H;
 
-  /* bookmarks, in place of the old "new tab" pill */
-  for (int i = 0; i < ON_NBM; i++) {
-    int x, y, w, h;
-    on_chip_rect(i, &x, &y, &w, &h);
-    meep_box(x, y, w, h, 6, MEEP_LINE, MEEP_PAPER3);
-    meep_text(&meep_m100, x + 8, y + (h - meep_line_h(&meep_m100)) / 2,
-              on_bm[i], MEEP_INK_SOFT);
-  }
-
   /* address pill: typed text, with a caret when focused */
-  int uy = ty + 34, uw = a->w - 20;
+  int uy = ty + 10, uw = a->w - 20;
   meep_box(a->x + 10, uy, uw, 24, 12, MEEP_LINE, MEEP_PAPER2);
   int tw = meep_text_w(&meep_m100, on_url);
   int avail = uw - 22;
@@ -3471,6 +3581,7 @@ static void app_defaults(int id, int *x, int *y, int *w, int *h) {
     case APP_NOTES: *x = 400; *y = 300; *w = 430; *h = 360; break;
     case APP_MEDIA: *x = 300; *y = 190; *w = 420; *h = 260; break;
     case APP_BROWSER: *x = 230; *y = 150; *w = 470; *h = 300; break;
+    case APP_TASKS:   *x = 250; *y = 170; *w = 460; *h = 300; break;
     default:        *x = 240; *y = 140; *w = 520; *h = 340; break;
   }
 }
@@ -3572,6 +3683,7 @@ static int app_icon(int id) {
     case APP_NOTES:   return ICON_NOTES;
     case APP_MEDIA:   return ICON_MEDIA;
     case APP_BROWSER: return ICON_BROWSER;
+    case APP_TASKS:   return ICON_TASKS;
     default:          return ICON_APPS;
   }
 }
@@ -3582,6 +3694,7 @@ static const char *app_title(int id) {
     case APP_NOTES:   return "notes";
     case APP_MEDIA:   return "media player";
     case APP_BROWSER: return "omi net";
+    case APP_TASKS:   return "task manager";
   }
   return "";
 }
@@ -3621,6 +3734,7 @@ static const sm_item sm_rows[] = {
   {"notes",          1, APP_NOTES},
   {"media player",   1, APP_MEDIA},
   {"omi net",        1, APP_BROWSER},
+  {"task manager",   1, APP_TASKS},
   {0, 0, 0},
   {"clock widget",   2, WG_CLOCK},
   {"weather widget", 2, WG_WEATHER},
@@ -3710,9 +3824,9 @@ static void draw_start_menu(void) {
        palette; separators have none */
     int ic = -1;
     if (sm_rows[i].kind == 1) {
-      static const int app_ic[] = { ICON_CALC, ICON_NOTES, ICON_MEDIA, ICON_BROWSER };
+      static const int app_ic[] = { ICON_CALC, ICON_NOTES, ICON_MEDIA, ICON_BROWSER, ICON_TASKS };
       int a = sm_rows[i].arg - 1;   /* app ids are 1-based (APP_NONE == 0) */
-      ic = (a >= 0 && a < 4) ? app_ic[a] : ICON_APPS;
+      ic = (a >= 0 && a < 5) ? app_ic[a] : ICON_APPS;
     } else if (sm_rows[i].kind == 2) {
       static const int wg_ic[] = { ICON_STICKY, ICON_WEATHER, ICON_CLOCK };
       int w = sm_rows[i].arg;
@@ -3809,6 +3923,136 @@ static void draw_taskbar_text(void) {
   }
 }
 
+
+/* ---- taskbar context menu (right-click, like windows) ------------------ */
+static int SX;          /* supersample factor, defined with the ss buffer below */
+#define CTM_W_BASE 200
+#define CTM_ROW_H   28
+
+static int ctm_open = 0, ctm_x = 0, ctm_y = 0, ctm_hover = -1;
+
+static const char *const ctm_items[] = {
+  "task manager", "appearance", "close all windows"
+};
+#define CTM_N ((int)(sizeof(ctm_items) / sizeof(ctm_items[0])))
+
+static int ctm_h(void) { return UI_SCALE_VAL(CTM_ROW_H) * CTM_N + UI_SCALE_VAL(10); }
+
+/* Anchored to the click, opening upwards like a taskbar menu; clamped on screen.
+ * The anchor is stored in 1x pixels, so a caller drawing into the supersampled
+ * buffer passes that buffer's scale as k (the same trick draw_cursor uses). */
+static void ctm_rect_k(int *x, int *y, int *w, int *h, int k) {
+  int cw = UI_SCALE_VAL(CTM_W_BASE), ch = ctm_h();
+  int px = ctm_x * k;
+  /* sit entirely above the bar: a menu that overlaps it gets clipped by the
+     chrome pass, and the bottom row would be unreadable */
+  int py = taskbar_y() * k - ch - UI_SCALE_VAL(6);
+  if (py < UI_SCALE_VAL(8)) py = UI_SCALE_VAL(8);
+  if (px + cw > (int)screen_width - UI_SCALE_VAL(8))
+    px = (int)screen_width - UI_SCALE_VAL(8) - cw;
+  if (px < UI_SCALE_VAL(8)) px = UI_SCALE_VAL(8);
+  *x = px; *y = py; *w = cw; *h = ch;
+}
+static void ctm_rect(int *x, int *y, int *w, int *h) {
+  ctm_rect_k(x, y, w, h, 1);
+}
+
+static int ctm_row_at(int x, int y) {
+  int px, py, pw, ph;
+  ctm_rect(&px, &py, &pw, &ph);
+  if (x < px || x >= px + pw || y < py || y >= py + ph) return -1;
+  int r = (y - py - UI_SCALE_VAL(5)) / UI_SCALE_VAL(CTM_ROW_H);
+  if (r < 0 || r >= CTM_N) return -1;
+  return r;
+}
+
+static void ctm_activate(int r) {
+  ctm_open = 0;
+  if (r == 0) {
+    app_open(APP_TASKS);
+    mapp_focus = APP_TASKS;
+    z_top(APP_TASKS);
+  } else if (r == 1) {
+    meep_apply_appearance(!appearance_dark);
+  } else if (r == 2) {
+    for (int i = 1; i < APP_COUNT; i++) mapp[i].open = 0;
+    if (mapp_focus > 0) mapp_focus = APP_NONE;
+  }
+  needs_redraw = 1;
+  full_redraw = 1;
+}
+
+static void draw_ctm(void) {
+  if (!ctm_open) return;
+  int px, py, pw, ph;
+  ctm_rect_k(&px, &py, &pw, &ph, SX);
+  meep_box(px, py, pw, ph, UI_SCALE_VAL(8), MEEP_LINE, MEEP_PAPER2);
+  for (int i = 0; i < CTM_N; i++) {
+    if (i != ctm_hover) continue;
+    meep_box(px + UI_SCALE_VAL(4), py + UI_SCALE_VAL(5) + i * UI_SCALE_VAL(CTM_ROW_H),
+             pw - UI_SCALE_VAL(8), UI_SCALE_VAL(CTM_ROW_H), UI_SCALE_VAL(6),
+             MEEP_ACCENT, MEEP_ACCENT);
+  }
+}
+
+static void draw_ctm_text(void) {
+  if (!ctm_open) return;
+  int px, py, pw, ph;
+  ctm_rect(&px, &py, &pw, &ph);
+  for (int i = 0; i < CTM_N; i++) {
+    int ry = py + UI_SCALE_VAL(5) + i * UI_SCALE_VAL(CTM_ROW_H);
+    int ly = ry + (UI_SCALE_VAL(CTM_ROW_H) - meep_line_h(&meep_s130)) / 2;
+    uint32_t col = (i == ctm_hover) ? MEEP_ACCENT_INK : MEEP_INK;
+    meep_text(&meep_s130, px + UI_SCALE_VAL(14), ly, ctm_items[i], col);
+  }
+}
+
+/* Ctrl+Alt+Del behaves like windows: raise it if it is already open. */
+static void open_task_manager(void) {
+  if (!mapp[APP_TASKS].open) app_open(APP_TASKS);
+  else mapp[APP_TASKS].min = 0;
+  mapp_focus = APP_TASKS;
+  z_top(APP_TASKS);
+  start_open = 0;
+  ctm_open = 0;
+  needs_redraw = 1;
+  full_redraw = 1;
+}
+
+/* Resolve an href against the page we are on: absolute, protocol-relative,
+ * root-relative or sibling-relative. Anything else (mailto:, javascript:)
+ * returns empty and the click is ignored. */
+static void on_resolve_url(const char *href, char *out, int cap) {
+  out[0] = 0;
+  if (!href || !*href) return;
+  int n = 0;
+  if (!strncmp(href, "http://", 7) || !strncmp(href, "https://", 8)) {
+    while (href[n] && n < cap - 1) { out[n] = href[n]; n++; }
+  } else if (href[0] == '/' && href[1] == '/') {
+    const char *pre = "https:";
+    while (pre[0] && n < cap - 1) out[n++] = *pre++;
+    while (*href && n < cap - 1) out[n++] = *href++;
+  } else if (href[0] == '/') {
+    const char *scheme = (!strncmp(on_url, "https://", 8)) ? "https://" : "http://";
+    int sl = (int)strlen(scheme);
+    for (int i = 0; i < sl && n < cap - 1; i++) out[n++] = scheme[i];
+    const char *hs = on_url + sl;
+    while (*hs && *hs != '/' && n < cap - 1) out[n++] = *hs++;
+    while (*href && n < cap - 1) out[n++] = *href++;
+  } else if (href[0] == '#') {
+    return;                              /* in-page anchors are not handled */
+  } else {
+    const char *base = on_url;
+    const char *last = 0;
+    for (const char *q = base; *q; q++) if (*q == '/') last = q;
+    if (!last) return;
+    last++;                              /* keep the trailing slash */
+    while (base < last && n < cap - 1) out[n++] = *base++;
+    while (*href && n < cap - 1) out[n++] = *href++;
+  }
+  out[n] = 0;
+}
+
 static int apps_click(int x, int y, int button) {
   if (button == 2) return 0;
   if (zl_n == 0) z_init();
@@ -3861,6 +4105,25 @@ static int apps_click(int x, int y, int button) {
       needs_redraw = 1; return 1;
     }
     if (y < a->y + APP_TITLE_H) { drag_app = e; drag_dx = x - a->x; drag_dy = y - a->y; needs_redraw = 1; return 1; }
+    if (e == APP_BROWSER && on_state == 2) {
+      int ox = a->x + ON_PAD_L, oy = a->y + APP_TITLE_H + 52;
+      int pbottom = a->y + a->h - 26;
+      if (y >= oy && y < pbottom && x >= ox) {
+        const char *href = web_hit_link(x - ox, y - oy + on_scroll);
+        if (href) {
+          char u[256];
+          on_resolve_url(href, u, (int)sizeof u);
+          if (u[0]) {
+            int k = 0;
+            while (u[k] && k < (int)sizeof on_url - 1) { on_url[k] = u[k]; k++; }
+            on_url[k] = 0;
+            on_load();
+          }
+          needs_redraw = 1;
+          return 1;
+        }
+      }
+    }
     if (e == APP_CALC) calc_body_click(x, y);
     if (e == APP_MEDIA) {
       int bx = a->x + 14;
@@ -3870,19 +4133,6 @@ static int apps_click(int x, int y, int button) {
         else if (!mp_start()) mp_playing = 0;
         needs_redraw = 1;
         return 1;
-      }
-    }
-    if (e == APP_BROWSER) {
-      for (int i = 0; i < ON_NBM; i++) {
-        int cx, cy, cw, ch;
-        on_chip_rect(i, &cx, &cy, &cw, &ch);
-        if (x >= cx && x < cx + cw && y >= cy && y < cy + ch) {
-          int k = 0;
-          while (on_bm[i][k] && k < (int)sizeof(on_url) - 1) { on_url[k] = on_bm[i][k]; k++; }
-          on_url[k] = 0;
-          on_load();
-          return 1;
-        }
       }
     }
     needs_redraw = 1;
@@ -3964,6 +4214,7 @@ static void apps_draw(void) {
     }
     if (!mapp[e].open || mapp[e].min) continue;
     if (e == APP_CALC)  draw_calc();
+    if (e == APP_TASKS) draw_tasks();
     else if (e == APP_NOTES) draw_notes();
     else if (e == APP_MEDIA) draw_media();
     else if (e == APP_BROWSER) draw_browser();
@@ -4074,6 +4325,10 @@ static void update_hover(void) {
     }
   }
   int sh = start_open ? sm_row_at(mouse_x, mouse_y) : -1;
+  {
+    int ch = ctm_open ? ctm_row_at(mouse_x, mouse_y) : -1;
+    if (ch != ctm_hover) { ctm_hover = ch; needs_redraw = 1; }
+  }
   if (nh != tb_hover || sh != start_hover) {
     tb_hover = nh;
     start_hover = sh;
@@ -4695,6 +4950,24 @@ static int appearance_hit(int x, int y) {
 }
 
 static void handle_mouse_click(int x, int y, int button) {
+  if (ctm_open) {                       /* the menu owns the next click */
+    int r = ctm_row_at(x, y);
+    if (r >= 0) { ctm_activate(r); return; }
+    ctm_open = 0;
+    needs_redraw = 1;
+    full_redraw = 1;
+    /* fall through: the click still lands where it was aimed */
+  }
+  if (button == 2 && y >= taskbar_y()) {  /* right-click the bar itself */
+    ctm_open = 1;
+    ctm_x = x;
+    ctm_y = y;
+    ctm_hover = -1;
+    start_open = 0;
+    needs_redraw = 1;
+    full_redraw = 1;
+    return;
+  }
   if (button == 2) {                       /* right click dismisses */
     if (open_menu >= 0) { open_menu = -1; hover_item = -1; }
     return;
@@ -5229,6 +5502,7 @@ static void gui_draw_all(void) {
     draw_start_menu();
     draw_cursor(mouse_x, mouse_y);
     draw_taskbar_text();
+    draw_ctm_text();
     return;
   }
 
@@ -5243,6 +5517,10 @@ static void gui_draw_all(void) {
   if (start_open) {                          /* the start menu needs its own region */
     sm_rect(&px, &py, &pw, &ph);
     px -= 4; py -= 4; pw += 8; ph += 8;      /* slack for the radius + shadow */
+  }
+  if (ctm_open) {                            /* same idea for the context menu */
+    ctm_rect(&px, &py, &pw, &ph);
+    px -= 4; py -= 4; pw += 8; ph += 8;
   }
 
   /* 3. repaint last frame's shell pixels from the wallpaper (kills the old cursor) */
@@ -5262,6 +5540,7 @@ static void gui_draw_all(void) {
   menu_bar_height = 0;
 
   draw_start_menu();                       /* under the bar, above the windows */
+  draw_ctm();
   draw_taskbar();
   draw_cursor(mouse_x * SX, mouse_y * SX);
 
@@ -5289,6 +5568,7 @@ static void gui_draw_all(void) {
 
   /* 7. type on top, at 1x, with the atlas' own anti-aliasing */
   draw_taskbar_text();
+  draw_ctm_text();
   draw_cursor(mouse_x, mouse_y);        /* keep the pointer above the windows */
 
   full_redraw = 1;                  /* dirty rects are in ss coords; blit whole frames */
@@ -5296,6 +5576,9 @@ static void gui_draw_all(void) {
 
 void gui_compose(void) {
   gui_poll_input();
+
+  if (ps2_take_ctrl_alt_del())    /* the shell owns this chord */
+    open_task_manager();
 
   if (appearance_wall_dirty) {      /* the toggle repaints the desktop too */
     appearance_wall_dirty = 0;
@@ -5342,10 +5625,14 @@ void gui_main_loop(void) {
       usb_poll();
       for (volatile int d = 0; d < 100; d++) __asm__ volatile("pause");
     }
-    
     gui_compose();
 
 
+
+
+
+
+    task_yield();   /* let any other runnable task have the cpu */
 
     /* Minimal yield - just a few pause instructions */
     for (volatile int i = 0; i < 50; i++) {

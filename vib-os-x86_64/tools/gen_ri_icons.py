@@ -32,6 +32,7 @@ SET = [
     ("ICON_STICKY",     "sticky-note-line",  "sticky widget"),
     ("ICON_APPEARANCE", "palette-line",      "appearance toggle"),
     ("ICON_APPS",       "apps-line",         "start menu / apps"),
+    ("ICON_TASKS",      "cpu-line",          "task manager app"),
     ("ICON_CLOSE",      "close-line",        "window close"),
     ("ICON_MIN",        "subtract-line",     "window minimise"),
     ("ICON_MAX",        "fullscreen-line",   "window maximise"),

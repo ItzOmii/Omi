@@ -31,10 +31,6 @@ CFLAGS := -target x86_64-unknown-none-elf \
           -fno-PIC \
           -m64 \
           -march=x86-64 \
-          -mno-80387 \
-          -mno-mmx \
-          -mno-sse \
-          -mno-sse2 \
           -mno-red-zone \
           -mcmodel=kernel \
           -I$(KERNEL_DIR)/include \
@@ -53,10 +49,6 @@ CFLAGS := -ffreestanding \
           -fno-PIC \
           -m64 \
           -march=x86-64 \
-          -mno-80387 \
-          -mno-mmx \
-          -mno-sse \
-          -mno-sse2 \
           -mno-red-zone \
           -mcmodel=kernel \
           -I$(KERNEL_DIR)/include \
@@ -102,12 +94,17 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/gui/window.c \
            $(KERNEL_DIR)/gui/compositor.c \
            $(KERNEL_DIR)/gui/omiweb.c \
+           $(KERNEL_DIR)/gui/ttf.c \
+           $(KERNEL_DIR)/kernel_task.c \
+           $(KERNEL_DIR)/gdt.c \
+           $(KERNEL_DIR)/gui/webimg.c \
            $(KERNEL_DIR)/gui/icons_ri.c \
            $(KERNEL_DIR)/net/tcp.c \
            $(KERNEL_DIR)/net/tls.c \
            $(KERNEL_DIR)/net/roots.c \
            $(KERNEL_DIR)/net/http.c \
            $(KERNEL_DIR)/media/media.c \
+           $(KERNEL_DIR)/media/image.c \
            $(KERNEL_DIR)/media/modules.c \
            $(KERNEL_DIR)/media/mp3.c \
            $(KERNEL_DIR)/media/picojpeg.c \
@@ -212,6 +209,10 @@ $(ISO): $(KERNEL) $(LIMINE_DIR)
 	# Media samples, exposed to the kernel as boot modules
 	mkdir -p $(ISO_ROOT)/media
 	cp assets/sample.mp3 assets/sample.mp4 $(ISO_ROOT)/media/
+
+	# TrueType faces, also boot modules
+	mkdir -p $(ISO_ROOT)/fonts
+	cp assets/fonts/*.ttf $(ISO_ROOT)/fonts/
 	
 	# Copy Limine config to ALL locations Limine searches
 	cp limine.conf $(ISO_ROOT)/limine.conf

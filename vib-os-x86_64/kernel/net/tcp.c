@@ -374,13 +374,28 @@ int net_dns_resolve(const net_cfg_t *cfg, const char *host, uint8_t ip_out[4]) {
   uint8_t r[1600];
   static uint16_t dns_id = 0x3301;
   if (!cfg || !cfg->valid) return 0;
-  uint8_t server[4];
+  /* Resolvers to try, in order: Google first, then whatever DHCP handed us,
+   * then Google's secondary. A router stub resolver that is slow or broken
+   * should not take the whole browser down with it. */
+  static const uint8_t google[2][4] = {{8, 8, 8, 8}, {8, 8, 4, 4}};
+  uint8_t servers[3][4];
+  int n_servers = 0;
   int have_dns = 0;
   for (int i = 0; i < 4; i++) if (cfg->dns[i]) have_dns = 1;
-  if (have_dns) memcpy(server, cfg->dns, 4);
-  else { server[0] = 1; server[1] = 1; server[2] = 1; server[3] = 1; }
 
-  for (int attempt = 0; attempt < 3; attempt++) {
+  memcpy(servers[n_servers], google[0], 4);
+  n_servers++;
+  if (have_dns && memcmp(cfg->dns, google[0], 4) != 0) {
+    memcpy(servers[n_servers], cfg->dns, 4);
+    n_servers++;
+  }
+  if (memcmp(servers[n_servers - 1], google[1], 4) != 0) {
+    memcpy(servers[n_servers], google[1], 4);
+    n_servers++;
+  }
+
+  for (int attempt = 0; attempt < n_servers; attempt++) {
+    const uint8_t *server = servers[attempt];
     uint16_t id = ++dns_id;
     int qlen = dns_build(q, id, host);
     if (qlen <= 0) return 0;
@@ -396,7 +411,11 @@ int net_dns_resolve(const net_cfg_t *cfg, const char *host, uint8_t ip_out[4]) {
           const uint8_t *udp = ip + ihl;
           if (get16(udp + 2) == 5353 && get16(udp) == 53) {
             int plen = get16(udp + 4) - 8;
-            if (plen > 0 && dns_parse(udp + 8, plen, id, ip_out)) return 1;
+            if (plen > 0 && dns_parse(udp + 8, plen, id, ip_out)) {
+              extern void net_log_dns_via(const uint8_t *ip);
+              net_log_dns_via(server);
+              return 1;
+            }
           }
         }
       }

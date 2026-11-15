@@ -70,6 +70,7 @@ static inline void io_wait(void) {
 /* Keyboard State                                                        */
 /* ===================================================================== */
 
+static volatile int cad_flag;          /* Ctrl+Alt+Del latched, cleared by the shell */
 static int shift_pressed = 0;
 static int ctrl_pressed = 0;
 static int alt_pressed = 0;
@@ -351,7 +352,9 @@ void ps2_poll(void) {
         case 0x4F: key = KEY_DOWN; break;        /* End -> Down */
         case 0x49: key = KEY_UP; break;          /* Page Up -> Up */
         case 0x51: key = KEY_DOWN; break;        /* Page Down -> Down */
-        case 0x53: key = '\b'; break;            /* Delete -> Backspace */
+        case 0x53:                               /* Delete (E0 53) */
+          if (ctrl_pressed && alt_pressed) { cad_flag = 1; continue; }
+          key = '\b'; break;                     /* plain Delete -> Backspace */
         case 0x1C: key = '\n'; break;            /* Keypad Enter */
         default: continue;
         }
@@ -579,3 +582,11 @@ int ps2_get_mouse_buttons(void) { return ps2_mouse_buttons; }
 /* Keep old handler functions for compatibility */
 void ps2_keyboard_handler(void) { ps2_poll(); }
 void ps2_mouse_handler(void) { ps2_poll(); }
+
+/* Ctrl+Alt+Del is a chord, not a character: it is latched here and the shell
+ * polls for it, so nothing in the keyboard callback path has to know. */
+int ps2_take_ctrl_alt_del(void) {
+  int v = cad_flag;
+  cad_flag = 0;
+  return v;
+}

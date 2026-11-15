@@ -41,6 +41,13 @@ static void n_dec(uint32_t v) {
   }
   n_puts(&b[i + 1]);
 }
+static void n_ip(const uint8_t *ip);
+/* the resolve path lives in tcp.c and logs through here */
+void net_log_dns_via(const uint8_t *ip) {
+  n_puts("[dns] via ");
+  n_ip(ip);
+  n_putc('\n');
+}
 static void n_ip(const uint8_t *ip) {
   for (int i = 0; i < 4; i++) {
     n_dec(ip[i]);
@@ -407,15 +414,18 @@ void net_selftest(void) {
   {
     static char page[4096];
     static http_result_t hr;
-    n_puts("[net] http get example.com ...\n");
-    int got = http_get(&cfg, "http://example.com/", page, sizeof page, &hr);
+    n_puts("[net] https get example.com ...\n");
+    int got = http_get(&cfg, "https://example.com/", page, sizeof page, &hr);
     n_puts("[net] http ");
     if (!got) {
-      n_puts("FAILED (dns or tcp)\n");
+      n_puts("FAILED ");
+      n_puts(hr.err[0] ? hr.err : "(dns or tcp)");
+      n_puts("\n");
     } else {
       n_dec((uint32_t)hr.status);
       n_puts(" len=");
       n_dec((uint32_t)hr.len);
+      n_puts(hr.secure ? " tls=yes" : " tls=no");
       n_puts(" title=\"");
       n_puts(hr.title);
       n_puts("\"\n");
