@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Omi — a small operating system with a real network stack</title>
+<meta name="description" content="Omi is a fork of vib-OS: custom kernel, posthog-styled shell, working TCP/IP, sound, and a browser that renders plain HTTP.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#F7F3E7; --paper2:#FFFCF3; --paper3:#F1EBD9;
+    --ink:#16130D; --soft:#6E6656; --faint:#96907F;
+    --line:rgba(22,19,13,.14); --hair:rgba(22,19,13,.08);
+    --accent:#FFC23D; --dark:#171512;
+    --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+    --disp:'Bricolage Grotesque','Helvetica Neue',Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--paper);color:var(--ink);font-family:var(--disp);
+    -webkit-font-smoothing:antialiased;
+    background-image:radial-gradient(var(--hair) 1px,transparent 1px);
+    background-size:22px 22px;background-position:-1px -1px;
+  }
+  a{color:inherit}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 22px}
+  .mono{font-family:var(--mono);font-size:12px;letter-spacing:.02em}
+  .chip{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);
+    background:var(--paper2);border-radius:999px;padding:5px 11px;font-family:var(--mono);
+    font-size:11.5px;color:var(--soft)}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 2px rgba(255,194,61,.22)}
+
+  /* ---------- nav ---------- */
+  header{position:sticky;top:0;z-index:30;backdrop-filter:blur(10px);
+    background:rgba(247,243,231,.82);border-bottom:1px solid var(--line)}
+  .nav{display:flex;align-items:center;gap:14px;height:58px}
+  .mark{display:flex;align-items:center;gap:9px;text-decoration:none}
+  .mark .glyph{width:26px;height:26px;border-radius:7px;background:var(--accent);
+    border:1px solid rgba(22,19,13,.35);display:grid;place-items:center;
+    font-family:var(--mono);font-size:13px;font-weight:600}
+  .mark b{font-size:18px;letter-spacing:-.01em}
+  .nav .sp{flex:1}
+  .nav a.lnk{font-family:var(--mono);font-size:12px;color:var(--soft);text-decoration:none;padding:6px 2px}
+  .nav a.lnk:hover{color:var(--ink)}
+  .btn{display:inline-flex;align-items:center;gap:8px;border:1px solid rgba(22,19,13,.35);
+    background:var(--accent);color:var(--ink);text-decoration:none;border-radius:10px;
+    padding:9px 14px;font-family:var(--mono);font-size:12px;font-weight:600;transition:transform .12s}
+  .btn:hover{transform:translateY(-1px)}
+  .btn.ghost{background:var(--paper2);border-color:var(--line);font-weight:500}
+
+  /* ---------- hero ---------- */
+  .hero{display:grid;grid-template-columns:1fr 1.12fr;gap:36px;align-items:center;padding:60px 0 40px}
+  h1{font-size:clamp(38px,5.2vw,60px);line-height:.98;letter-spacing:-.032em;margin:14px 0 0;font-weight:600}
+  h1 em{font-style:normal;padding:.02em .14em .06em;margin:0 -.14em;background:var(--accent);
+    box-decoration-break:clone;-webkit-box-decoration-break:clone;border-radius:3px}
+  .lede{font-size:17.5px;line-height:1.5;color:#3B3528;max-width:44ch;margin:18px 0 0}
+  .cta{display:flex;gap:10px;margin-top:24px;flex-wrap:wrap}
+  .facts{display:flex;gap:22px;margin-top:30px;flex-wrap:wrap}
+  .fact{border-left:2px solid var(--accent);padding-left:11px}
+  .fact b{display:block;font-size:19px;letter-spacing:-.01em}
+  .fact span{font-family:var(--mono);font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.08em}
+
+  /* window frame around screenshots */
+  .win{border:1px solid var(--line);border-radius:12px;background:var(--paper2);overflow:hidden}
+  .win.plain{border-radius:14px;border-color:rgba(22,19,13,.22);background:#14161a;
+    box-shadow:0 1px 0 rgba(255,255,255,.5) inset}
+  .win.plain img{display:block;width:100%;height:auto}
+  .win .bar{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--hair);
+    font-family:var(--mono);font-size:11px;color:var(--soft);background:var(--paper3)}
+  .win .bar i{width:7px;height:7px;border-radius:50%;background:var(--faint);display:inline-block}
+  .win img{display:block;width:100%;height:auto}
+  .hero-shot{position:relative}
+  .hero-shot .cap{display:flex;gap:10px;align-items:center;margin-top:11px;font-family:var(--mono);
+    font-size:11.5px;color:var(--soft);padding-left:2px}
+  .hero-shot .cap b{color:var(--ink);font-weight:500}
+  .hero-shot .cap i{width:16px;height:1px;background:var(--line);display:inline-block}
+
+  /* ---------- ticker ---------- */
+  .ticker{border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+    background:var(--paper3);overflow:hidden;margin-top:26px}
+  .ticker{-webkit-mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent);mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent)}
+  .ticker .row{display:flex;gap:26px;align-items:center;white-space:nowrap;padding:11px 0;
+    font-family:var(--mono);font-size:11.5px;color:var(--soft);animation:slide 34s linear infinite}
+  @keyframes slide{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+  .ticker b{color:var(--ink);font-weight:600}
+
+  /* ---------- sections ---------- */
+  section{padding:74px 0}
+  .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint)}
+  h2{font-size:clamp(27px,3.4vw,40px);letter-spacing:-.026em;line-height:1.04;margin:12px 0 0;font-weight:600;max-width:26ch}
+  .sub{color:#4A4436;font-size:16px;line-height:1.55;max-width:62ch;margin-top:14px}
+
+  .wide{margin-top:26px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:26px;margin-top:36px}
+  .card{border:1px solid var(--line);border-radius:14px;background:var(--paper2);overflow:hidden;
+    display:flex;flex-direction:column}
+  .card .shot{border-bottom:1px solid var(--hair);background:#14161a;aspect-ratio:16/10;
+    display:grid;place-items:center;padding:16px}
+  .card .shot img{display:block;max-width:100%;max-height:100%;width:auto;height:auto;
+    border-radius:8px;border:1px solid rgba(255,255,255,.06)}
+  .card .body{padding:16px 18px 18px}
+  .card h3{margin:0;font-size:18px;letter-spacing:-.012em}
+  .card p{margin:7px 0 0;color:#4F4939;font-size:14.5px;line-height:1.5}
+  .card .meta{margin-top:11px;font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .card .meta span{color:var(--ink)}
+
+  /* stack */
+  .stack{background:var(--dark);color:#EDE7D8;border-radius:16px;padding:34px;margin-top:34px;
+    display:grid;grid-template-columns:.95fr 1.05fr;gap:34px;border:1px solid #000}
+  .stack h3{color:#fff;font-size:20px;margin:0 0 6px}
+  .stack p{color:#A9A292;font-size:14.5px;line-height:1.55;margin:0}
+  .layers{font-family:var(--mono);font-size:12.5px}
+  .layer{display:grid;grid-template-columns:118px 1fr;gap:14px;padding:8px 0;border-top:1px solid rgba(255,255,255,.07)}
+  .layer:first-child{border-top:0}
+  .layer b{color:var(--accent);font-weight:500}
+  .layer span{color:#B8B2A2}
+  .term{margin-top:18px;background:#0E0D0B;border:1px solid rgba(255,255,255,.08);border-radius:10px;
+    padding:12px 14px;font-family:var(--mono);font-size:11.5px;color:#8FBF7F;line-height:1.75;overflow-x:auto}
+  .term .c{color:#5C5A52}
+  .term .a{color:var(--accent)}
+
+  /* honesty */
+  .holes{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:32px}
+  .hole{border:1px dashed rgba(22,19,13,.28);border-radius:12px;padding:16px 16px 18px;background:rgba(255,252,243,.6)}
+  .hole .n{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .hole h4{margin:7px 0 5px;font-size:16px}
+  .hole p{margin:0;font-size:14px;line-height:1.5;color:#4F4939}
+
+  /* run */
+  .run{display:grid;grid-template-columns:1.05fr .95fr;gap:30px;align-items:start;margin-top:30px}
+  pre.shell{margin:0;background:var(--dark);color:#E7E1D1;border-radius:12px;padding:18px 18px;
+    font-family:var(--mono);font-size:12px;line-height:1.85;overflow-x:auto;border:1px solid #000}
+  pre.shell .cmt{color:#6E6A5E}
+  pre.shell .acc{color:var(--accent)}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:8px 16px;font-family:var(--mono);font-size:12px;
+    border-top:1px solid var(--line);padding-top:16px;margin-top:6px}
+  .kv dt{color:var(--faint)}
+  .kv dd{margin:0;color:var(--ink)}
+
+  footer{border-top:1px solid var(--line);padding:30px 0 46px;margin-top:20px}
+  .foot{display:flex;gap:16px;align-items:center;flex-wrap:wrap;font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+  .foot a{color:var(--soft);text-decoration:none;border-bottom:1px solid var(--line)}
+  .foot a:hover{color:var(--ink)}
+
+  @media(max-width:900px){
+    .hero{grid-template-columns:1fr;padding-top:40px}
+    .grid2{grid-template-columns:1fr}
+    .stack{grid-template-columns:1fr;padding:24px}
+    .holes{grid-template-columns:1fr}
+    .run{grid-template-columns:1fr}
+    .nav a.lnk{display:none}
+    section{padding:52px 0}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap nav">
+    <a class="mark" href="#top"><span class="glyph">◨</span><b>Omi</b></a>
+    <span class="chip"><span class="dot"></span> v0.1 · x86_64</span>
+    <span class="sp"></span>
+    <a class="lnk" href="#inside">inside</a>
+    <a class="lnk" href="#stack">stack</a>
+    <a class="lnk" href="#holes">limits</a>
+    <a class="btn ghost" href="https://github.com/viralcode/vib-OS">upstream ↗</a>
+    <a class="btn" href="#run">boot it</a>
+  </div>
+</header>
+
+<main id="top">
+<div class="wrap hero">
+  <div>
+    <span class="chip">forked from vib-OS · 60 files changed</span>
+    <h1>An operating system <em>you can read</em> in a weekend.</h1>
+    <p class="lede">Omi is a small operating system you boot from a USB stick: it draws its own
+      desktop, fetches web pages over a TCP/IP stack, and plays MP3s — all from kernel code you can
+      read end to end. Forked from vib-OS, with the network, the sound and the shell added here.</p>
+    <div class="cta">
+      <a class="btn" href="#run">Run it in QEMU</a>
+      <a class="btn ghost" href="#inside">See the screens</a>
+    </div>
+    <div class="facts">
+      <div class="fact"><b>13,225</b><span>lines added</span></div>
+      <div class="fact"><b>7.4 MB</b><span>bootable ISO</span></div>
+      <div class="fact"><b>0.7 s</b><span>limine → kernel</span></div>
+      <div class="fact"><b>0</b><span>runtime deps</span></div>
+    </div>
+  </div>
+  <div class="hero-shot">
+    <div class="win plain">
+      <img src="assets/omi-net-window.png" alt="Omi Net browser showing a page fetched over plain HTTP">
+    </div>
+    <div class="cap"><b>live capture</b><i></i>httpforever.com · 200 · 80 lines · rendered by a tag stripper</div>
+  </div>
+</div>
+
+<div class="ticker">
+  <div class="row">
+    <span>·</span><span><b>e1000</b> driver</span><span><b>arp</b> · ipv4 · icmp · udp</span>
+    <span><b>dhcp</b> lease 10.0.2.15</span><span><b>dns</b> A records</span>
+    <span><b>tcp</b> handshake + retries</span><span><b>http/1.1</b> client</span>
+    <span><b>minimp3</b> decoder</span><span><b>hda</b> 48 khz stereo</span>
+    <span><b>limine</b> timeout 0</span><span><b>no tls</b> (yet)</span>
+    <span>·</span><span><b>e1000</b> driver</span><span><b>arp</b> · ipv4 · icmp · udp</span>
+    <span><b>dhcp</b> lease 10.0.2.15</span><span><b>dns</b> A records</span>
+    <span><b>tcp</b> handshake + retries</span><span><b>http/1.1</b> client</span>
+    <span><b>minimp3</b> decoder</span><span><b>hda</b> 48 khz stereo</span>
+    <span><b>limine</b> timeout 0</span><span><b>no tls</b> (yet)</span>
+  </div>
+</div>
+
+<section id="inside">
+  <div class="wrap">
+    <span class="eyebrow">what's inside</span>
+    <h2>Four apps, one address space,<br>zero servers.</h2>
+    <p class="sub">Everything runs in the kernel, because there is nothing else to run in. Each
+      window is a struct and a draw function; each driver is a file you can finish reading before
+      the coffee goes cold.</p>
+
+    <div class="grid2">
+      <article class="card">
+        <div class="shot"><img src="assets/omi-net.png" alt="Omi Net browser showing a fetched web page"></div>
+        <div class="body">
+          <h3>Omi Net</h3>
+          <p>Bookmarks, an address bar you can type into, scrolling and a status strip. The page
+            comes off a real socket; the renderer is a tag stripper that wraps to a width measured
+            from the font.</p>
+          <div class="meta"><span>kernel/net/</span> http.c · tcp.c · net.c</div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="shot"><img src="assets/media-win.png" alt="Omi media player playing a track"></div>
+        <div class="body">
+          <h3>Media player</h3>
+          <p>Streams an MP3 off the boot medium, decodes with minimp3, pushes PCM to Intel HDA and
+            keeps the compositor alive while it does it. Elapsed, percent, progress bar, stop.</p>
+          <div class="meta"><span>kernel/media/</span> mp3.c · drivers/hda.c</div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="shot"><img src="assets/calc-win.png" alt="Omi calculator"></div>
+        <div class="body">
+          <h3>Calculator</h3>
+          <p>Fixed-point arithmetic with a real operator stack, keyboard and pointer both wired.</p>
+          <div class="meta"><span>gui/compositor.c</span> calc_state_t</div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="shot"><img src="assets/notes-win.png" alt="Omi notepad with typed text"></div>
+        <div class="body">
+          <h3>Notepad</h3>
+          <p>A line editor that survives reboots-in-spirit only — the buffer is RAM until the disk
+            driver lands. Insert, delete, wrap, caret. It is the app that found the keyboard bugs.</p>
+          <div class="meta"><span>gui/compositor.c</span> np_text · NP_MAX 4000</div>
+        </div>
+      </article>
+    </div>
+
+    <div class="wide">
+      <div class="win">
+        <div class="bar"><i></i><i></i><i></i><span style="margin-left:6px">the shell — 1280×800</span></div>
+        <img src="assets/start-menu.png" alt="The Omi shell with the start menu open over the desktop">
+      </div>
+      <div class="cap">midnight by default · the Omi mark is the start button · every app is a window in the kernel</div>
+    </div>
+  </div>
+</section>
+
+<section id="stack" style="padding-top:0">
+  <div class="wrap">
+    <span class="eyebrow">the part that was missing</span>
+    <h2>Networking,<br>from the wire up.</h2>
+    <p class="sub">vib-OS could draw. It could not talk. Omi adds the whole ladder below the browser,
+      one file at a time, and prints every step to COM1 so you can watch it happen.</p>
+
+    <div class="stack">
+      <div>
+        <h3>Bottom-up, in the order the packets travel</h3>
+        <p>No lwIP, no vendored stack, no POSIX sockets. Each layer is a function that takes bytes
+          and returns bytes, which is why the whole thing fits in a few thousand lines.</p>
+        <div class="term">
+          <div class="c">// serial log, boot to first page</div>
+          <div>[net] dhcp lease ip=10.0.2.15 gw=10.0.2.2 dns=10.0.2.3</div>
+          <div>[net] gateway mac resolved</div>
+          <div>[net] http get example.com ...</div>
+          <div>[net] http <span class="a">200</span> len=577 title="Example Domain"</div>
+          <div>[net] ping 10.0.2.2 REPLY - configured and reachable</div>
+        </div>
+      </div>
+      <div class="layers">
+        <div class="layer"><b>e1000</b><span>receive + transmit rings, i219/i82574 compatible</span></div>
+        <div class="layer"><b>arp</b><span>who-has, gateway MAC resolution, reply cache</span></div>
+        <div class="layer"><b>ipv4 / icmp</b><span>checksums, fragmentation-free path, echo reply</span></div>
+        <div class="layer"><b>udp</b><span>one socket at a time, which is all DNS needs</span></div>
+        <div class="layer"><b>dhcp</b><span>discover → offer → request → ack, lease + gw + dns</span></div>
+        <div class="layer"><b>dns</b><span>A-record query against the DHCP-provided resolver</span></div>
+        <div class="layer"><b>tcp</b><span>handshake, seq/ack, retries with fresh source ports</span></div>
+        <div class="layer"><b>http/1.1</b><span>GET, header parse, content-length, failure codes</span></div>
+        <div class="layer"><b>omi net</b><span>tag stripper, wrap to measured width, status strip</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="holes" style="padding-top:0">
+  <div class="wrap">
+    <span class="eyebrow">what does not work</span>
+    <h2>Three honest holes.</h2>
+    <p class="sub">A hobby OS that hides its gaps is a demo. These are the ones you will hit within
+      a minute of booting.</p>
+    <div class="holes">
+      <div class="hole">
+        <div class="n">01</div>
+        <h4>No TLS</h4>
+        <p>There is no crypto in the kernel, so https is refused up front instead of failing
+          mysteriously. That also means no weather forecast — the widget reports link state instead.</p>
+      </div>
+      <div class="hole">
+        <div class="n">02</div>
+        <h4>No mic capture</h4>
+        <p>Output works on real hardware; capture does not. Most onboard HDA codecs expose no
+          capture endpoint, so <span class="mono">hda-duplex</span> fails at init. The default
+          launcher uses <span class="mono">hda-output</span>.</p>
+      </div>
+      <div class="hole">
+        <div class="n">03</div>
+        <h4>No processes</h4>
+        <p>Apps are kernel-resident windows, exactly as upstream. One address space means one bug
+          can take the shell down — and no, there is no permission model.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="run" style="padding-top:0">
+  <div class="wrap">
+    <span class="eyebrow">take it for a spin</span>
+    <h2>Sixty seconds<br>to a desktop.</h2>
+    <div class="run">
+      <pre class="shell"><span class="cmt"># build (needs gcc, nasm, xorriso, mtools)</span>
+cd vib-os-x86_64
+make
+
+<span class="cmt"># boot it — the e1000 device is what gives Omi a network</span>
+qemu-system-x86_64 -m 512 -cdrom omi.iso -boot d -vga std \
+  -netdev user,id=n0 -device e1000,netdev=n0 \
+  -audiodev sdl,id=snd -device intel-hda \
+  -device hda-output,audiodev=snd
+
+<span class="cmt"># or onto real metal</span>
+sudo dd if=omi.iso of=/dev/sdX bs=4M status=progress</pre>
+      <div>
+        <dl class="kv">
+          <dt>base</dt><dd>viralcode/vib-OS @ 73b6429</dd>
+          <dt>target</dt><dd>x86_64, BIOS + UEFI via Limine</dd>
+          <dt>diff</dt><dd>60 files, +13,225 / −807</dd>
+          <dt>iso</dt><dd>7.4 MB, boots to midnight</dd>
+          <dt>media</dt><dd>generated placeholders, not licensed music</dd>
+          <dt>license</dt><dd>same as upstream</dd>
+        </dl>
+        <p class="sub" style="font-size:15px">The screenshots on this page are unretouched
+          1280×800 captures from the ISO above, taken in QEMU with the e1000 and HDA devices
+          attached. Nothing is mocked up.</p>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap foot">
+    <span class="mark" style="gap:8px"><span class="glyph" style="width:20px;height:20px;border-radius:6px;font-size:11px">◨</span><b style="font-family:var(--disp);font-size:14px">Omi</b></span>
+    <span>·</span>
+    <a href="https://github.com/viralcode/vib-OS">forked from vib-OS</a>
+    <span>·</span>
+    <span>built on meepBox</span>
+    <span class="sp" style="flex:1"></span>
+    <span>no trackers, no fonts you can't see, no javascript</span>
+  </div>
+</footer>
+
+</body>
+</html>
