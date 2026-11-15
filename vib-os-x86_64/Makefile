@@ -38,6 +38,8 @@ CFLAGS := -target x86_64-unknown-none-elf \
           -mno-red-zone \
           -mcmodel=kernel \
           -I$(KERNEL_DIR)/include \
+          -I$(KERNEL_DIR)/lib/bearssl/port \
+          -I$(KERNEL_DIR)/lib/bearssl/inc \
           -Wall -Wextra \
           -O2 \
           -g
@@ -58,6 +60,8 @@ CFLAGS := -ffreestanding \
           -mno-red-zone \
           -mcmodel=kernel \
           -I$(KERNEL_DIR)/include \
+          -I$(KERNEL_DIR)/lib/bearssl/port \
+          -I$(KERNEL_DIR)/lib/bearssl/inc \
           -Wall -Wextra \
           -O2 \
           -g
@@ -97,8 +101,11 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/gui/desktop_mgr.c \
            $(KERNEL_DIR)/gui/window.c \
            $(KERNEL_DIR)/gui/compositor.c \
+           $(KERNEL_DIR)/gui/omiweb.c \
            $(KERNEL_DIR)/gui/icons_ri.c \
            $(KERNEL_DIR)/net/tcp.c \
+           $(KERNEL_DIR)/net/tls.c \
+           $(KERNEL_DIR)/net/roots.c \
            $(KERNEL_DIR)/net/http.c \
            $(KERNEL_DIR)/media/media.c \
            $(KERNEL_DIR)/media/modules.c \
@@ -109,7 +116,26 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/media/hd_wallpaper_city.c
 
 # Object files
-OBJECTS := $(patsubst $(KERNEL_DIR)/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
+BEARSSL := $(KERNEL_DIR)/lib/bearssl
+BEARSSL_ALL := $(wildcard $(BEARSSL)/src/*/*.c)
+# Everything that only exists for big-endian PowerPC/x86-64 extras, plus server
+# and client-certificate paths Omi never takes, plus key generation/signing we
+# do not perform. Keeping the list explicit keeps the kernel image small.
+BEARSSL_SKIP := aes_big aes_ct64 aes_pwr8 aes_x86ni aes_small ghash_pclmul \
+                ghash_pwr8 c25519_m15 c25519_m64 p256_m15 p256_m64 all_m15 \
+                all_m64 chacha20_sse2 des_ descbc sysrng pemdec pemenc keygen \
+                sign server scert ccert
+BEARSSL_SOURCES := $(filter-out $(foreach p,$(BEARSSL_SKIP),$(BEARSSL)/src/*/*$(p)*.c),$(BEARSSL_ALL))
+
+# Gumbo HTML5 parser (vendored, freestanding, kernel heap)
+GUMBO_DIR  := kernel/lib/gumbo
+GUMBO_ALL  := $(wildcard $(GUMBO_DIR)/src/*.c) $(GUMBO_DIR)/glue.c
+GUMBO_SRC  := $(GUMBO_ALL)
+GUMBO_OBJ  := $(patsubst $(KERNEL_DIR)/lib/gumbo/%.c,$(BUILD_DIR)/lib/gumbo/%.o,$(GUMBO_SRC))
+
+OBJECTS := $(patsubst $(KERNEL_DIR)/%.c,$(BUILD_DIR)/%.o,$(SOURCES)) \
+           $(patsubst $(BEARSSL)/src/%.c,$(BUILD_DIR)/lib/bearssl/%.o,$(BEARSSL_SOURCES)) \
+           $(GUMBO_OBJ)
 
 # Limine
 LIMINE_VERSION := 8.6.0
@@ -137,10 +163,28 @@ $(BUILD_DIR)/media/mp3.o: $(KERNEL_DIR)/media/mp3.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -msse -msse2 -mfpmath=sse -c $< -o $@
 
+# Gumbo builds with its own port headers (stdint/stddef/stdbool map onto types.h)
+# and is third-party code whose warnings are not ours to police.
+$(BUILD_DIR)/lib/gumbo/%.o: $(KERNEL_DIR)/lib/gumbo/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(CC) -I$(GUMBO_DIR)/port -I$(GUMBO_DIR)/src $(CFLAGS) -w -c $< -o $@
+
+# The renderer includes gumbo.h, so it needs the same port headers the parser
+# uses (they keep clang's stdint/stddef/stdbool from colliding with types.h).
+$(BUILD_DIR)/gui/omiweb.o: $(KERNEL_DIR)/gui/omiweb.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(CC) -I$(GUMBO_DIR)/port -I$(GUMBO_DIR)/src $(CFLAGS) -c $< -o $@
+
 # Compile C files
 $(BUILD_DIR)/%.o: $(KERNEL_DIR)/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# BearSSL: freestanding, its own port headers (stdint/stddef map onto types.h),
+# and its warning level is not ours to police.
+$(BUILD_DIR)/lib/bearssl/%.o: $(BEARSSL)/src/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -w -I$(BEARSSL)/port -I$(BEARSSL)/inc -I$(BEARSSL)/src -c $< -o $@
 
 # Link kernel
 $(KERNEL): $(OBJECTS)
