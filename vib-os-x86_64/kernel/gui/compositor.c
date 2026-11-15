@@ -3067,8 +3067,10 @@ static void mp_pump(void) {
   }
 }
 
-static void mp_time(uint64_t frames, int rate, char *out) {
-  uint32_t secs = rate > 0 ? (uint32_t)(frames / (uint64_t)rate) : 0;
+/* samples are interleaved: divide by rate * channels, or a stereo track
+   reports twice its real elapsed time while the percent bar stays correct. */
+static void mp_time(uint64_t frames, int rate, int ch, char *out) {
+  uint32_t secs = (rate > 0 && ch > 0) ? (uint32_t)(frames / (uint64_t)(rate * ch)) : 0;
   int i = 0;
   out[i++] = (char)('0' + (secs / 60) / 10);
   out[i++] = (char)('0' + (secs / 60) % 10);
@@ -3093,7 +3095,7 @@ static void draw_media(void) {
   uint64_t done = mp3h ? meep_mp3_pos(mp3h) : 0;
   uint64_t tf = mp3h ? meep_mp3_total(mp3h) : 0;
   int pm = tf > 0 ? (int)((done * 1000) / tf) : 0;   /* permille */
-  mp_time(done, mp_rate, pos);
+  mp_time(done, mp_rate, mp_ch, pos);
   { int pc = pm / 10;               /* permille -> percent */
     int i = 0;
     if (pc >= 100) pct[i++] = (char)('0' + (pc / 100) % 10);
