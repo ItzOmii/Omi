@@ -1,6 +1,6 @@
 # Omi
 
-> **This is [Omi](OMI.md)** — a fork of vib-OS with a posthog-styled shell, a working TCP/IP
+> **This is [Omi](OMI.md)** — a fork of vib-OS with a flat cream-and-hairline shell, a working TCP/IP
 > stack, Intel HDA sound, and a browser. Four commits ahead of upstream; see
 > [OMI.md](OMI.md) for what changed and [the landing page](https://itzomii.github.io/Omi/) for
 > screenshots. Grab the bootable ISO from [Releases](https://github.com/ItzOmii/Omi/releases).

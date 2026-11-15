@@ -2,7 +2,7 @@
 
 Omi is a fork of [vib-OS](https://github.com/viralcode/vib-OS) — same custom 64-bit kernel,
 same from-scratch userspace — with a different face and a few things the base tree does not
-have: networking, sound, a browser, and an OS shell styled like [posthog.com](https://posthog.com).
+have: networking, sound, a browser, and a flat, paper-coloured shell.
 
 Everything here is x86_64 and lives in [`vib-os-x86_64/`](vib-os-x86_64/). The ARM/RISC-V trees
 are untouched upstream code.
@@ -15,8 +15,8 @@ serve the folder.
 
 ## What Omi adds
 
-**Shell.** Flat, shadowless window chrome in the posthog palette (cream paper, `#FFC23D` accent,
-hairline borders, Bricolage Grotesque + JetBrains Mono). Midnight is the boot appearance. A
+**Shell.** Flat, shadowless window chrome — cream paper, a `#FFC23D` accent,
+hairline borders, Bricolage Grotesque + JetBrains Mono. Midnight is the boot appearance. A
 Windows-style taskbar sits at the bottom with a start menu; the Omi mark is the start button.
 Iconography is [Remix Icon](https://icon-sets.iconify.design/ri/), baked to bitmaps by
 `vib-os-x86_64/tools/gen_ri_icons.py` so the kernel needs no font renderer for them.
