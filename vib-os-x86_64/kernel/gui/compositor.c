@@ -22,6 +22,8 @@
 #include "mp3.h"
 #include "../include/hda.h"
 #include "omi_http.h"
+#include "omiweb.h"
+#include "omi_tls.h"
 
 /* External font data */
 extern const uint8_t font_data[256][16];
@@ -2389,6 +2391,7 @@ typedef struct { int open, x, y, w, h; int min; } meep_app_t;
 static meep_app_t mapp[APP_COUNT];
 static int mapp_focus = APP_NONE;
 static int drag_app = APP_NONE, drag_dx = 0, drag_dy = 0;
+static int resize_app = APP_NONE, resize_dx = 0, resize_dy = 0;
 
 /* ---- widgets ----------------------------------------------------------- */
 enum { WG_STICKY = 0, WG_WEATHER, WG_CLOCK, WG_COUNT };
@@ -2409,8 +2412,9 @@ static int sticky_len = 0, sticky_cur = 0;
 
 /* weather is fed by the MeepNet uplink once it lands; until then it says so
    rather than inventing a forecast. */
-static int wx_ok = 0, wx_now = 0, wx_hi = 0, wx_lo = 0;
+static int wx_ok = 0, wx_now = 0, wx_hi = 0, wx_lo = 0, wx_hi_ok = 0;
 static char wx_desc[32] = "no uplink";
+static char wx_city[28] = "this network";
 
 /* ---- tiny string helpers (no libc snprintf in here) -------------------- */
 static int s_len(const char *s) { int n = 0; while (s[n]) n++; return n; }
@@ -2557,6 +2561,11 @@ static void app_win(int x, int y, int w, int h, const char *title,
   int by = y + (APP_TITLE_H - bh) / 2;
   for (int i = 0; i < 3; i++) {
     wctl_glyph(bx + i * (bw + gap) + bw / 2, by + bh / 2, i, focused ? MEEP_INK : MEEP_INK_SOFT);
+  }
+  /* corner grip: three hairlines, the resize affordance */
+  for (int i = 0; i < 3; i++) {
+    int gx = x + w - 5 - i * 4, gy = y + h - 5;
+    gui_draw_line(gx - 6, gy, gx, gy - 6, focused ? MEEP_INK_SOFT : MEEP_LINE);
   }
   if (meta && meta[0]) {
     int mw = meep_text_w(&meep_m100, meta);
@@ -2923,6 +2932,68 @@ static void draw_bigclock(void) {
 }
 
 /* ---- widgets: weather -------------------------------------------------- */
+/* One fetch, at boot, over TLS. No location is passed: wttr.in geolocates the
+ * client by IP, so the widget names whatever city this network is in instead of
+ * a city compiled into the kernel. Format: "<place>|<temp>|<condition>". */
+static void wx_fetch(void) {
+  static char body[512];
+  static http_result_t wr;
+  const net_cfg_t *cfg = net_get();
+  if (!cfg->valid) return;
+
+  if (!http_get(cfg, "https://wttr.in/?format=%l|%t|%C", body, sizeof body, &wr))
+    return;
+  if (wr.status != 200 || !wr.secure) return;
+
+  int i = 0;
+
+  /* place, up to the first comma: "<City>, <Region>, <Country>" -> "<City>" */
+  int o = 0, seen = 0;
+  while (body[i] && body[i] != '|' && body[i] != ',') {
+    char ch = body[i++];
+    if (ch < 32 || ch >= 127) continue;
+    if (ch == ' ' && !seen) continue;             /* leading spaces */
+    if (o < (int)sizeof wx_city - 1) { wx_city[o++] = ch; seen = 1; }
+  }
+  while (o > 0 && wx_city[o - 1] == ' ') o--;
+  wx_city[o] = 0;
+  if (o == 0) {
+    const char *fb = "this network";
+    for (o = 0; fb[o] && o < (int)sizeof wx_city - 1; o++) wx_city[o] = fb[o];
+    wx_city[o] = 0;
+  }
+
+  /* skip to the temperature field */
+  while (body[i] && body[i] != '|') i++;
+  if (body[i] == '|') i++;
+
+  int sign = 1, val = 0, digits = 0;
+  if (body[i] == '+' || body[i] == '-') { if (body[i] == '-') sign = -1; i++; }
+  while (body[i] >= '0' && body[i] <= '9') { val = val * 10 + (body[i] - '0'); i++; digits++; }
+  if (!digits || val > 150) return;               /* no temp, no forecast */
+
+  while (body[i] && body[i] != '|') i++;
+  if (body[i] == '|') i++;
+
+  o = 0;
+  while (body[i] && body[i] != '\n' && body[i] != '\r' && body[i] != '|'
+         && o < (int)sizeof wx_desc - 1) {
+    char ch = body[i++];
+    if (ch >= 32 && ch < 127) wx_desc[o++] = ch;
+  }
+  while (o > 0 && wx_desc[o - 1] == ' ') o--;     /* wttr.in pads the field */
+  wx_desc[o] = 0;
+  if (o == 0) {
+    const char *fb = "clear";
+    for (o = 0; fb[o]; o++) wx_desc[o] = fb[o];
+    wx_desc[o] = 0;
+  }
+
+  wx_now = sign * val;
+  wx_ok = 1;
+  wx_hi_ok = 0;          /* this source gives the current temp, not the day's range */
+}
+
 static void draw_weather(void) {
   meep_wg_t *w = &mwg[WG_WEATHER];
   if (!w->on) return;
@@ -2937,9 +3008,9 @@ static void draw_weather(void) {
                  MEEP_INK_SOFT);
     meep_hline(x, by + 51, w->w - 24, 1, MEEP_LINE_SOFT);
     if (up) {
-      meep_text(&meep_m100, x, by + 60, "tcp + http are working.",
+      meep_text(&meep_m100, x, by + 60, "tcp, http and tls are up.",
                 MEEP_INK_SOFT);
-      meep_text(&meep_m100, x, by + 74, "a forecast needs tls. no tls.",
+      meep_text(&meep_m100, x, by + 74, "no forecast came back yet.",
                 MEEP_INK_SOFT);
     } else {
       meep_text(&meep_m100, x, by + 60, "a NIC and the tcp stack",
@@ -2956,17 +3027,29 @@ static void draw_weather(void) {
   meep_text(&meep_m105, x + big_w(27, t) + 4, by + 13, "F", MEEP_INK_SOFT);
   meep_text(&meep_m115, x, by + 46, wx_desc, MEEP_INK_SOFT);
 
-  char a[12], b[12];
-  s_num(wx_hi, a); s_num(wx_lo, b);
-  int hy = by + 68;
-  meep_tracked(x, hy, "HI", MEEP_INK_SOFT);
-  meep_text(&meep_m105, x + 24, hy - 1, a, MEEP_INK);
-  meep_tracked(x + 62, hy, "LO", MEEP_INK_SOFT);
-  meep_text(&meep_m105, x + 86, hy - 1, b, MEEP_INK);
-  meep_hline(x, hy + 17, w->w - 24, 1, MEEP_LINE_SOFT);
+  if (wx_hi_ok) {
+    char a[12], b[12];
+    s_num(wx_hi, a); s_num(wx_lo, b);
+    int hy = by + 68;
+    meep_tracked(x, hy, "HI", MEEP_INK_SOFT);
+    meep_text(&meep_m105, x + 24, hy - 1, a, MEEP_INK);
+    meep_tracked(x + 62, hy, "LO", MEEP_INK_SOFT);
+    meep_text(&meep_m105, x + 86, hy - 1, b, MEEP_INK);
+    meep_hline(x, hy + 17, w->w - 24, 1, MEEP_LINE_SOFT);
+  } else {
+    meep_hline(x, by + 68, w->w - 24, 1, MEEP_LINE_SOFT);
+    meep_text(&meep_m100, x, by + 74, "now, over tls", MEEP_INK_SOFT);
+  }
 
-  meep_text(&meep_m100, x, w->y + w->h - 18, "Jacksonville - via MeepNet",
-            MEEP_INK_SOFT);
+  {
+    char foot[48];
+    int o = 0;
+    for (int k = 0; wx_city[k] && o < 30; k++) foot[o++] = wx_city[k];
+    const char *tail = " - wttr.in";
+    for (int k = 0; tail[k] && o < (int)sizeof foot - 1; k++) foot[o++] = tail[k];
+    foot[o] = 0;
+    meep_text(&meep_m100, x, w->y + w->h - 18, foot, MEEP_INK_SOFT);
+  }
 }
 
 
@@ -3144,7 +3227,8 @@ static int  on_caret;
 static int  on_status;
 static http_result_t on_res;
 
-static const char *on_bm[] = {"example.com", "info.cern.ch", "httpforever.com"};
+static const char *on_bm[] = {"example.com", "info.cern.ch", "https://example.com",
+                              "https://info.cern.ch"};
 #define ON_NBM 3
 
 static int on_lc(char c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
@@ -3163,140 +3247,53 @@ static int on_tag(const char *s, int len, int i, const char *name, int *closing)
          after == '\n' || after == '\t';
 }
 
-/* Drops markup, keeps words and block breaks. `len` is the body length. */
-static int on_flatten(const char *s, int len, char *out, int max) {
-  int o = 0;
-  int skipping = 0;                      /* inside <script>/<style> */
-  const char *skip_name = 0;
-  for (int i = 0; i < len && o < max - 1; i++) {
-    char c = s[i];
-    if (skipping && c != '<') continue;     /* drop script/style bodies */
-    if (c == '<') {
-      int j = i + 1;
-      while (j < len && s[j] != '>') j++;
-      if (j >= len) break;
-      int closing = 0;
-      if (skipping) {
-        if (on_tag(s, len, i, skip_name, &closing) && closing) skipping = 0;
-        i = j;
-        continue;
-      }
-      if (on_tag(s, len, i, "script", &closing) ||
-          on_tag(s, len, i, "style", &closing)) {
-        if (!closing) {
-          skipping = 1;
-          skip_name = on_tag(s, len, i, "script", &closing) ? "script" : "style";
-        }
-        i = j;
-        continue;
-      }
-      int block = 0;
-      static const char *blocks[] = {"p", "div", "br", "li", "tr", "h1", "h2",
-                                     "h3", "h4", "h5", "h6", "ul", "ol",
-                                     "table", "section", "article", "header",
-                                     "footer", "title", "pre", "blockquote"};
-      for (int b = 0; b < (int)(sizeof blocks / sizeof blocks[0]); b++)
-        if (on_tag(s, len, i, blocks[b], &closing)) { block = 1; break; }
-      if (block) {
-        if (o > 0 && out[o - 1] != '\n') out[o++] = '\n';
-        if (o > 1 && out[o - 2] == '\n') o--;      /* no double breaks */
-      }
-      i = j;
-      continue;
-    }
-    if (c == '&') {
-      const char *rep = 0;
-      int adv = 0;
-      if (i + 4 < len && s[i + 1] == 'a' && s[i + 2] == 'm' && s[i + 3] == 'p' && s[i + 4] == ';') { rep = "&"; adv = 5; }
-      else if (i + 3 < len && s[i + 1] == 'l' && s[i + 2] == 't' && s[i + 3] == ';') { rep = "<"; adv = 4; }
-      else if (i + 3 < len && s[i + 1] == 'g' && s[i + 2] == 't' && s[i + 3] == ';') { rep = ">"; adv = 4; }
-      else if (i + 5 < len && s[i + 1] == 'n' && s[i + 2] == 'b' && s[i + 3] == 's' && s[i + 4] == 'p' && s[i + 5] == ';') { rep = " "; adv = 6; }
-      else if (i + 5 < len && s[i + 1] == 'q' && s[i + 2] == 'u' && s[i + 3] == 'o' && s[i + 4] == 't' && s[i + 5] == ';') { rep = "\""; adv = 6; }
-      else if (i + 4 < len && s[i + 1] == '#') {
-        int v = 0, k = i + 2;
-        while (k < len && s[k] >= '0' && s[k] <= '9' && v < 1000) { v = v * 10 + (s[k] - '0'); k++; }
-        if (k < len && s[k] == ';' && v >= 32 && v < 127) {
-          out[o++] = (char)v;
-          i = k;
-          continue;
-        }
-      }
-      if (rep) {
-        for (const char *r = rep; *r && o < max - 1; r++) out[o++] = *r;
-        i += adv - 1;
-        continue;
-      }
-    }
-    if (c == '\r') continue;
-    /* the bitmap face is ascii only: drop whole utf-8 sequences instead of
-       printing a box per byte (page titles are full of em dashes) */
-    if ((unsigned char)c >= 0x80) {
-      while (i + 1 < len && ((unsigned char)s[i + 1] & 0xC0) == 0x80) i++;
-      continue;
-    }
-    if (c == '\t') c = ' ';
-    if (c == '\n') c = ' ';
-    if (c < ' ') continue;
-    if (c == ' ' && o > 0 && out[o - 1] == ' ') continue;   /* collapse runs */
-    out[o++] = c;
+/* ---- page rendering -------------------------------------------------- */
+/* The renderer in gui/omiweb.c owns layout; it only needs to measure text,
+ * which is why the font bitmaps stay in this file. */
+#define ON_PAD_L 14
+
+static const mface *web_faces(int f) {
+  switch (f) {
+    case 1: return &meep_s145;
+    case 2: return &meep_m100;
+    case 3: return &meep_m105;
+    case 4: return &meep_m115;
+    default: return &meep_s130;
   }
-  out[o] = 0;
-  return o;
 }
 
-/* Columns that actually fit: measured from the mono face, not guessed. */
-static int on_cols(void) {
-  meep_app_t *a = &mapp[APP_BROWSER];
-  int cw = meep_text_w(&meep_m100, "mmmmmmmmmm") / 10;
-  if (cw <= 0) cw = 6;
-  int cols = (a->w - 40) / cw;
-  if (cols < 24) cols = 24;
-  if (cols > 90) cols = 90;
-  return cols;
+static int web_measure(int font, const char *s) { return meep_text_w(web_faces(font), s); }
+
+/* re-flow the current document for a new viewport width - no refetch */
+static void web_relayout(void) {
+  if (on_state != 2 || !on_text[0]) return;
+  int cw = mapp[APP_BROWSER].w - 2 * ON_PAD_L;
+  if (cw < 120) cw = 120;
+  if (web_build(on_text, (int)strlen(on_text), cw, web_measure) == 0) on_nlines = web_height();
 }
 
-static void on_wrap(int cols) {
-  on_nlines = 0;
-  int col = 0;
-  int i = 0;
-  char line[92];
-  int ll = 0;
-  line[0] = 0;
-  while (on_text[i] && on_nlines < 400) {
-    if (on_text[i] == '\n') {
-      line[ll] = 0;
-      on_lines[on_nlines][0] = 0;
-      int k = 0;
-      while (k < ll && k < 91) { on_lines[on_nlines][k] = line[k]; k++; }
-      on_lines[on_nlines][k] = 0;
-      on_nlines++;
-      ll = 0; col = 0;
-      i++;
-      continue;
+static void draw_web(int x, int y, int bottom) {
+  int n = web_count();
+  const web_op_t *ops = web_ops();
+  for (int i = 0; i < n; i++) {
+    const web_op_t *o = &ops[i];
+    int oy = y + o->y - on_scroll;
+    int oh = o->h > 0 ? o->h : 4;
+    if (oy > bottom) continue;
+    if (oy + oh < y - 2) continue;
+    if (o->kind == 0) {
+      if (o->h <= 0) continue;
+      meep_box(x + o->x, oy, o->w, o->h, 0, o->color, o->color);
+    } else if (o->kind == 2) {
+      meep_hline(x + o->x, oy, o->w, 1, o->color);
+    } else if (o->text) {
+      const mface *f = web_faces(o->font);
+      meep_text(f, x + o->x, oy, o->text, o->color);
+      if (o->bold) meep_text(f, x + o->x + 1, oy, o->text, o->color);
     }
-    /* word wrap: find the next word */
-    int w = 0;
-    while (on_text[i + w] && on_text[i + w] != ' ' && on_text[i + w] != '\n') w++;
-    if (col + w >= cols && col > 0) {
-      line[ll] = 0;
-      int k = 0;
-      while (k < ll && k < 91) { on_lines[on_nlines][k] = line[k]; k++; }
-      on_lines[on_nlines][k] = 0;
-      on_nlines++;
-      ll = 0; col = 0;
-      if (on_nlines >= 400) break;
-    }
-    for (int k = 0; k < w && ll < 90; k++) { line[ll++] = on_text[i + k]; col++; }
-    i += w;
-    if (on_text[i] == ' ') { if (ll < 90) { line[ll++] = ' '; } col++; i++; }
-  }
-  if (ll > 0 && on_nlines < 400) {
-    int k = 0;
-    while (k < ll && k < 91) { on_lines[on_nlines][k] = line[k]; k++; }
-    on_lines[on_nlines][k] = 0;
-    on_nlines++;
   }
 }
+
 
 static void on_load(void) {
   on_scroll = 0;
@@ -3317,15 +3314,22 @@ static void on_load(void) {
   gui_compose();
   if (!http_get(cfg, url, on_text, ON_MAX, &on_res)) {
     on_state = 3;
-    on_status = on_res.status;        /* -1 dns, -2 tcp, -3 send, -4 not http */
+    on_status = on_res.status;        /* -1 dns, -2 tcp, -3 send, -4 not http, -5 tls */
     return;
   }
   on_status = on_res.status;
   on_state = (on_res.status == 200) ? 2 : 3;
   int n = on_res.len;
   if (n <= 0) n = 0;
-  on_flatten(on_text, n, on_text, ON_MAX);
-  on_wrap(on_cols());
+  if (n > ON_MAX - 1) n = ON_MAX - 1;
+  on_text[n] = 0;
+  {
+    int cw = mapp[APP_BROWSER].w - 2 * ON_PAD_L;
+    if (cw < 120) cw = 120;
+    if (web_build(on_text, n, cw, web_measure) != 0) { on_state = 3; on_status = -4; return; }
+
+  }
+  on_nlines = web_height();
 }
 
 static void on_chip_rect(int i, int *x, int *y, int *w, int *h) {
@@ -3378,14 +3382,13 @@ static void draw_browser(void) {
 
   int bx = a->x + 16, byy = uy + 42;
   int bottom = a->y + a->h - 26;
-  int line_h = 14;
 
   if (on_state == 0) {
     meep_text(&meep_m115, bx, byy, "type a url, press enter", MEEP_INK);
     byy += 24;
-    meep_text(&meep_m100, bx, byy, "http only - this client has no tls,", MEEP_INK_SOFT);
+    meep_text(&meep_m100, bx, byy, "http and https both work.", MEEP_INK_SOFT);
     byy += 16;
-    meep_text(&meep_m100, bx, byy, "so https hosts will refuse to load.", MEEP_INK_SOFT);
+    meep_text(&meep_m100, bx, byy, "bookmarks load, or type and press enter.", MEEP_INK_SOFT);
   } else if (on_state == 1) {
     meep_text(&meep_m115, bx, byy, "fetching...", MEEP_INK);
   } else if (on_state == 3) {
@@ -3394,19 +3397,20 @@ static void draw_browser(void) {
     const char *why = "the reply did not parse.",
                    *hint = "try another host.";
     if (on_status == -1) { why = "dns has no address for that host."; hint = "check the name, or add a dot-com."; }
-    else if (on_status == -2) { why = "the host never opened a port."; hint = "site down, blocked, or https only."; }
+    else if (on_status == -2) { why = "the host never opened a port."; hint = "site down or blocked."; }
     else if (on_status == -3) { why = "the connection died mid request."; hint = "try again."; }
+    else if (on_status == -5) {
+      why = on_res.err[0] ? on_res.err : "the secure connection failed.";
+      hint = "no page was trusted, so nothing was shown.";
+    }
     else if (on_status > 0) { why = "the server refused to serve the page."; hint = "it answered, but not with 200."; }
     meep_text(&meep_m100, bx, byy, why, MEEP_INK_SOFT);
     byy += 16;
     meep_text(&meep_m100, bx, byy, hint, MEEP_INK_SOFT);
-  } else {
-    int rows = (bottom - byy) / line_h;
-    for (int i = 0; i < rows; i++) {
-      int li = on_scroll + i;
-      if (li >= on_nlines) break;
-      meep_text(&meep_m100, bx, byy + i * line_h, on_lines[li], MEEP_INK);
-    }
+  } else if (on_state == 2) {
+    /* the page gets its own paper: html assumes a light canvas */
+    meep_box(a->x + 1, byy - 2, a->w - 2, bottom - byy + 4, 0, 0xFCFAF4, 0xFCFAF4);
+    draw_web(a->x + ON_PAD_L, byy, bottom);
   }
 
   /* status strip, like the web shell's .mn-status */
@@ -3423,12 +3427,12 @@ static void draw_browser(void) {
     const char *q = "failed";
     while (*q) foot[f++] = *q++;
   } else foot[f++] = '-';
-  p = "   lines ";
+  p = "   page ";
   while (*p) foot[f++] = *p++;
   { int v = on_nlines, d[6], n = 0; if (!v) d[n++] = 0;
     while (v) { d[n++] = v % 10; v /= 10; }
     while (n) foot[f++] = (char)('0' + d[--n]); }
-  p = "   scroll ";
+  p = "px   at ";
   while (*p) foot[f++] = *p++;
   { int v = on_scroll, d[6], n = 0; if (!v) d[n++] = 0;
     while (v) { d[n++] = v % 10; v /= 10; }
@@ -3849,6 +3853,13 @@ static int apps_click(int x, int y, int button) {
       needs_redraw = 1;
       return 1;
     }
+    if (x >= a->x + a->w - 18 && y >= a->y + a->h - 18) {
+      /* pulling the corner of a maximised window un-maximises it and keeps
+       * sizing from where it is, the way desktop window managers behave */
+      app_max[e] = 0;
+      resize_app = e; resize_dx = a->x + a->w - x; resize_dy = a->y + a->h - y;
+      needs_redraw = 1; return 1;
+    }
     if (y < a->y + APP_TITLE_H) { drag_app = e; drag_dx = x - a->x; drag_dy = y - a->y; needs_redraw = 1; return 1; }
     if (e == APP_CALC) calc_body_click(x, y);
     if (e == APP_MEDIA) {
@@ -3920,9 +3931,13 @@ static int apps_key(int key) {
     } else if (key == '\n' || key == '\r') {
       on_load();
     } else if (key == KEY_UP) {
-      if (on_scroll > 0) on_scroll--;
+      on_scroll -= 36;
+      if (on_scroll < 0) on_scroll = 0;
     } else if (key == KEY_DOWN) {
-      if (on_scroll < on_nlines - 1) on_scroll++;
+      int maxs = on_nlines - (mapp[APP_BROWSER].h - APP_TITLE_H - 100);
+      if (maxs < 0) maxs = 0;
+      on_scroll += 36;
+      if (on_scroll > maxs) on_scroll = maxs;
     } else if (key >= 32 && key < 127 && n < (int)sizeof(on_url) - 1) {
       on_url[n] = (char)key;
       on_url[n + 1] = 0;
@@ -4845,6 +4860,7 @@ static void gui_poll_input(void) {
   
   /* Release dragging on mouse up */
   if (left_release) {
+    if (resize_app != APP_NONE) { web_relayout(); resize_app = APP_NONE; }
     dragging_window = DRAG_NONE;
     drag_app = APP_NONE;
     wg_drag = -1;
@@ -4860,6 +4876,16 @@ static void gui_poll_input(void) {
     if (ny > (int)screen_height - 40) ny = screen_height - 40;
     a->x = nx; a->y = ny;
     needs_redraw = 1;
+  }
+  if (resize_app != APP_NONE && left_held) {
+    meep_app_t *a = &mapp[resize_app];
+    int nw = new_x + resize_dx - a->x;
+    int nh = new_y + resize_dy - a->y;
+    if (nw < 300) nw = 300;
+    if (nh < 200) nh = 200;
+    if (a->x + nw > (int)screen_width - 6) nw = (int)screen_width - 6 - a->x;
+    if (a->y + nh > (int)screen_height - DOCK_HEIGHT - 4) nh = (int)screen_height - DOCK_HEIGHT - 4 - a->y;
+    if (nw != a->w || nh != a->h) { a->w = nw; a->h = nh; full_redraw = 1; needs_redraw = 1; }
   }
   if (wg_drag >= 0 && left_held) {
     meep_wg_t *g = &mwg[wg_drag];
@@ -5289,6 +5315,7 @@ void gui_compose(void) {
   }
 }
 
+
 void gui_main_loop(void) {
   meep_apply_appearance(appearance_dark);   /* midnight is the boot look */
   /* Initial full redraw */
@@ -5298,6 +5325,10 @@ void gui_main_loop(void) {
   
   unsigned idle = 0;
   while (1) {
+    {
+      static int wx_tried = 0;
+      if (!wx_tried && frame_count > 40 && e1000_link()) { wx_tried = 1; wx_fetch(); }
+    }
     mp_pump();                       /* paces playback at real time */
     /* a focused Omi Net window needs a caret tick even when nothing happens */
     if (++idle > 3000000u) {
@@ -5313,6 +5344,7 @@ void gui_main_loop(void) {
     }
     
     gui_compose();
+
 
 
     /* Minimal yield - just a few pause instructions */
