@@ -9,6 +9,10 @@ are untouched upstream code.
 
 ![Omi desktop](vib-os-x86_64/screenshots/omi-desktop.png)
 
+**Landing page:** [`docs/index.html`](docs/index.html) — the pitch, the stack, and six unretouched
+1280×800 captures taken in QEMU. It is static HTML with no javascript; open the file directly or
+serve the folder.
+
 ## What Omi adds
 
 **Shell.** Flat, shadowless window chrome in the posthog palette (cream paper, `#FFC23D` accent,
