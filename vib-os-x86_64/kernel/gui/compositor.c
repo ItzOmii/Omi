@@ -22,6 +22,7 @@
 #include "limine_modules.h"
 #include "mp3.h"
 #include "../include/hda.h"
+#include "../include/guiipc.h"
 #include "omi_http.h"
 #include "omiweb.h"
 #include "ttf.h"
@@ -2723,8 +2724,35 @@ static void draw_tasks(void) {
     uint32_t ink = (t->state == TASK_RUN) ? MEEP_INK : MEEP_INK_SOFT;
     if (t->state == TASK_RUN)
       fb_fill_rect(x0 - UI_SCALE_VAL(6), y0 + lh / 2 - 2, 4, 4, MEEP_ACCENT_INK);
-    meep_text(&meep_m100, cx_name,  y0, t->name, ink);
-    meep_text(&meep_m100, cx_state, y0, task_state_name(t->state), ink);
+    /* a user-mode task carries a cr3: flag it, and show how it left */
+    char nm[40];
+    int np = 0;
+    while (t->name[np] && np < 30) { nm[np] = t->name[np]; np++; }
+    if (t->cr3) {
+      const char *tag = " (u)";
+      for (int q = 0; tag[q] && np < 38; q++) nm[np++] = tag[q];
+    }
+    nm[np] = 0;
+    meep_text(&meep_m100, cx_name,  y0, nm, ink);
+    if (t->state == TASK_DEAD && t->cr3) {
+      char st[24];
+      int sp2 = 0;
+      if (t->work == (uint64_t)-1) {
+        const char *why = "killed";
+        while (why[sp2]) { st[sp2] = why[sp2]; sp2++; }
+      } else {
+        const char *why = "done ";
+        while (why[sp2]) { st[sp2] = why[sp2]; sp2++; }
+        char code[12];
+        u64s(t->work, code);
+        int cp = 0;
+        while (code[cp] && sp2 < 22) st[sp2++] = code[cp++];
+      }
+      st[sp2] = 0;
+      meep_text(&meep_m100, cx_state, y0, st, ink);
+    } else {
+      meep_text(&meep_m100, cx_state, y0, task_state_name(t->state), ink);
+    }
     char buf[24];
     u64s(t->ticks, buf);
     meep_text(&meep_m100, cx_ticks, y0, buf, ink);
@@ -2742,7 +2770,7 @@ static void draw_tasks(void) {
   }
 
   meep_text(&meep_m100, x0, a->y + a->h - UI_SCALE_VAL(18),
-            "scheduler: round robin, 100 hz tick", MEEP_INK_SOFT);
+            "round robin / 100 hz / (u) = ring 3", MEEP_INK_SOFT);
 }
 
 static void draw_calc(void) {
@@ -4200,6 +4228,310 @@ static int apps_key(int key) {
   return 0;
 }
 
+/* ---- foreign windows: a ring-3 process drawing through the server -------- */
+
+typedef struct {
+  int32_t  kind, x, y, w, h;
+  uint32_t color;
+  char     text[WINIPC_TEXT_MAX];
+} wcmd_t;
+
+#define WINIPC_EVQ 32
+
+typedef struct {
+  int      used, id;
+  int32_t  x, y, w, h;
+  char     title[32];
+  uint32_t bg;
+  int      ncmds;
+  wcmd_t   cmds[WINIPC_MAX_CMDS];
+  /* input queue: mouse and key events waiting for the process to poll them */
+  win_event_t ev[WINIPC_EVQ];
+  int      ev_head, ev_tail;
+  int      owner;                   /* task that opened it: woken on input */
+} fwin_t;
+
+static fwin_t fwin[WINIPC_MAX];
+static int fwin_next_id = 1;
+static fwin_t *fwin_find(int id);      /* defined below the event queue */
+static int fwin_focus = -1;      /* index into fwin[], -1 = none */
+static int fwin_drag = -1, fwin_dx, fwin_dy;
+static int fwin_lastx = -1, fwin_lasty = -1;
+
+static void fwin_push(fwin_t *f, int32_t kind, int32_t x, int32_t y, int32_t code) {
+  int next = (f->ev_head + 1) % WINIPC_EVQ;
+  if (next == f->ev_tail) return;              /* queue full: drop, oldest stays */
+  f->ev[f->ev_head].kind = kind;
+  f->ev[f->ev_head].x = x;
+  f->ev[f->ev_head].y = y;
+  f->ev[f->ev_head].code = code;
+  f->ev_head = next;
+  task_wake(f->owner);              /* a blocked task waiting for input runs */
+}
+
+int winipc_poll(int id, win_event_t *out) {
+  fwin_t *f = fwin_find(id);
+  if (!f || !out) return -1;
+  if (f->ev_tail == f->ev_head) return 0;
+  *out = f->ev[f->ev_tail];
+  f->ev_tail = (f->ev_tail + 1) % WINIPC_EVQ;
+  return 1;
+}
+
+int winipc_owner(int id) {
+  fwin_t *f = fwin_find(id);
+  return f ? f->owner : 0;
+}
+
+/* The process may move and resize its own window; everything is clamped here,
+ * so a bad request cannot put a window off-screen or make it unusable. */
+int winipc_set_rect(int id, int32_t x, int32_t y, int32_t w, int32_t h) {
+  fwin_t *f = fwin_find(id);
+  if (!f) return -1;
+  if (w < 120) w = 120;
+  if (h < 90)  h = 90;
+  if (w > (int32_t)screen_width - 40) w = (int32_t)screen_width - 40;
+  if (h > (int32_t)screen_height - 120) h = (int32_t)screen_height - 120;
+  if (x < 0) x = 0;
+  if (y < APP_TITLE_H) y = APP_TITLE_H;
+  if (x + w > (int32_t)screen_width - 4) x = (int32_t)screen_width - 4 - w;
+  if (y + h > (int32_t)screen_height - 48) y = (int32_t)screen_height - 48 - h;
+  f->x = x; f->y = y; f->w = w; f->h = h;
+  needs_redraw = 1;
+  return 0;
+}
+
+int winipc_get_rect(int id, int32_t *x, int32_t *y, int32_t *w, int32_t *h) {
+  fwin_t *f = fwin_find(id);
+  if (!f) return -1;
+  if (x) *x = f->x;
+  if (y) *y = f->y;
+  if (w) *w = f->w;
+  if (h) *h = f->h;
+  return 0;
+}
+
+int winipc_focused(void) {
+  if (fwin_focus < 0) return 0;
+  fwin_t *f = &fwin[fwin_focus];
+  return f->used ? f->id : 0;
+}
+
+/* Pointer handling for foreign windows. A click anywhere on one of them, and
+ * every move while a drag is in progress, is consumed here: the built-in apps
+ * never see it. */
+int winipc_input(int mx, int my, int buttons, int pressed, int released) {
+  if (fwin_drag >= 0) {
+    fwin_t *f = &fwin[fwin_drag];
+    if (!f->used) {
+      fwin_drag = -1;
+    } else if (buttons & 1) {
+      int nx = mx - fwin_dx, ny = my - fwin_dy;
+      if (nx < 0) nx = 0;
+      if (ny < APP_TITLE_H) ny = APP_TITLE_H;
+      if (nx + f->w > (int)screen_width) nx = (int)screen_width - f->w;
+      if (ny + f->h > (int)screen_height - 48) ny = (int)screen_height - 48 - f->h;
+      if (nx != f->x || ny != f->y) { f->x = nx; f->y = ny; needs_redraw = 1; }
+      return 1;
+    } else {
+      fwin_drag = -1;
+    }
+  }
+
+  int hit = -1;
+  for (int i = 0; i < WINIPC_MAX; i++) {
+    fwin_t *f = &fwin[i];
+    if (!f->used) continue;
+    if (mx >= f->x && mx < f->x + f->w && my >= f->y && my < f->y + f->h) hit = i;
+  }
+  if (hit < 0) return 0;
+
+  fwin_t *f = &fwin[hit];
+  int cxp = mx - f->x - 1;
+  int cyp = my - f->y - APP_TITLE_H;
+
+  if (pressed) {
+    fwin_focus = hit;
+    needs_redraw = 1;
+    if (my < f->y + APP_TITLE_H) {
+      if (app_wctl_hit(mx, my, f->x, f->y, f->w) == 3) {   /* close */
+        fwin_push(f, WIN_EV_CLOSE, 0, 0, 0);
+        winipc_close(f->id);
+        if (fwin_focus == hit) fwin_focus = -1;
+        return 1;
+      }
+      fwin_drag = hit;
+      fwin_dx = mx - f->x;
+      fwin_dy = my - f->y;
+      return 1;
+    }
+    if (cyp >= 0) {
+      fwin_push(f, WIN_EV_DOWN, cxp, cyp, 1);
+    }
+    return 1;
+  }
+
+  if (released) {
+    if (cyp >= 0) fwin_push(f, WIN_EV_UP, cxp, cyp, 0);
+    return 1;
+  }
+
+  if (cxp != fwin_lastx || cyp != fwin_lasty) {
+    fwin_lastx = cxp;
+    fwin_lasty = cyp;
+    if (cyp >= 0) fwin_push(f, WIN_EV_MOVE, cxp, cyp, 0);
+  }
+  return 1;
+}
+
+/* Keyboard goes to the focused foreign window, and nowhere else. */
+int winipc_key(int key) {
+  if (fwin_focus < 0) return 0;
+  fwin_t *f = &fwin[fwin_focus];
+  if (!f->used) { fwin_focus = -1; return 0; }
+  fwin_push(f, WIN_EV_KEY, 0, 0, key);
+  needs_redraw = 1;
+  return 1;
+}
+
+static fwin_t *fwin_find(int id) {
+  for (int i = 0; i < WINIPC_MAX; i++)
+    if (fwin[i].used && fwin[i].id == id) return &fwin[i];
+  return 0;
+}
+
+int winipc_open(const char *title, int32_t w, int32_t h) {
+  int slot = -1;
+  for (int i = 0; i < WINIPC_MAX; i++) if (!fwin[i].used) { slot = i; break; }
+  if (slot < 0) return -1;
+
+  if (w < 120) w = 120;
+  if (h < 80)  h = 80;
+  if (w > 620) w = 620;
+  if (h > 420) h = 420;
+
+  fwin_t *f = &fwin[slot];
+  f->used = 1;
+  f->owner = task_current();
+  f->id = fwin_next_id++;
+  f->w = w;
+  f->h = h;
+  f->x = 150 + slot * 46;
+  f->y = 120 + slot * 40;
+  f->bg = MEEP_PAPER2;
+  f->ncmds = 0;
+
+  int i = 0;
+  while (title && title[i] && i < 31) { f->title[i] = title[i]; i++; }
+  f->title[i] = 0;
+  if (!i) { const char *d = "window"; for (i = 0; d[i]; i++) f->title[i] = d[i]; f->title[i] = 0; }
+
+  needs_redraw = 1;
+  return f->id;
+}
+
+void winipc_close(int id) {
+  fwin_t *f = fwin_find(id);
+  if (!f) return;
+  for (int i = 0; i < WINIPC_MAX; i++) {
+    if (&fwin[i] == f) {
+      if (fwin_focus == i) fwin_focus = -1;
+      if (fwin_drag == i) fwin_drag = -1;
+    }
+  }
+  f->used = 0;
+  needs_redraw = 1;
+}
+
+int winipc_clear(int id, uint32_t color) {
+  fwin_t *f = fwin_find(id);
+  if (!f) return -1;
+  f->bg = color;
+  f->ncmds = 0;
+  needs_redraw = 1;
+  return 0;
+}
+
+int winipc_add(int id, const win_cmd_u *cmd, const char *text) {
+  fwin_t *f = fwin_find(id);
+  if (!f || !cmd) return -1;
+  if (f->ncmds >= WINIPC_MAX_CMDS) return -1;
+
+  wcmd_t *c = &f->cmds[f->ncmds++];
+  c->kind = cmd->kind;
+  c->x = cmd->x; c->y = cmd->y; c->w = cmd->w; c->h = cmd->h;
+  c->color = cmd->color & 0x00FFFFFFu;
+  c->text[0] = 0;
+  if (text) {
+    int i = 0;
+    while (text[i] && i < WINIPC_TEXT_MAX - 1) { c->text[i] = text[i]; i++; }
+    c->text[i] = 0;
+  }
+  needs_redraw = 1;
+  return 0;
+}
+
+void winipc_present(int id) {
+  if (!fwin_find(id)) return;
+  needs_redraw = 1;
+}
+
+void winipc_draw_all(void) {
+  for (int i = 0; i < WINIPC_MAX; i++) {
+    fwin_t *f = &fwin[i];
+    if (!f->used) continue;
+
+    app_win(f->x, f->y, f->w, f->h, f->title, "ring 3", 1);
+
+    /* client area: everything inside the chrome, and every command is clipped
+     * to it so a process cannot draw over the desktop */
+    int cx = f->x + 1, cy = f->y + APP_TITLE_H;
+    int cw = f->w - 2, ch = f->h - APP_TITLE_H - 1;
+    if (cw <= 0 || ch <= 0) continue;
+    fb_fill_rect(cx, cy, cw, ch, f->bg);
+
+    for (int k = 0; k < f->ncmds; k++) {
+      wcmd_t *c = &f->cmds[k];
+
+      if (c->kind == WCMD_TEXT || c->kind == WCMD_TEXT_LARGE) {
+        const mface *fnt = (c->kind == WCMD_TEXT_LARGE) ? &meep_s130 : &meep_m100;
+        int px = cx + c->x, py = cy + c->y;
+        if (px < cx || py < cy) continue;
+        if (py + meep_line_h(fnt) > cy + ch) continue;
+        /* Clip by truncation, not by dropping the line: a process that asks for
+         * a string wider than its window still gets the part that fits drawn. */
+        int avail = (cx + cw) - px;
+        char fit[WINIPC_TEXT_MAX];
+        int n = 0;
+        for (; c->text[n] && n < WINIPC_TEXT_MAX - 1; n++) {
+          fit[n] = c->text[n];
+          fit[n + 1] = 0;
+          if (meep_text_w(fnt, fit) > avail) { fit[n] = 0; break; }
+        }
+        if (n == 0) continue;
+        meep_text(fnt, px, py, fit, c->color);
+        continue;
+      }
+
+      int rx = cx + c->x, ry = cy + c->y, rw = c->w, rh = c->h;
+      if (rx < cx) { rw -= (cx - rx); rx = cx; }
+      if (ry < cy) { rh -= (cy - ry); ry = cy; }
+      if (rx + rw > cx + cw) rw = cx + cw - rx;
+      if (ry + rh > cy + ch) rh = cy + ch - ry;
+      if (rw <= 0 || rh <= 0) continue;
+
+      if (c->kind == WCMD_RECT) {
+        fb_fill_rect(rx, ry, rw, rh, c->color);
+      } else if (c->kind == WCMD_FRAME) {
+        fb_fill_rect(rx, ry, rw, 1, c->color);
+        fb_fill_rect(rx, ry + rh - 1, rw, 1, c->color);
+        fb_fill_rect(rx, ry, 1, rh, c->color);
+        fb_fill_rect(rx + rw - 1, ry, 1, rh, c->color);
+      }
+    }
+  }
+}
+
 static void apps_draw(void) {
   if (zl_n == 0) z_init();
   for (int i = 0; i < zl_n; i++) {
@@ -4219,6 +4551,7 @@ static void apps_draw(void) {
     else if (e == APP_MEDIA) draw_media();
     else if (e == APP_BROWSER) draw_browser();
   }
+  winipc_draw_all();          /* ring-3 windows sit above the built-in apps */
 }
 typedef struct { const char *title; const mitem *items; int n; } mmenu;
 
@@ -4528,6 +4861,9 @@ static void keyboard_callback(int key) {
   
   /* Any key press triggers redraw */
   needs_redraw = 1;
+
+  /* keys belong to a focused ring-3 window first */
+  if (winipc_key(key)) return;
   
   /* F1-F8: Change wallpaper */
   if (key >= KEY_F1 && key <= KEY_F8) {
@@ -5079,6 +5415,15 @@ static void gui_poll_input(void) {
   int buttons = ps2_get_mouse_buttons();
   int left_held = buttons & 1;
   int left_release = !(buttons & 1) && (prev_buttons & 1);
+  int left_press = (buttons & 1) && !(prev_buttons & 1);
+
+  /* A foreign window that owns the pointer consumes the click: the built-in
+   * apps and the desktop never see it. */
+  if (winipc_input(new_x, new_y, buttons, left_press, left_release)) {
+    prev_buttons = buttons;
+    needs_redraw = 1;
+    return;
+  }
   
   /* Handle window dragging */
   if (dragging_window != DRAG_NONE && left_held) {
@@ -5626,7 +5971,6 @@ void gui_main_loop(void) {
       for (volatile int d = 0; d < 100; d++) __asm__ volatile("pause");
     }
     gui_compose();
-
 
 
 

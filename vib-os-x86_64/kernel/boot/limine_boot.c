@@ -16,6 +16,8 @@
 #include "../include/e1000.h"
 #include "../include/net.h"
 #include "../include/hda.h"
+#include "../include/ring3.h"
+#include "../include/elf.h"
 
 /* ========== Limine Requests ========== */
 
@@ -445,6 +447,18 @@ void _start(void) {
   __asm__ volatile("sti");
 
   task_demo_start();
+
+  /* User mode: one address space and one iretq away from the kernel. "init"
+   * runs a normal write/yield/exit path; "probe" reads a kernel address and
+   * must be killed for it, without taking the system down. */
+  ring3_init();
+  ring3_spawn_elf("init",  "init.elf", 0);
+  ring3_spawn_elf("probe", "init.elf", 1);
+  ring3_spawn_elf("spin",  "init.elf", 2);
+  ring3_spawn_elf("ui",    "init.elf", 3);
+  ring3_spawn_elf("shmw",  "init.elf", 4);
+  ring3_spawn_elf("shmr",  "init.elf", 5);
+
   serial_puts("Starting main loop...\n");
 
   /* Main rendering loop */

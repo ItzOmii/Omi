@@ -97,6 +97,8 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/gui/ttf.c \
            $(KERNEL_DIR)/kernel_task.c \
            $(KERNEL_DIR)/gdt.c \
+           $(KERNEL_DIR)/ring3.c \
+           $(KERNEL_DIR)/elf.c \
            $(KERNEL_DIR)/gui/webimg.c \
            $(KERNEL_DIR)/gui/icons_ri.c \
            $(KERNEL_DIR)/net/tcp.c \
@@ -129,6 +131,12 @@ GUMBO_DIR  := kernel/lib/gumbo
 GUMBO_ALL  := $(wildcard $(GUMBO_DIR)/src/*.c) $(GUMBO_DIR)/glue.c
 GUMBO_SRC  := $(GUMBO_ALL)
 GUMBO_OBJ  := $(patsubst $(KERNEL_DIR)/lib/gumbo/%.c,$(BUILD_DIR)/lib/gumbo/%.o,$(GUMBO_SRC))
+
+# The first user-mode program: a static ELF built freestanding and linked at
+# the address ring3.c/elf.c map it to. It travels on the ISO as a boot module.
+USER_SRC := $(KERNEL_DIR)/user/init.c
+USER_LD  := $(KERNEL_DIR)/user/app.ld
+USER_ELF := $(BUILD_DIR)/init.elf
 
 OBJECTS := $(patsubst $(KERNEL_DIR)/%.c,$(BUILD_DIR)/%.o,$(SOURCES)) \
            $(patsubst $(BEARSSL)/src/%.c,$(BUILD_DIR)/lib/bearssl/%.o,$(BEARSSL_SOURCES)) \
@@ -172,6 +180,16 @@ $(BUILD_DIR)/gui/omiweb.o: $(KERNEL_DIR)/gui/omiweb.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) -I$(GUMBO_DIR)/port -I$(GUMBO_DIR)/src $(CFLAGS) -c $< -o $@
 
+# The user program. Freestanding C, no libc, no relocations, linked by its own
+# script (kernel/user/app.ld) at 0x8000000000 - the window elf.c maps.
+$(USER_ELF): $(USER_SRC) $(USER_LD) | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(CC) -target x86_64-unknown-none-elf -ffreestanding -fno-stack-protector \
+	      -fno-pic -mno-red-zone -mcmodel=large -O1 -c $(USER_SRC) -o $(BUILD_DIR)/user_init.o
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T $(USER_LD) \
+	      -o $@ $(BUILD_DIR)/user_init.o
+	@echo "user elf: $$(stat -c %s $@) bytes"
+
 # Compile C files
 $(BUILD_DIR)/%.o: $(KERNEL_DIR)/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
@@ -196,7 +214,7 @@ $(LIMINE_DIR):
 	cd $(LIMINE_DIR) && ./configure --enable-uefi-x86-64 && make
 
 # Create ISO
-$(ISO): $(KERNEL) $(LIMINE_DIR)
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR)
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -205,6 +223,10 @@ $(ISO): $(KERNEL) $(LIMINE_DIR)
 	
 	# Copy kernel
 	cp $(KERNEL) $(ISO_ROOT)/boot/kernel.elf
+
+	# User programs, exposed to the kernel as boot modules
+	mkdir -p $(ISO_ROOT)/apps
+	cp $(USER_ELF) $(ISO_ROOT)/apps/init.elf
 
 	# Media samples, exposed to the kernel as boot modules
 	mkdir -p $(ISO_ROOT)/media

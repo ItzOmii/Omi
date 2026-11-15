@@ -70,15 +70,21 @@ DEFINE_IRQ_HANDLER(13)
 DEFINE_IRQ_HANDLER(14)
 DEFINE_IRQ_HANDLER(15)
 
-static void idt_set_gate(uint8_t vector, void *handler) {
+/* Install any gate: `dpl3` marks it callable from ring 3 (int 0x80), which is
+ * the difference between a trap a user task may take and one it may not. */
+void idt_set_gate_raw(uint8_t vector, void *handler, int dpl3) {
   uint64_t addr = (uint64_t)handler;
   idt[vector].offset_low = addr & 0xFFFF;
   idt[vector].selector = 0x08;
   idt[vector].ist = 0;
-  idt[vector].type_attr = 0x8E; /* present, ring0, interrupt gate */
+  idt[vector].type_attr = (uint8_t)(0x8E | (dpl3 ? 0x60 : 0x00));
   idt[vector].offset_mid = (addr >> 16) & 0xFFFF;
   idt[vector].offset_high = (addr >> 32) & 0xFFFFFFFF;
   idt[vector].zero = 0;
+}
+
+static void idt_set_gate(uint8_t vector, void *handler) {
+  idt_set_gate_raw(vector, handler, 0);
 }
 
 __attribute__((interrupt)) static void isr_default(interrupt_frame_t *frame) {

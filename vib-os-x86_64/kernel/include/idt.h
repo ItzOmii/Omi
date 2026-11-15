@@ -19,6 +19,7 @@ typedef void (*isr_handler_t)(interrupt_frame_t *frame);
 
 void idt_init(void);
 void idt_register_handler(uint8_t vector, isr_handler_t handler);
+void idt_set_gate_raw(uint8_t vector, void *handler, int dpl3);
 
 void pic_init(void);
 void pic_send_eoi(uint8_t irq);
