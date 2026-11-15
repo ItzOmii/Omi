@@ -7,6 +7,7 @@
 #include "net.h"
 #include "omi_net.h"
 #include "omi_http.h"
+#include "omi_tls.h"
 
 
 #define SCRATCH_MAX 24576
@@ -27,8 +28,9 @@ static int a_to_i(const char *s) {
 int http_parse_url(const char *url, char *host, int host_max, uint16_t *port,
                    char *path, int path_max) {
   const char *s = url;
+  int tls = 0;
   if (starts_with(s, "http://")) s += 7;
-  else if (starts_with(s, "https://")) return 0;   /* no TLS in here */
+  else if (starts_with(s, "https://")) { s += 8; tls = 1; }
   else if (s[0] == '/') return 0;                  /* relative, caller's job */
   else if (!s[0]) return 0;
 
@@ -37,7 +39,7 @@ int http_parse_url(const char *url, char *host, int host_max, uint16_t *port,
   host[h] = 0;
   if (h == 0) return 0;
 
-  *port = 80;
+  *port = tls ? 443 : 80;
   if (*s == ':') {
     s++;
     int p = a_to_i(s);
@@ -108,12 +110,19 @@ int http_get(const net_cfg_t *cfg, const char *url, char *body, int body_max,
   uint16_t port = 80;
   uint8_t ip[4];
 
-  res->status = 0; res->len = 0; res->truncated = 0;
-  res->title[0] = 0;
+  res->status = 0; res->len = 0; res->truncated = 0; res->secure = 0;
+  res->title[0] = 0; res->err[0] = 0;
   if (body_max <= 0) return 0;
   body[0] = 0;
 
   if (!http_parse_url(url, host, sizeof host, &port, path, sizeof path)) { res->status = -1; return 0; }
+
+  int want_tls = 0;
+  {
+    const char *q = url;
+    if (q[0] == 'h' && q[1] == 't' && q[2] == 't' && q[3] == 'p' && q[4] == 's' && q[5] == ':')
+      want_tls = 1;
+  }
 
   /* dotted quad or name? */
   int dotted = 1, dots = 0;
@@ -134,6 +143,29 @@ int http_get(const net_cfg_t *cfg, const char *url, char *body, int body_max,
 
   if (!tcp_connect(cfg, ip, port)) { res->status = -2; return 0; }
 
+  if (want_tls) {
+    int tr = tls_start(host);
+    if (tr != TLS_OK) {
+      /* Say which part of TLS failed, and the engine code when we have one. */
+      res->status = -5;
+      const char *why = tls_error_text(tr);
+      int o = 0;
+      for (const char *p = why; *p && o < (int)sizeof res->err - 12; p++) res->err[o++] = *p;
+      int e = tls_last_error();
+      if (e > 0 && o < (int)sizeof res->err - 8) {
+        char nb[8]; int nl = 0;
+        while (e > 0 && nl < 7) { nb[nl++] = (char)('0' + e % 10); e /= 10; }
+        res->err[o++] = ' '; res->err[o++] = '(';
+        while (nl > 0) res->err[o++] = nb[--nl];
+        res->err[o++] = ')';
+      }
+      res->err[o] = 0;
+      tcp_close();
+      return 0;
+    }
+    res->secure = 1;
+  }
+
   char req[512];
   int rl = 0;
   const char *hdr1 = "GET ";
@@ -148,17 +180,24 @@ int http_get(const net_cfg_t *cfg, const char *url, char *body, int body_max,
   for (const char *p = tail; *p && rl < 511; p++) req[rl++] = *p;
   req[rl] = 0;
 
-  if (tcp_send(req, rl) != rl) { res->status = -3; tcp_close(); return 0; }
+  if (want_tls) {
+    if (tls_send_all(req, rl) != TLS_OK) { res->status = -3; tls_shutdown(); tcp_close(); return 0; }
+  } else {
+    if (tcp_send(req, rl) != rl) { res->status = -3; tcp_close(); return 0; }
+  }
 
   int total = 0;
   int closed = 0;
   while (!closed && total < SCRATCH_MAX) {
-    int n = tcp_recv(raw + total, SCRATCH_MAX - total - 1, 4000);
+    int n = want_tls ? tls_recv(raw + total, SCRATCH_MAX - total - 1, 4000)
+                     : tcp_recv(raw + total, SCRATCH_MAX - total - 1, 4000);
     if (n > 0) { total += n; continue; }
-    if (n < 0) closed = 1;
-    else break;                       /* idle timeout */
+    if (n < 0) { closed = 1; break; }  /* plain TCP: peer closed */
+    if (n == 0 && !want_tls) break;    /* plain idle timeout */
+    if (n == 0 && want_tls) closed = 1;/* TLS: end of stream */
   }
   raw[total] = 0;
+  if (want_tls) tls_shutdown();
   tcp_close();
   if (total <= 0) return 0;
 

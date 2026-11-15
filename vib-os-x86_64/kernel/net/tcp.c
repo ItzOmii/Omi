@@ -151,6 +151,8 @@ static void pick_route(const net_cfg_t *cfg, const uint8_t ip[4], uint8_t mac[6]
   memcpy(mac, cfg->gw_mac, 6);
 }
 
+static void tcp_pend_clear(void);   /* defined with the receive path */
+
 int tcp_connect(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t port) {
   if (!cfg || !cfg->valid) return 0;
   s_cfg = *cfg;
@@ -192,6 +194,7 @@ int tcp_connect(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t port) {
             s_seq += 1;                 /* our SYN consumed one sequence number */
             tcp_seg(TCP_ACK, 0, 0);
             s_open = 1;
+            tcp_pend_clear();
             return 1;
           }
         }
@@ -216,11 +219,32 @@ int tcp_send(const void *buf, int len) {
   return sent;
 }
 
+/* Bytes that arrived inside a segment but did not fit the caller's buffer.
+ * Without this, a short read (TLS asks for the 5-byte record header first)
+ * ACKed the whole segment and threw the rest away, which corrupted every
+ * handshake. One segment at a time is all we ever need. */
+#define TCP_PEND_MAX 2048
+static uint8_t s_pend[TCP_PEND_MAX];
+static int s_pend_off = 0;
+static int s_pend_len = 0;
+
+static void tcp_pend_clear(void) { s_pend_off = 0; s_pend_len = 0; }
+
+static int tcp_pend_take(void *buf, int max) {
+  int n = s_pend_len - s_pend_off;
+  if (n > max) n = max;
+  if (n > 0) memcpy(buf, s_pend + s_pend_off, (size_t)n);
+  s_pend_off += n;
+  if (s_pend_off >= s_pend_len) tcp_pend_clear();
+  return n;
+}
+
 int tcp_recv(void *buf, int max, int timeout_ms) {
   if (!s_open) return -1;
   uint8_t r[1600];
   uint8_t *out = (uint8_t *)buf;
   if (max <= 0) return 0;
+  if (s_pend_off < s_pend_len) return tcp_pend_take(out, max);
   pace_init();
   while (pace_ms() < (uint32_t)timeout_ms) {
     int n = e1000_poll_recv(r, sizeof r);
@@ -241,8 +265,19 @@ int tcp_recv(void *buf, int max, int timeout_ms) {
       int take = payload;
       if (take > max) take = max;
       if (seq == s_ack) {
-        memcpy(out, t + ihl, (size_t)take);
+        /* ACK for everything we accepted, and keep what does not fit. */
         s_ack += (uint32_t)payload;
+        if (payload <= TCP_PEND_MAX) {
+          memcpy(s_pend, t + ihl, (size_t)payload);
+          s_pend_len = payload;
+          s_pend_off = take;
+          if (take > 0) memcpy(out, s_pend, (size_t)take);
+        } else {
+          /* Cannot happen with a 1500-byte MTU, but do not lie if it does. */
+          tcp_pend_clear();
+          memcpy(out, t + ihl, (size_t)take);
+          s_ack = seq + (uint32_t)take;
+        }
         tcp_seg(TCP_ACK, 0, 0);
         if (flags & TCP_FIN) { s_ack += 1; tcp_seg(TCP_ACK, 0, 0); s_open = 0; }
         return take;
@@ -266,6 +301,7 @@ int tcp_recv(void *buf, int max, int timeout_ms) {
 }
 
 void tcp_close(void) {
+  tcp_pend_clear();
   if (s_open) {
     s_seq += 1;
     tcp_seg((uint8_t)(TCP_FIN | TCP_ACK), 0, 0);
