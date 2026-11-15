@@ -1,5 +1,5 @@
 /*
- * VibCode x64 - Page Attribute Table (PAT) and Write-Combining Support
+ * MeepOS x86_64 - Page Attribute Table (PAT) and Write-Combining Support
  * Enables fast framebuffer access on real hardware
  */
 

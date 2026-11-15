@@ -9,6 +9,11 @@
 #include "../include/acpi.h"
 #include "../include/string.h"
 #include "../include/types.h"
+#include "../include/limine_modules.h"
+#include "../include/mp3.h"
+#include "../include/e1000.h"
+#include "../include/net.h"
+#include "../include/hda.h"
 
 /* ========== Limine Requests ========== */
 
@@ -47,6 +52,14 @@ __attribute__((used,
                     .revision = 0,
                     .response = NULL};
 
+/* Memory map request (so the GUI can report real installed RAM) */
+__attribute__((used,
+               section(".limine_requests"))) static volatile struct limine_memmap_request
+    memmap_request = {.id = {0xc7b1dd30df4c8b88, 0x0a82e883a194f07b,
+                             0x67cf3d9d378a806f, 0xe304acdfc50c3c62},
+                      .revision = 0,
+                      .response = NULL};
+
 /* Kernel address request (physical/virtual base) */
 __attribute__((used,
                section(".limine_requests"))) static volatile struct limine_kernel_address_request
@@ -55,8 +68,18 @@ __attribute__((used,
                               .revision = 0,
                               .response = NULL};
 
+/* Boot modules: files handed over from the boot medium (see limine.conf) */
+__attribute__((used, section(".limine_requests"))) static volatile struct meep_module_request
+    module_request = {.id = {0xc7b1dd30df4c8b88, 0x0a82e883a194f07b,
+                             LIMINE_MODULE_REQUEST_ID0, LIMINE_MODULE_REQUEST_ID1},
+                      .revision = 0,
+                      .response = NULL,
+                      .internal_module_count = 0,
+                      .internal_modules = NULL};
+
 /* Global HHDM offset for drivers to use */
 uint64_t hhdm_offset = 0xFFFF800000000000ULL;
+uint64_t system_ram_bytes = 0;   /* sum of LIMINE_MEMMAP_USABLE */
 uint64_t kernel_phys_base = 0;
 uint64_t kernel_virt_base = 0;
 
@@ -232,11 +255,52 @@ static void direct_screen_test(void *fb_addr, uint64_t width, uint64_t height,
 
 /* ========== Kernel Main ========== */
 
+/*
+ * Enable the FPU/SSE units.
+ *
+ * We compile the kernel with -mno-sse, but code we link in from compiler-rt
+ * (soft-float helpers pulled in by the MP3 decoder) is baseline x86_64 and
+ * uses SSE registers. Without CR4.OSFXSR the first such instruction is #UD
+ * and the machine triple-faults.
+ */
+/*
+ * compiler-rt is built with stack protection, so its objects read the canary
+ * from %fs:0x28. Give the kernel an FS base with a canary in the right slot;
+ * otherwise the first soft-float call page-faults at address 0x28.
+ */
+static uint8_t kernel_fs_area[64] __attribute__((aligned(64)));
+
+static void cpu_setup_fs_canary(void) {
+  *(uint64_t *)(kernel_fs_area + 0x28) = 0x9E3779B97F4A7C15ULL;
+  uint64_t base = (uint64_t)(uintptr_t)kernel_fs_area;
+  uint32_t lo = (uint32_t)base;
+  uint32_t hi = (uint32_t)(base >> 32);
+  __asm__ volatile("wrmsr" ::"c"(0xC0000100), "a"(lo), "d"(hi)); /* IA32_FS_BASE */
+}
+
+static void cpu_enable_fpu_sse(void) {
+  uint64_t cr0, cr4;
+  __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+  cr0 &= ~((uint64_t)1 << 2); /* EM = 0 : no FPU emulation */
+  cr0 &= ~((uint64_t)1 << 3); /* TS = 0 : no lazy context switch */
+  __asm__ volatile("mov %0, %%cr0" ::"r"(cr0));
+
+  __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+  cr4 |= ((uint64_t)1 << 9);  /* OSFXSR: enable FXSAVE/FXRSTOR, SSE state */
+  cr4 |= ((uint64_t)1 << 10); /* OSXMMEXCPT: enable #XF for SSE faults */
+  __asm__ volatile("mov %0, %%cr4" ::"r"(cr4));
+  __asm__ volatile("fninit");
+}
+
 void _start(void) {
   /* Initialize serial for debug output */
   serial_init();
   serial_puts("\n\n=== UEFI Demo OS ===\n");
   serial_puts("Kernel entry point reached!\n");
+
+  /* FPU/SSE + FS base, before any float (compiler-rt) code can run */
+  cpu_enable_fpu_sse();
+  cpu_setup_fs_canary();
 
   /* Initialize IDT/PIC (interrupts still disabled by default) */
   idt_init();
@@ -253,12 +317,27 @@ void _start(void) {
   serial_puts("Limine base revision OK\n");
 
   /* Get HHDM offset for physical memory access */
+  if (memmap_request.response) {
+    struct limine_memmap_response *mr = memmap_request.response;
+    for (uint64_t i = 0; i < mr->entry_count; i++) {
+      struct limine_memmap_entry *e = mr->entries[i];
+      if (e->type == 0) system_ram_bytes += e->length;   /* LIMINE_MEMMAP_USABLE */
+    }
+  }
+
+  serial_puts("RAM usable: ");
+  serial_puthex(system_ram_bytes);
+  serial_puts("\n");
+
   if (hhdm_request.response) {
     hhdm_offset = hhdm_request.response->offset;
     serial_puts("HHDM offset: ");
     serial_puthex(hhdm_offset);
     serial_puts("\n");
   }
+
+  /* Boot modules (sample media) */
+  meep_modules_probe((void *)module_request.response);
 
   /* Get kernel physical/virtual base */
   if (kernel_address_request.response) {
@@ -342,7 +421,13 @@ void _start(void) {
     for (int i = 0; i < 50; i++) row[70 + i] = 0xFF00FF00;
   }
 
+  serial_puts("Initializing NIC...\n");
+  net_selftest();
+  serial_puts("Initializing HDA...\n");
+  hda_selftest();
+
   serial_puts("Initializing GUI...\n");
+  meep_mp3_selftest();
   gui_init();
 
   /* Visual checkpoint: BLUE = gui_init done, starting main loop */

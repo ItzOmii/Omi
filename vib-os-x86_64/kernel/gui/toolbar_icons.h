@@ -1,5 +1,5 @@
 /*
- * Toolbar Icons for vib-OS Image Viewer
+ * Toolbar Icons for MeepOS Image Viewer
  * Generated from Feather Icons (MIT Licensed)
  */
 

@@ -1,5 +1,5 @@
 /*
- * VibCode x64 - Simple RAM-based Virtual Filesystem
+ * MeepOS x86_64 - Simple RAM-based Virtual Filesystem
  */
 
 #include "../include/vfs.h"
@@ -148,7 +148,7 @@ void vfs_seed_content(void) {
   
   f = vfs_open("/Desktop/readme.txt", O_CREAT | O_WRONLY);
   if (f) {
-    const char *txt = "Welcome to Vib-os!\n\nThis is a demo operating system.\n";
+    const char *txt = "Welcome to Omi!\n\nThis is a demo operating system.\n";
     vfs_write(f, txt, strlen(txt));
     vfs_close(f);
   }
@@ -162,7 +162,7 @@ void vfs_seed_content(void) {
   
   f = vfs_open("/etc/hostname", O_CREAT | O_WRONLY);
   if (f) {
-    vfs_write(f, "vibcode", 7);
+    vfs_write(f, "meepos", 7);
     vfs_close(f);
   }
   

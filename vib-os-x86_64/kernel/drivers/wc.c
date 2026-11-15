@@ -1,5 +1,5 @@
 /*
- * VibCode x64 - Write-Combining Framebuffer Support
+ * MeepOS x86_64 - Write-Combining Framebuffer Support
  * 
  * Implements proper MTRR configuration for fast framebuffer access.
  * Based on Intel/AMD documentation and Linux kernel implementation.

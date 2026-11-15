@@ -1,5 +1,5 @@
 /*
- * VibCode x64 - Write-Combining Support Header
+ * MeepOS x86_64 - Write-Combining Support Header
  */
 
 #ifndef _WC_H

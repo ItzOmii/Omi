@@ -20,7 +20,7 @@ ISO_ROOT := iso_root
 
 # Output files
 KERNEL := $(BUILD_DIR)/kernel.elf
-ISO := uefi-demo.iso
+ISO := omi.iso
 
 # Compiler flags
 CFLAGS := -target x86_64-unknown-none-elf \
@@ -69,9 +69,13 @@ LDFLAGS := -nostdlib \
            -z max-page-size=0x1000 \
            -T $(KERNEL_DIR)/linker.ld
 
+# compiler-rt soft-float helpers (minimp3 uses float maths, kernel is -mno-sse)
+BUILTINS := $(shell ls /usr/lib/llvm-*/lib/clang/*/lib/linux/libclang_rt.builtins-x86_64.a 2>/dev/null | head -1)
+
 # Source files
 SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/lib/string.c \
+           $(KERNEL_DIR)/lib/builtins_shim.c \
            $(KERNEL_DIR)/mm/kmalloc.c \
            $(KERNEL_DIR)/mm/mmio.c \
            $(KERNEL_DIR)/fs/vfs.c \
@@ -80,6 +84,9 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/drivers/wc.c \
            $(KERNEL_DIR)/drivers/ps2.c \
            $(KERNEL_DIR)/drivers/pci.c \
+           $(KERNEL_DIR)/drivers/e1000.c \
+           $(KERNEL_DIR)/net/net.c \
+           $(KERNEL_DIR)/drivers/hda.c \
            $(KERNEL_DIR)/drivers/acpi.c \
            $(KERNEL_DIR)/drivers/usb.c \
            $(KERNEL_DIR)/drivers/usb_hid.c \
@@ -90,7 +97,12 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/gui/desktop_mgr.c \
            $(KERNEL_DIR)/gui/window.c \
            $(KERNEL_DIR)/gui/compositor.c \
+           $(KERNEL_DIR)/gui/icons_ri.c \
+           $(KERNEL_DIR)/net/tcp.c \
+           $(KERNEL_DIR)/net/http.c \
            $(KERNEL_DIR)/media/media.c \
+           $(KERNEL_DIR)/media/modules.c \
+           $(KERNEL_DIR)/media/mp3.c \
            $(KERNEL_DIR)/media/picojpeg.c \
            $(KERNEL_DIR)/media/hd_wallpaper_landscape.c \
            $(KERNEL_DIR)/media/hd_wallpaper_nature.c \
@@ -118,6 +130,13 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)/gui
 	mkdir -p $(BUILD_DIR)/media
 
+# MP3 decoding needs real SSE maths: minimp3 works in float, and the kernel's
+# default -mno-sse soft-float ABI does not match compiler-rt / xmm registers.
+# Only this file gets SSE; interrupt handlers stay integer-only.
+$(BUILD_DIR)/media/mp3.o: $(KERNEL_DIR)/media/mp3.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -msse -msse2 -mfpmath=sse -c $< -o $@
+
 # Compile C files
 $(BUILD_DIR)/%.o: $(KERNEL_DIR)/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
@@ -125,7 +144,7 @@ $(BUILD_DIR)/%.o: $(KERNEL_DIR)/%.c | $(BUILD_DIR)
 
 # Link kernel
 $(KERNEL): $(OBJECTS)
-	$(LD) $(LDFLAGS) $(OBJECTS) -o $@
+	$(LD) $(LDFLAGS) $(OBJECTS) $(BUILTINS) -o $@
 
 # Download and build Limine
 $(LIMINE_DIR):
@@ -145,6 +164,10 @@ $(ISO): $(KERNEL) $(LIMINE_DIR)
 	
 	# Copy kernel
 	cp $(KERNEL) $(ISO_ROOT)/boot/kernel.elf
+
+	# Media samples, exposed to the kernel as boot modules
+	mkdir -p $(ISO_ROOT)/media
+	cp assets/sample.mp3 assets/sample.mp4 $(ISO_ROOT)/media/
 	
 	# Copy Limine config to ALL locations Limine searches
 	cp limine.conf $(ISO_ROOT)/limine.conf
@@ -163,6 +186,7 @@ $(ISO): $(KERNEL) $(LIMINE_DIR)
 		-no-emul-boot -boot-load-size 4 -boot-info-table \
 		--efi-boot boot/limine-uefi-cd.bin \
 		-efi-boot-part --efi-boot-image --protective-msdos-label \
+		-V OMI -A "Omi" -p "Omi" \
 		$(ISO_ROOT) -o $(ISO)
 	
 	# Install Limine for hybrid boot

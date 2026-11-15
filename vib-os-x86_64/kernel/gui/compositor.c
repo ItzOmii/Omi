@@ -1,18 +1,27 @@
 /*
- * VibCode x64 - Complete GUI Compositor
+ * MeepOS x86_64 - Complete GUI Compositor
  * Desktop, Dock, Context Menu, Terminal, File Manager, Windows
  * With HD Wallpaper support and real dock icons
  */
 
+#include "../include/e1000.h"
 #include "../include/font.h"
 #include "../include/gui.h"
 #include "../include/kmalloc.h"
 #include "../include/media.h"
+#include "../include/pci.h"
 #include "../include/ps2.h"
 #include "../include/usb.h"
 #include "../include/string.h"
 #include "../include/vfs.h"
 #include "dock_icons.h"
+#include "meep_font.h"
+#include "icons_ri.h"
+#include "omi_net.h"
+#include "limine_modules.h"
+#include "mp3.h"
+#include "../include/hda.h"
+#include "omi_http.h"
 
 /* External font data */
 extern const uint8_t font_data[256][16];
@@ -60,6 +69,60 @@ extern unsigned int hd_wallpaper_city_jpg_len;
 #define COLOR_TERM_BG 0x1E1E2E
 #define COLOR_TERM_FG 0xCDD6F4
 
+/* ===================================================================== */
+/* MeepOS palette - values lifted from sites/meepos/index.html :root     */
+/* ===================================================================== */
+/* The palette is runtime state, not compile-time constants: the menubar's
+   appearance toggle swaps every value below between the web shell's "paper"
+   and "midnight" :root blocks, and a full redraw repaints everything with it.
+   Keep the names - every draw site already reads them. */
+static uint32_t MEEP_PAPER      = MAKE_COLOR(0xED, 0xEB, 0xDD); /* --paper     */
+static uint32_t MEEP_PAPER2     = MAKE_COLOR(0xF7, 0xF5, 0xEA); /* --paper-2   */
+static uint32_t MEEP_PAPER3     = MAKE_COLOR(0xE2, 0xE0, 0xCE); /* --paper-3   */
+static uint32_t MEEP_INK        = MAKE_COLOR(0x16, 0x16, 0x0F); /* --ink       */
+static uint32_t MEEP_INK_SOFT   = MAKE_COLOR(0x63, 0x63, 0x5A); /* --ink-soft  */
+static uint32_t MEEP_LINE       = MAKE_COLOR(0xC6, 0xC5, 0xB3); /* --line      */
+static uint32_t MEEP_ACCENT     = MAKE_COLOR(0xFF, 0xC2, 0x3D); /* --accent    */
+static uint32_t MEEP_ACCENT_INK = MAKE_COLOR(0x23, 0x1A, 0x00); /* --accent-ink*/
+static uint32_t MEEP_OK         = MAKE_COLOR(0x4A, 0x9D, 0x58); /* --ok        */
+static uint32_t MEEP_LINE_SOFT  = MAKE_COLOR(0xD8, 0xD7, 0xC6); /* --line-soft */
+static uint32_t MEEP_PRESS      = MAKE_COLOR(0xD2, 0xD0, 0xBE); /* pressed tile*/
+
+/* 0 = paper, 1 = midnight. Mirrors index.html's :root[data-theme] blocks. */
+static int appearance_dark = 1;   /* boot appearance: midnight */
+
+static int appearance_wall_dirty = 0;
+
+static void meep_apply_appearance(int dark) {
+  appearance_dark = dark ? 1 : 0;
+  appearance_wall_dirty = 1;
+  if (!appearance_dark) {
+    MEEP_PAPER      = MAKE_COLOR(0xED, 0xEB, 0xDD);
+    MEEP_PAPER2     = MAKE_COLOR(0xF7, 0xF5, 0xEA);
+    MEEP_PAPER3     = MAKE_COLOR(0xE2, 0xE0, 0xCE);
+    MEEP_INK        = MAKE_COLOR(0x16, 0x16, 0x0F);
+    MEEP_INK_SOFT   = MAKE_COLOR(0x63, 0x63, 0x5A);
+    MEEP_LINE       = MAKE_COLOR(0xC6, 0xC5, 0xB3);
+    MEEP_LINE_SOFT  = MAKE_COLOR(0xD8, 0xD7, 0xC6);
+    MEEP_PRESS      = MAKE_COLOR(0xD2, 0xD0, 0xBE);
+    MEEP_ACCENT     = MAKE_COLOR(0xFF, 0xC2, 0x3D);
+    MEEP_ACCENT_INK = MAKE_COLOR(0x23, 0x1A, 0x00);
+    MEEP_OK         = MAKE_COLOR(0x4A, 0x9D, 0x58);
+  } else {
+    MEEP_PAPER      = MAKE_COLOR(0x17, 0x18, 0x1B);
+    MEEP_PAPER2     = MAKE_COLOR(0x1E, 0x20, 0x24);
+    MEEP_PAPER3     = MAKE_COLOR(0x26, 0x28, 0x2D);
+    MEEP_INK        = MAKE_COLOR(0xEF, 0xED, 0xE3);
+    MEEP_INK_SOFT   = MAKE_COLOR(0x8E, 0x8F, 0x86);
+    MEEP_LINE       = MAKE_COLOR(0x32, 0x34, 0x3A);
+    MEEP_LINE_SOFT  = MAKE_COLOR(0x2A, 0x2C, 0x31);
+    MEEP_PRESS      = MAKE_COLOR(0x2E, 0x30, 0x36);
+    MEEP_ACCENT     = MAKE_COLOR(0xFF, 0xC2, 0x3D);
+    MEEP_ACCENT_INK = MAKE_COLOR(0x1A, 0x14, 0x00);
+    MEEP_OK         = MAKE_COLOR(0x5F, 0xBF, 0x72);
+  }
+}
+
 /* UI Scale - dynamically set based on resolution */
 int ui_scale = 1;
 #define UI_SCALE_VAL(x) ((x) * ui_scale)
@@ -91,6 +154,9 @@ static int menu_bar_height = 28;
 static int mouse_x = 400;
 static int mouse_y = 300;
 static int mouse_buttons = 0;
+/* shell interaction state (declared up here: draw_dock() runs before the menus) */
+static int open_menu = -1, hover_menu = -1, hover_item = -1;
+static int hover_dock = -1, press_dock = -1;
 static int dock_hover_index = -1;
 static int dock_smooth_sizes[NUM_DOCK_ICONS] = {0};
 
@@ -331,7 +397,16 @@ static uint32_t wallpaper_get_pixel(int x, int y, int width, int height) {
     int img_y = (y * (int)wallpaper_image.height) / height;
     if (img_x >= 0 && img_x < (int)wallpaper_image.width && img_y >= 0 &&
         img_y < (int)wallpaper_image.height) {
-      return wallpaper_image.pixels[img_y * wallpaper_image.width + img_x];
+      uint32_t px = wallpaper_image.pixels[img_y * wallpaper_image.width + img_x];
+      if (appearance_dark) {
+        /* midnight desktop: same paper and grain, flipped to a dark ground so
+           the dots read as speckle instead of dirt */
+        int r = (px >> 16) & 0xFF, g = (px >> 8) & 0xFF, b = px & 0xFF;
+        int lum = (r * 77 + g * 150 + b * 29) >> 8;
+        if (lum < 226) return MAKE_COLOR(0x2C, 0x2E, 0x34);
+        return MAKE_COLOR(0x17, 0x18, 0x1B);
+      }
+      return px;
     }
   }
 
@@ -616,155 +691,248 @@ static void draw_dock_icon(int x, int y, int size, int icon_idx,
   }
 }
 
+
+/* ===================================================================== */
+/* MeepOS shell helpers                                                  */
+/* ===================================================================== */
+
+/* a 1px rounded outline: fill the rounded shape, then its interior again */
+static void meep_box(int x, int y, int w, int h, int r, uint32_t stroke,
+                     uint32_t fill) {
+  int t = ui_scale > 0 ? ui_scale : 1;      /* 1 CSS px, whatever we render at */
+  gui_draw_rounded_rect(x, y, w, h, r, stroke);
+  if (w > 2 * t && h > 2 * t)
+    gui_draw_rounded_rect(x + t, y + t, w - 2 * t, h - 2 * t, r > t ? r - t : 0, fill);
+}
+
+/* ---- real time, straight off the CMOS, so the menubar clock is live ---- */
+static uint8_t meep_inb(uint16_t port) {
+  uint8_t v; __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(port)); return v;
+}
+static void meep_outb(uint16_t port, uint8_t v) {
+  __asm__ volatile("outb %0, %1" : : "a"(v), "Nd"(port));
+}
+static uint8_t meep_cmos(uint8_t reg) { meep_outb(0x70, reg); return meep_inb(0x71); }
+static int meep_bcd(uint8_t v) { return (v & 0x0F) + ((v >> 4) * 10); }
+
+static int meep_isqrt(int v) {
+  if (v <= 0) return 0;
+  int x = v, y = (x + 1) / 2;
+  while (y < x) { x = y; y = (x + v / x) / 2; }
+  return x;
+}
+
+/* "Sat, Nov 14  2:32 PM" - the same string the web shell puts in the menubar */
+static void meep_clock_text(char *out) {
+  static const char *DAYS[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+  static const char *MONS[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  for (int i = 0; i < 100000; i++)
+    if (!(meep_cmos(0x0A) & 0x80)) break;      /* wait out an update in progress */
+
+  uint8_t min = meep_cmos(0x02), hr = meep_cmos(0x04);
+  uint8_t dow = meep_cmos(0x06), day = meep_cmos(0x07), mon = meep_cmos(0x08);
+  uint8_t regB = meep_cmos(0x0B);
+
+  int pm = (hr & 0x80) != 0;
+  int h = hr & 0x7F, d = day, m = mon;
+  if (!(regB & 0x04)) { h = meep_bcd((uint8_t)h); d = meep_bcd(day); m = meep_bcd(mon);
+                        min = (uint8_t)meep_bcd(min); }
+  if (regB & 0x02) pm = (h >= 12);
+  int h12 = h % 12; if (h12 == 0) h12 = 12;
+  if (m < 1 || m > 12) m = 1;
+  if (d < 1 || d > 31) d = 1;
+  if (dow < 1 || dow > 7) dow = 1;
+
+  char *o = out;
+  const char *s = DAYS[dow - 1];             while (*s) *o++ = *s++;
+  *o++ = ','; *o++ = ' ';
+  s = MONS[m - 1];                           while (*s) *o++ = *s++;
+  *o++ = ' ';
+  if (d >= 10) *o++ = (char)('0' + d / 10);
+  *o++ = (char)('0' + d % 10);
+  *o++ = ' '; *o++ = ' ';
+  if (h12 >= 10) *o++ = (char)('0' + h12 / 10);
+  *o++ = (char)('0' + h12 % 10);
+  *o++ = ':';
+  *o++ = (char)('0' + (min / 10) % 10);
+  *o++ = (char)('0' + min % 10);
+  *o++ = ' ';
+  *o++ = pm ? 'P' : 'A';
+  *o++ = 'M';
+  *o = 0;
+}
+
+/* thin horizontal rule, used for the sliders / wifi glyphs */
+static void meep_hline(int x, int y, int w, int t, uint32_t c) {
+  fb_fill_rect(x, y, w, t, c);
+}
+
+static void meep_vline(int x, int y, int h, int t, uint32_t c) {
+  fb_fill_rect(x, y, t, h, c);
+}
+
+/* upper part of a circle outline, used for the wifi fan and the globe meridians.
+   thresh = how far below the centre the arc is allowed to reach. */
+static void meep_arc_up(int cx, int cy, int r, int thresh, int t, uint32_t c) {
+  int x = r, y = 0, err = 1 - r;
+  while (x >= y) {
+    int pts[8][2] = {{x, y}, {y, x}, {-y, x}, {-x, y},
+                     {-x, -y}, {-y, -x}, {y, -x}, {x, -y}};
+    for (int i = 0; i < 8; i++) {
+      if (pts[i][1] <= 0 && -pts[i][1] <= thresh)   /* only the top half */
+        fb_fill_rect(cx + pts[i][0], cy + pts[i][1], t, t, c);
+    }
+    y++;
+    if (err < 0) err += 2 * y + 1;
+    else { x--; err += 2 * (y - x) + 1; }
+  }
+}
+
+/* the dock glyphs of MeepOS, redrawn as flat line art (icons only, nothing runs) */
+static void meep_dock_glyph(int idx, int cx, int cy, int s, uint32_t ink) {
+  int t = UI_SCALE_VAL(2);            /* stroke width, like SVG stroke-width 1.45 */
+  int r1 = s / 2;
+  switch (idx) {
+  case 0: {                            /* chat bubble with a tail on the left */
+    meep_box(cx - r1, cy - r1, s, s - UI_SCALE_VAL(5), UI_SCALE_VAL(5), ink,
+             MEEP_PAPER2);
+    gui_draw_line(cx - UI_SCALE_VAL(5), cy + r1 - UI_SCALE_VAL(5),
+                  cx - UI_SCALE_VAL(5), cy + r1, ink);
+    gui_draw_line(cx - UI_SCALE_VAL(5), cy + r1,
+                  cx - UI_SCALE_VAL(1), cy + r1, ink);
+    break;
+  }
+  case 1: {                            /* two stacked windows */
+    meep_box(cx - r1, cy - r1, s - UI_SCALE_VAL(5), s - UI_SCALE_VAL(5),
+             UI_SCALE_VAL(3), ink, MEEP_PAPER2);
+    meep_box(cx - r1 + UI_SCALE_VAL(5), cy - r1 + UI_SCALE_VAL(5),
+             s - UI_SCALE_VAL(5), s - UI_SCALE_VAL(5), UI_SCALE_VAL(3), ink,
+             MEEP_PAPER2);
+    break;
+  }
+  case 2:
+  case 3: {                            /* globe: ring, equator, curved meridian */
+    int rm = r1 - t;
+    gui_draw_circle(cx, cy, r1, ink);
+    gui_draw_circle(cx, cy, rm, MEEP_PAPER2);
+    meep_hline(cx - rm, cy - t / 2, rm * 2, t, ink);          /* equator */
+    for (int dy = -rm; dy <= rm; dy++) {                      /* meridian ellipse */
+      int w2 = rm * rm - dy * dy;
+      if (w2 < 0) continue;
+      int xi = meep_isqrt(w2) * 45 / 100;
+      fb_fill_rect(cx - xi - t / 2, cy + dy, t, 1, ink);
+      fb_fill_rect(cx + xi - t / 2, cy + dy, t, 1, ink);
+    }
+    break;
+  }
+  case 4: {                            /* folder: a raised tab over a rounded body */
+    int tx0 = cx - r1, ty0 = cy - r1 + UI_SCALE_VAL(1);
+    int tw = UI_SCALE_VAL(9), th = UI_SCALE_VAL(6);
+    fb_fill_rect(tx0, ty0, tw, t, ink);                    /* tab top */
+    fb_fill_rect(tx0, ty0, t, th, ink);                    /* tab left */
+    fb_fill_rect(tx0 + tw - t, ty0, t, th - t, ink);       /* tab right */
+    meep_box(cx - r1, ty0 + th - t, s, s - UI_SCALE_VAL(6), UI_SCALE_VAL(3),
+             ink, MEEP_PAPER2);
+    break;
+  }
+  case 5: {                            /* terminal: frame + ">" prompt */
+    meep_box(cx - r1, cy - r1, s, s, UI_SCALE_VAL(4), ink, MEEP_PAPER2);
+    gui_draw_line(cx - UI_SCALE_VAL(5), cy - UI_SCALE_VAL(4), cx,
+                  cy, ink);
+    gui_draw_line(cx, cy, cx - UI_SCALE_VAL(5), cy + UI_SCALE_VAL(4), ink);
+    gui_draw_line(cx + UI_SCALE_VAL(1), cy + UI_SCALE_VAL(4),
+                  cx + UI_SCALE_VAL(5), cy + UI_SCALE_VAL(4), ink);
+    break;
+  }
+  case 6: {                            /* gear: ring plus eight short teeth */
+    int ro = r1 - UI_SCALE_VAL(1);
+    int ri = UI_SCALE_VAL(4);
+    gui_draw_circle(cx, cy, ro - UI_SCALE_VAL(2), ink);
+    gui_draw_circle(cx, cy, ro - UI_SCALE_VAL(2) - t, MEEP_PAPER2);
+    gui_draw_circle(cx, cy, ri, ink);
+    gui_draw_circle(cx, cy, ri - t, MEEP_PAPER2);
+    static const int dx[8] = {1000, 707, 0, -707, -1000, -707, 0, 707};
+    static const int dy[8] = {0, 707, 1000, 707, 0, -707, -1000, -707};
+    for (int i = 0; i < 8; i++)
+      fb_fill_rect(cx + dx[i] * ro / 1000 - t / 2,
+                   cy + dy[i] * ro / 1000 - t / 2, t, t, ink);
+    break;
+  }
+  case 7: {                            /* sliders */
+    int off[3] = {-UI_SCALE_VAL(5), 0, UI_SCALE_VAL(5)};
+    int kx[3] = {-UI_SCALE_VAL(4), UI_SCALE_VAL(3), -UI_SCALE_VAL(1)};
+    for (int i = 0; i < 3; i++) {
+      meep_hline(cx - r1, cy + off[i], s, UI_SCALE_VAL(1), ink);
+      fb_fill_rect(cx + kx[i] - UI_SCALE_VAL(1), cy + off[i] - UI_SCALE_VAL(2),
+                   UI_SCALE_VAL(4), UI_SCALE_VAL(5), MEEP_PAPER2);
+      gui_draw_circle(cx + kx[i], cy + off[i], UI_SCALE_VAL(2), ink);
+    }
+    break;
+  }
+  case 8: {                            /* wifi: two arcs and a dot */
+    int by = cy + UI_SCALE_VAL(7);
+    meep_arc_up(cx, by, UI_SCALE_VAL(12), UI_SCALE_VAL(9), t, ink);
+    meep_arc_up(cx, by, UI_SCALE_VAL(7), UI_SCALE_VAL(5), t, ink);
+    fb_fill_rect(cx - t / 2, by - UI_SCALE_VAL(3), t, t, ink);
+    break;
+  }
+  default: {                           /* toggle: pill with the knob to the right */
+    meep_box(cx - r1, cy - UI_SCALE_VAL(6), s, UI_SCALE_VAL(12),
+             UI_SCALE_VAL(6), ink, MEEP_PAPER2);
+    gui_draw_circle(cx + UI_SCALE_VAL(4), cy, UI_SCALE_VAL(3), ink);
+    break;
+  }
+  }
+}
+
+/* ---- dock geometry, one source of truth (also used by the supersampler) ---- */
+static void meep_dock_rect(int s, int *rx, int *ry, int *rw, int *rh) {
+  int tile = 44 * s, pad = 7 * s, gap = 6 * s, brd = s, n = NUM_DOCK_ICONS;
+  int sep_w = 7 * s;
+  int dh = brd * 2 + pad * 2 + tile;
+  int dw = brd * 2 + pad * 2 + n * tile + n * gap + sep_w;
+  int x = ((int)screen_width - dw) / 2;
+  x -= x % s;                       /* snap: keeps 1px strokes on whole pixels */
+  *rx = x;
+  *ry = (int)screen_height - 14 * s - dh;
+  *rw = dw; *rh = dh;
+}
+
 static void draw_dock(void) {
-  int base_y = screen_height - DOCK_HEIGHT + UI_SCALE_VAL(6);
-  int total_w =
-      NUM_DOCK_ICONS * (DOCK_ICON_SIZE + DOCK_PADDING) - DOCK_PADDING + UI_SCALE_VAL(32);
-  int dock_x = (screen_width - total_w) / 2;
-  int dock_h = DOCK_HEIGHT - UI_SCALE_VAL(12);
+  /* MeepOS dock, measured off the running web shell at 1280x800:
+     outer 523x60 (1px border + 7px padding + 10 * 44px tiles + 6px gaps + a 1px
+     separator with 3px side margins), 14px radius, centred, 14px off the bottom. */
+  int tile = UI_SCALE_VAL(44);
+  int pad  = UI_SCALE_VAL(7);
+  int gap  = UI_SCALE_VAL(6);
+  int brd  = UI_SCALE_VAL(1);
+  int n    = NUM_DOCK_ICONS;                 /* 10 tiles, split 4 | 6 by the separator */
+  int sep_margin = UI_SCALE_VAL(3);
+  int sep_w = UI_SCALE_VAL(7);
 
-  /* Check if mouse is near dock */
-  int mouse_in_dock = (mouse_y >= (int)screen_height - DOCK_HEIGHT - UI_SCALE_VAL(40));
-  int hovered_idx = -1;
+  int x, y, dw, dh;
+  meep_dock_rect(ui_scale, &x, &y, &dw, &dh);
 
-  /* Calculate magnification for each icon */
-  int icon_sizes[NUM_DOCK_ICONS];
-  int render_x[NUM_DOCK_ICONS];
-  
-  for (int i = 0; i < NUM_DOCK_ICONS; i++) {
-    int target = DOCK_ICON_SIZE;
-    int base_center_x = dock_x + UI_SCALE_VAL(16) + i * (DOCK_ICON_SIZE + DOCK_PADDING) +
-                        DOCK_ICON_SIZE / 2;
-    
-    if (mouse_in_dock) {
-      int dist = mouse_x - base_center_x;
-      if (dist < 0)
-        dist = -dist;
-      
-      int magnify_range = UI_SCALE_VAL(120);
-      if (dist < magnify_range) {
-        /* Quadratic ease magnification */
-        int scale = (magnify_range - dist) * 256 / magnify_range;
-        scale = scale * scale / 256;
-        target += UI_SCALE_VAL(32) * scale / 256;  /* Max +32px at 1x */
-        
-        if (dist < DOCK_ICON_SIZE / 2 + UI_SCALE_VAL(5))
-          hovered_idx = i;
-      }
-    }
-    
-    /* Smooth animation */
-    if (dock_smooth_sizes[i] < target) {
-      dock_smooth_sizes[i] += UI_SCALE_VAL(4);
-      if (dock_smooth_sizes[i] > target)
-        dock_smooth_sizes[i] = target;
-    } else if (dock_smooth_sizes[i] > target) {
-      dock_smooth_sizes[i] -= UI_SCALE_VAL(4);
-      if (dock_smooth_sizes[i] < target)
-        dock_smooth_sizes[i] = target;
-    }
-    icon_sizes[i] = dock_smooth_sizes[i];
-  }
+  /* paper-2 at 88% over paper, flattened (the framebuffer has no alpha) */
+  meep_box(x, y, dw, dh, UI_SCALE_VAL(14), MEEP_LINE, MEEP_PAPER2);
 
-  /* Calculate dynamic total width and positions */
-  int dynamic_w = 0;
-  for (int i = 0; i < NUM_DOCK_ICONS; i++) {
-    dynamic_w += icon_sizes[i];
-    if (i < NUM_DOCK_ICONS - 1)
-      dynamic_w += DOCK_PADDING;
-  }
-  dynamic_w += UI_SCALE_VAL(32); /* Padding */
-  
-  int dynamic_dock_x = (screen_width - dynamic_w) / 2;
-  int cur_x = dynamic_dock_x + UI_SCALE_VAL(16);
-  for (int i = 0; i < NUM_DOCK_ICONS; i++) {
-    render_x[i] = cur_x;
-    cur_x += icon_sizes[i] + DOCK_PADDING;
-  }
-
-  /* Draw dock background */
-  gui_draw_rounded_rect(dynamic_dock_x - 1, base_y - 1, dynamic_w + 2, dock_h + 2, UI_SCALE_VAL(16), 0x2A2A3A);
-  gui_draw_rounded_rect(dynamic_dock_x, base_y, dynamic_w, dock_h, UI_SCALE_VAL(15), 0x1E1E28);
-  
-  /* Highlight line */
-  for (int i = dynamic_dock_x + UI_SCALE_VAL(14); i < dynamic_dock_x + dynamic_w - UI_SCALE_VAL(14); i++) {
-    fb_put_pixel(i, base_y + 1, 0x3A3A4A);
-  }
-
-  /* Draw icons with colored backgrounds */
-  int center_y = base_y + dock_h / 2;
-  
-  for (int i = 0; i < NUM_DOCK_ICONS; i++) {
-    int size = icon_sizes[i];
-    int x = render_x[i];
-    int y = center_y - size / 2 - (size - DOCK_ICON_SIZE) / 3; /* Rise up when magnified */
-    
-    /* Draw colored rounded background */
-    int icon_r = size / 5;
-    uint32_t bg_color = dock_icon_colors[i];
-    
-    /* Draw rounded rectangle background */
-    fb_fill_rect(x + icon_r, y, size - 2 * icon_r, size, bg_color);
-    fb_fill_rect(x, y + icon_r, size, size - 2 * icon_r, bg_color);
-    
-    /* Draw corners */
-    for (int dy = -icon_r; dy <= icon_r; dy++) {
-      for (int dx = -icon_r; dx <= icon_r; dx++) {
-        if (dx * dx + dy * dy <= icon_r * icon_r) {
-          fb_put_pixel(x + icon_r + dx, y + icon_r + dy, bg_color);
-          fb_put_pixel(x + size - icon_r - 1 + dx, y + icon_r + dy, bg_color);
-          fb_put_pixel(x + icon_r + dx, y + size - icon_r - 1 + dy, bg_color);
-          fb_put_pixel(x + size - icon_r - 1 + dx, y + size - icon_r - 1 + dy, bg_color);
-        }
-      }
+  int cx = x + brd + pad;
+  int cy = y + brd + pad;
+  for (int i = 0; i < n; i++) {
+    if (i == 4) {                            /* separator between the two groups */
+      fb_fill_rect(cx + sep_margin, cy + UI_SCALE_VAL(2), UI_SCALE_VAL(1),
+                   tile - UI_SCALE_VAL(4), MEEP_LINE);
+      cx += sep_w + gap;
     }
-    
-    /* Top highlight */
-    for (int px = x + icon_r; px < x + size - icon_r; px++) {
-      uint32_t hl = (bg_color & 0xFEFEFE) + 0x202020;
-      fb_put_pixel(px, y + 2, hl);
-    }
-    
-    /* Draw the icon bitmap on top */
-    const uint32_t *icon_data = get_dock_icon_data(i);
-    int bmp_size = size * 3 / 4;
-    int offset = (size - bmp_size) / 2;
-    
-    for (int py = 0; py < bmp_size; py++) {
-      int src_y = (py * DOCK_ICON_BITMAP_SIZE) / bmp_size;
-      for (int px = 0; px < bmp_size; px++) {
-        int src_x = (px * DOCK_ICON_BITMAP_SIZE) / bmp_size;
-        uint32_t pixel = icon_data[src_y * DOCK_ICON_BITMAP_SIZE + src_x];
-        
-        /* Check alpha channel */
-        uint8_t alpha = (pixel >> 24) & 0xFF;
-        if (alpha > 128) {
-          fb_put_pixel(x + offset + px, y + offset + py, pixel & 0xFFFFFF);
-        }
-      }
-    }
-  }
-  
-  /* Draw hover label */
-  if (hovered_idx >= 0) {
-    const char *label = dock_labels[hovered_idx];
-    int label_w = font_string_width(label) + UI_SCALE_VAL(16);
-    int label_h = UI_SCALE_VAL(24);
-    int label_x = render_x[hovered_idx] + icon_sizes[hovered_idx] / 2 - label_w / 2;
-    int label_y = base_y - UI_SCALE_VAL(40);
-    
-    gui_draw_rounded_rect(label_x, label_y, label_w, label_h, UI_SCALE_VAL(6), 0x303040);
-    gui_draw_string(label_x + UI_SCALE_VAL(8), label_y + (label_h - FONT_HEIGHT * ui_scale) / 2, label, 0xFFFFFF);
-    
-    /* Triangle pointer */
-    int tri_x = label_x + label_w / 2;
-    int tri_y = label_y + label_h;
-    int tri_size = UI_SCALE_VAL(5);
-    for (int t = 0; t < tri_size; t++) {
-      for (int j = -t; j <= t; j++) {
-        fb_put_pixel(tri_x + j, tri_y + t, 0x303040);
-      }
-    }
+    if (i == press_dock)
+      meep_box(cx, cy, tile, tile, UI_SCALE_VAL(11), MEEP_LINE, MEEP_PRESS);
+    else if (i == hover_dock)
+      meep_box(cx, cy, tile, tile, UI_SCALE_VAL(11), MEEP_LINE, MEEP_PAPER3);
+    else
+      meep_box(cx, cy, tile, tile, UI_SCALE_VAL(11), MEEP_LINE, MEEP_PAPER2);
+    meep_dock_glyph(i, cx + tile / 2, cy + tile / 2, UI_SCALE_VAL(22), MEEP_INK);
+    cx += tile + gap;
   }
 }
 
@@ -934,7 +1102,7 @@ static void term_puts(const char *str, uint8_t color) {
 }
 
 static void term_prompt(void) {
-  term_puts("vib-os", 10); /* Green */
+  term_puts("meepos", 10); /* Green */
   term_puts(":", 7);       /* White */
   term_puts("~", 12);      /* Blue */
   term_puts("$ ", 7);      /* White */
@@ -968,7 +1136,7 @@ static void term_execute(const char *cmd) {
     terminal.cursor_x = 0;
     terminal.cursor_y = 0;
   } else if (strcmp(cmd, "help") == 0) {
-    term_puts("Vib-OS Terminal v2.0\n", 14);
+    term_puts("Omi Terminal v2.0\n", 14);
     term_puts("File Commands:\n", 11);
     term_puts("  ls        - List directory contents\n", 7);
     term_puts("  cd <dir>  - Change directory\n", 7);
@@ -984,7 +1152,7 @@ static void term_execute(const char *cmd) {
     term_puts("  clear     - Clear screen\n", 7);
     term_puts("  help      - This help message\n", 7);
   } else if (strcmp(cmd, "uname") == 0 || strcmp(cmd, "uname -a") == 0) {
-    term_puts("Vib-OS 1.0.0 x86_64\n", 11);
+    term_puts("Omi 1.0.0 x86_64\n", 11);
   } else if (strcmp(cmd, "neofetch") == 0) {
     term_puts("       _  _         ___  ____  \n", 14);
     term_puts(" __   _(_)| |__     / _ \\/ ___| \n", 14);
@@ -993,7 +1161,7 @@ static void term_execute(const char *cmd) {
     term_puts("   \\_/ |_||_.__/    \\___/|____/ \n", 14);
     term_puts("\n", 7);
     term_puts("OS:      ", 11);
-    term_puts("Vib-OS 1.0.0\n", 7);
+    term_puts("Omi 1.0.0\n", 7);
     term_puts("Host:    ", 11);
     term_puts("QEMU x86_64 Virtual Machine\n", 7);
     term_puts("Kernel:  ", 11);
@@ -1009,7 +1177,7 @@ static void term_execute(const char *cmd) {
   } else if (strcmp(cmd, "id") == 0) {
     term_puts("uid=0(root) gid=0(root) groups=0(root)\n", 7);
   } else if (strcmp(cmd, "hostname") == 0) {
-    term_puts("vib-os\n", 7);
+    term_puts("meepos\n", 7);
   } else if (strcmp(cmd, "free") == 0) {
     term_puts("              total        used        free\n", 7);
     term_puts("Mem:         512 MB       12 MB      500 MB\n", 7);
@@ -2042,7 +2210,7 @@ static void draw_help_window(void) {
 
   /* Content */
   int ty = y + title_h + UI_SCALE_VAL(18);
-  gui_draw_string(x + UI_SCALE_VAL(20), ty, "Vib-os Desktop", THEME_BLUE);
+  gui_draw_string(x + UI_SCALE_VAL(20), ty, "Omi Desktop", THEME_BLUE);
   ty += line_gap;
   gui_draw_string(x + UI_SCALE_VAL(20), ty, "Version 1.0", THEME_SUBTEXT);
   ty += section_gap;
@@ -2076,164 +2244,1955 @@ static void draw_help_window(void) {
 /* Desktop Background                                                    */
 /* ===================================================================== */
 
+
 static void draw_wallpaper(void) {
-  /* Ensure wallpaper image is loaded if needed */
-  if (wallpapers[current_wallpaper].type == 1) {
-    wallpaper_ensure_loaded();
-  }
+  /* MeepOS paper desktop: #EDEBDD, a 22px dot grid at 16,16, and
+     radial-gradient(120% 80% at 50% 0%, rgba(255,255,255,.34), transparent 62%).
+     Built once into a cache because the compositor redraws on every event. */
+  static uint32_t *cache = (uint32_t *)0;
+  static int cw = 0, ch = 0, cdark = -1;
+  int w = (int)screen_width, h = (int)screen_height;
 
-  if (wallpaper_cache_dirty || !wallpaper_cache) {
-    wallpaper_build_cache();
-  }
+  if (!cache || cw != w || ch != h || cdark != appearance_dark) {
+    if (cache) kfree(cache);
+    cache = (uint32_t *)kmalloc((size_t)w * h * sizeof(uint32_t));
+    cw = w; ch = h; cdark = appearance_dark;
+    if (!cache) return;
 
-  if (!wallpaper_cache)
-    return;
+    /* the palette is runtime state, so the desktop follows the toggle too */
+    const int pr = (MEEP_PAPER >> 16) & 0xFF, pg = (MEEP_PAPER >> 8) & 0xFF,
+              pb = MEEP_PAPER & 0xFF;             /* --paper */
+    const int ir = (MEEP_INK >> 16) & 0xFF, ig = (MEEP_INK >> 8) & 0xFF,
+              ib = MEEP_INK & 0xFF;               /* --ink   */
+    /* the web shell's white radial bloom is a light-theme device; in midnight
+       the same gradient lifts toward paper-2 instead, so it never fogs out */
+    const int hr = appearance_dark ? ((MEEP_PAPER2 >> 16) & 0xFF) : 255;
+    const int hg = appearance_dark ? ((MEEP_PAPER2 >> 8) & 0xFF) : 255;
+    const int hb = appearance_dark ? (MEEP_PAPER2 & 0xFF) : 255;
+    int cx = w / 2, cy = 0;
+    int rx = w * 12 / 10, ry = h * 8 / 10;
+    if (rx < 1) rx = 1;
+    if (ry < 1) ry = 1;
 
-  /* Copy cached wallpaper into backbuffer */
-  for (uint32_t y = 0; y < screen_height; y++) {
-    uint64_t *src = (uint64_t *)(wallpaper_cache + y * screen_width);
-    uint64_t *dst = (uint64_t *)(backbuffer + y * screen_width);
-    size_t count64 = screen_width / 2;
-    size_t i = 0;
-    size_t fast_count = count64 & ~7UL;
-    for (; i < fast_count; i += 8) {
-      dst[i] = src[i];
-      dst[i + 1] = src[i + 1];
-      dst[i + 2] = src[i + 2];
-      dst[i + 3] = src[i + 3];
-      dst[i + 4] = src[i + 4];
-      dst[i + 5] = src[i + 5];
-      dst[i + 6] = src[i + 6];
-      dst[i + 7] = src[i + 7];
-    }
-    for (; i < count64; i++) {
-      dst[i] = src[i];
-    }
-    if (screen_width & 1) {
-      uint32_t *dst32 = (uint32_t *)dst;
-      uint32_t *src32 = (uint32_t *)src;
-      dst32[screen_width - 1] = src32[screen_width - 1];
-    }
-  }
-}
-
-/* ===================================================================== */
-/* Desktop Icons - desktop_icon_t defined in gui.h                       */
-/* ===================================================================== */
-
-static desktop_icon_t desktop_icons[] = {
-    {"Documents", 40, 60, 1},
-    {"Pictures", 40, 160, 1},
-    {"Downloads", 40, 260, 1},
-    {"Terminal", 40, 360, 0},
-};
-#define NUM_DESKTOP_ICONS 4
-
-static void draw_desktop_icons(void) {
-  for (int i = 0; i < NUM_DESKTOP_ICONS; i++) {
-    int x = desktop_icons[i].x * ui_scale;
-    int y = desktop_icons[i].y * ui_scale;
-
-    /* Icon */
-    if (desktop_icons[i].is_dir) {
-      fb_fill_rect(x + UI_SCALE_VAL(12), y + UI_SCALE_VAL(10),
-                   UI_SCALE_VAL(40), UI_SCALE_VAL(32), THEME_YELLOW);
-      fb_fill_rect(x + UI_SCALE_VAL(12), y + UI_SCALE_VAL(6),
-                   UI_SCALE_VAL(20), UI_SCALE_VAL(6), THEME_PEACH);
-    } else {
-      fb_fill_rect(x + UI_SCALE_VAL(16), y + UI_SCALE_VAL(4),
-                   UI_SCALE_VAL(32), UI_SCALE_VAL(40), THEME_SURFACE);
-      fb_draw_rect(x + UI_SCALE_VAL(16), y + UI_SCALE_VAL(4),
-                   UI_SCALE_VAL(32), UI_SCALE_VAL(40), THEME_OVERLAY);
-      if (strcmp(desktop_icons[i].name, "Terminal") == 0) {
-        gui_draw_char(x + UI_SCALE_VAL(26), y + UI_SCALE_VAL(18), '>',
-                      THEME_GREEN);
-      } else if (strcmp(desktop_icons[i].name, "Settings") == 0) {
-        gui_draw_circle(x + UI_SCALE_VAL(32), y + UI_SCALE_VAL(24),
-                        UI_SCALE_VAL(10), THEME_LAVENDER);
-        gui_draw_circle(x + UI_SCALE_VAL(32), y + UI_SCALE_VAL(24),
-                        UI_SCALE_VAL(4), THEME_BASE);
+    for (int y = 0; y < h; y++) {
+      int dy = y - cy;
+      int dy2 = (int)(((int64_t)dy * dy * 1000000) / ((int64_t)ry * ry));
+      int dy22 = y % 22;
+      int dot_y = (dy22 == 18 || dy22 == 19);      /* dots are 2x2, phase 18 mod 22 */
+      for (int x = 0; x < w; x++) {
+        int dx = x - cx;
+        int s = dy2 + (int)(((int64_t)dx * dx * 1000000) / ((int64_t)rx * rx));
+        int t = meep_isqrt(s);                    /* 0..1000, gradient position */
+        int r = pr, g = pg, b = pb;
+        if (t < 620) {
+          /* #desktop::after paints this at opacity .5, so .34 becomes .17 */
+          int a = 43 - (43 * t) / 620;
+          r += (hr - r) * a / 255;
+          g += (hg - g) * a / 255;
+          b += (hb - b) * a / 255;
+        }
+        if (dot_y) {                              /* dot = rgba(ink, .10) */
+          int dx22 = x % 22;
+          if (dx22 == 4 || dx22 == 5) {
+            r = (r * 90 + ir * 10 + 50) / 100;
+            g = (g * 90 + ig * 10 + 50) / 100;
+            b = (b * 90 + ib * 10 + 50) / 100;
+          }
+        }
+        cache[y * w + x] = MAKE_COLOR(r, g, b);
       }
     }
+  }
 
-    /* Label */
-    int label_w = strlen(desktop_icons[i].name) * FONT_WIDTH * ui_scale;
-    gui_draw_string(x + UI_SCALE_VAL(32) - label_w / 2,
-                    y + UI_SCALE_VAL(52), desktop_icons[i].name,
-                    THEME_TEXT);
+  for (int y = 0; y < h; y++)
+    memcpy(backbuffer + (size_t)y * w, cache + (size_t)y * w, (size_t)w * sizeof(uint32_t));
+}
+
+/* no desktop icons in the MeepOS environment: the shell is the layout, nothing else */
+
+/* ---- real type: Bricolage Grotesque + JetBrains Mono, alpha-blended at 1x ---- */
+static int meep_text_w(const mface *f, const char *s) {
+  int w = 0;
+  for (; *s; s++) { int c = (unsigned char)*s; if (c < 32 || c > 126) c = '?'; w += f->g[c - 32].adv; }
+  return w;
+}
+
+static void meep_blend_px(int x, int y, uint32_t color, int a) {
+  if (x < 0 || y < 0 || x >= (int)screen_width || y >= (int)screen_height) return;
+  uint32_t *p = backbuffer + (size_t)y * screen_width + x;
+  uint32_t d = *p;
+  int ia = 255 - a;
+  int r = (((color >> 16) & 0xFF) * a + ((d >> 16) & 0xFF) * ia) / 255;
+  int g = (((color >>  8) & 0xFF) * a + ((d >>  8) & 0xFF) * ia) / 255;
+  int b = (( color        & 0xFF) * a + ( d        & 0xFF) * ia) / 255;
+  *p = MAKE_COLOR(r, g, b);
+}
+
+/* A Remix Icon glyph. The baked mask is ICON_SRC square and box-filtered down
+   to the target box, so the same mask is crisp at 1x and at any ui_scale. */
+static void meep_icon(int id, int x, int y, int size, uint32_t color) {
+  if (id < 0 || id >= ICON_COUNT || size <= 0) return;
+  int d = UI_SCALE_VAL(size);
+  const unsigned char *m = ri_icon_mask[id];
+  for (int ty = 0; ty < d; ty++) {
+    int sy0 = ty * ICON_SRC / d, sy1 = (ty + 1) * ICON_SRC / d;
+    if (sy1 <= sy0) sy1 = sy0 + 1;
+    for (int tx = 0; tx < d; tx++) {
+      int sx0 = tx * ICON_SRC / d, sx1 = (tx + 1) * ICON_SRC / d;
+      if (sx1 <= sx0) sx1 = sx0 + 1;
+      int acc = 0, n = 0;
+      for (int sy = sy0; sy < sy1; sy++)
+        for (int sx = sx0; sx < sx1; sx++) {
+          acc += m[sy * ICON_SRC + sx];
+          n++;
+        }
+      int a = acc / n;
+      if (a) meep_blend_px(x + tx, y + ty, color, a);
+    }
   }
 }
 
-/* ===================================================================== */
-/* Menu Bar - macOS Big Sur style (matching test folder)                 */
-/* ===================================================================== */
+/* draw at 1x with the atlas' own coverage - ytop is the top of the line box */
+static void meep_text(const mface *f, int x, int ytop, const char *s, uint32_t color) {
+  int pen = x;
+  for (; *s; s++) {
+    int c = (unsigned char)*s; if (c < 32 || c > 126) c = '?';
+    const mglyph *g = &f->g[c - 32];
+    for (int gy = 0; gy < g->h; gy++) {
+      const uint8_t *row = f->bm + g->off + gy * g->w;
+      for (int gx = 0; gx < g->w; gx++)
+        if (row[gx]) meep_blend_px(pen + g->ox + gx, ytop + g->oy + gy, color, row[gx]);
+    }
+    pen += g->adv;
+  }
+}
 
-static int menu_open = 0;
+static int meep_line_h(const mface *f) { return f->asc + f->desc; }
 
-static void draw_menu_bar(void) {
-  /* Glossy menu bar - gradient from dark to slightly lighter (like test folder) */
-  for (int y = 0; y < MENU_BAR_HEIGHT; y++) {
-    int brightness = 45 + (y * 10) / MENU_BAR_HEIGHT; /* 45 to 55 */
-    uint32_t color = (brightness << 16) | (brightness << 8) | (brightness + 5);
-    for (int x = 0; x < (int)screen_width; x++) {
-      fb_put_pixel(x, y, color);
+#define BRAND_WORD "Omi"
+
+/* ---- menus, transcribed from the web shell's index.html ---- */
+typedef struct { const char *label; const char *kbd; } mitem;
+/* ===================== MeepOS apps and widgets ======================= */
+/* =========================================================================
+ * MeepOS apps: real windows, a calculator, a notepad, and the desktop
+ * widgets (sticky note / weather / big clock).  All integer maths - the
+ * kernel is built with -mno-80387, so there is no FPU to lean on.
+ * ========================================================================= */
+
+/* MeepOS is its own OS, not a front-end for the house dashboard: only the apps
+   that were actually asked for live here (plus the widgets, below). */
+enum { APP_NONE = 0, APP_CALC, APP_NOTES, APP_MEDIA, APP_BROWSER, APP_COUNT };
+
+typedef struct { int open, x, y, w, h; int min; } meep_app_t;
+
+static meep_app_t mapp[APP_COUNT];
+static int mapp_focus = APP_NONE;
+static int drag_app = APP_NONE, drag_dx = 0, drag_dy = 0;
+
+/* ---- widgets ----------------------------------------------------------- */
+enum { WG_STICKY = 0, WG_WEATHER, WG_CLOCK, WG_COUNT };
+
+typedef struct { int on, x, y, w, h; } meep_wg_t;
+
+/* default layout copied off the web shell: a 206px column down the right side */
+static meep_wg_t mwg[WG_COUNT] = {
+  { 0, 1058, 372, 206, 168 },     /* sticky note */
+  { 1, 1058, 174, 206, 152 },     /* weather     */
+  { 1, 1058,  56, 206, 110 }      /* big clock   */
+};
+static int wg_focus = -1;
+static int wg_drag = -1, wg_dx = 0, wg_dy = 0;
+
+static char sticky_text[600] = "";
+static int sticky_len = 0, sticky_cur = 0;
+
+/* weather is fed by the MeepNet uplink once it lands; until then it says so
+   rather than inventing a forecast. */
+static int wx_ok = 0, wx_now = 0, wx_hi = 0, wx_lo = 0;
+static char wx_desc[32] = "no uplink";
+
+/* ---- tiny string helpers (no libc snprintf in here) -------------------- */
+static int s_len(const char *s) { int n = 0; while (s[n]) n++; return n; }
+
+static void s_cpy(char *d, const char *s, int cap) {
+  int i = 0;
+  while (s[i] && i < cap - 1) { d[i] = s[i]; i++; }
+  d[i] = 0;
+}
+
+static void s_num(long long v, char *out) {
+  char tmp[24];
+  int n = 0, i = 0;
+  int neg = v < 0;
+  unsigned long long u = neg ? (unsigned long long)(-v) : (unsigned long long)v;
+  if (!u) tmp[n++] = '0';
+  while (u) { tmp[n++] = (char)('0' + (int)(u % 10ULL)); u /= 10ULL; }
+  if (neg) out[i++] = '-';
+  while (n) out[i++] = tmp[--n];
+  out[i] = 0;
+}
+
+/* cents -> "12.5" / "12" / "-3.25" */
+static void s_money(long long v100, char *out) {
+  long long v = v100;
+  int i = 0;
+  if (v < 0) { out[i++] = '-'; v = -v; }
+  char ip[24];
+  s_num(v / 100, ip);
+  for (int k = 0; ip[k]; k++) out[i++] = ip[k];
+  int c = (int)(v % 100);
+  if (c) {
+    out[i++] = '.';
+    out[i++] = (char)('0' + c / 10);
+    if (c % 10) out[i++] = (char)('0' + c % 10);
+  }
+  out[i] = 0;
+}
+
+/* ---- seven-segment numerals: the shell's own big type ------------------ */
+static const unsigned char seg7[10] = { 63, 6, 91, 79, 102, 109, 125, 7, 127, 111 };
+
+static void seg_bar(int x, int y, int w, int h, uint32_t ink) {
+  if (w > 0 && h > 0) fb_fill_rect(x, y, w, h, ink);
+}
+
+static void big_char(int x, int ytop, int w, int h, int t, char c, uint32_t ink) {
+  int mid = ytop + h / 2;
+  if (c >= '0' && c <= '9') {
+    unsigned char m = seg7[c - '0'];
+    if (m & 1)  seg_bar(x + t, ytop, w - 2 * t, t, ink);                  /* A */
+    if (m & 2)  seg_bar(x + w - t, ytop + t, t, h / 2 - t, ink);          /* B */
+    if (m & 4)  seg_bar(x + w - t, mid + 1, t, h / 2 - t, ink);           /* C */
+    if (m & 8)  seg_bar(x + t, ytop + h - t, w - 2 * t, t, ink);          /* D */
+    if (m & 16) seg_bar(x, mid + 1, t, h / 2 - t, ink);                   /* E */
+    if (m & 32) seg_bar(x, ytop + t, t, h / 2 - t, ink);                  /* F */
+    if (m & 64) seg_bar(x + t, mid - t / 2, w - 2 * t, t, ink);           /* G */
+  } else if (c == ':') {
+    seg_bar(x + w / 2 - t / 2, ytop + h / 4, t, t, ink);
+    seg_bar(x + w / 2 - t / 2, ytop + (3 * h) / 4 - t, t, t, ink);
+  } else if (c == '.') {
+    seg_bar(x + w / 2 - t / 2, ytop + h - t, t, t, ink);
+  } else if (c == '-') {
+    seg_bar(x + t, mid - t / 2, w - 2 * t, t, ink);
+  }
+}
+
+static int big_text(int x, int ytop, int h, const char *s, uint32_t ink) {
+  int t = h / 7;   if (t < 2) t = 2;
+  int w = h / 2;   if (w < 6) w = 6;
+  int gap = h / 8; if (gap < 2) gap = 2;
+  int cx = x;
+  for (int i = 0; s[i]; i++) {
+    int cw = (s[i] == ':' || s[i] == '.') ? t * 2 : w;
+    big_char(cx, ytop, cw, h, t, s[i], ink);
+    cx += cw + gap;
+  }
+  return cx - x - gap;
+}
+
+static int big_w(int h, const char *s) {
+  int t = h / 7;   if (t < 2) t = 2;
+  int w = h / 2;   if (w < 6) w = 6;
+  int gap = h / 8; if (gap < 2) gap = 2;
+  int total = 0, n = 0;
+  for (int i = 0; s[i]; i++) {
+    total += (s[i] == ':' || s[i] == '.') ? t * 2 : w;
+    n++;
+  }
+  return n ? total + gap * (n - 1) : 0;
+}
+
+/* ---- window chrome ----------------------------------------------------- */
+/* Mirrors the web shell's CSS: .titlebar is 31px, paper-2 with a 1px --line
+   hairline, title 12.5px/600, and a .wctl group of 30x26 buttons on the right
+   (minimise, maximise, close - close turns #c0392b on hover). The framebuffer
+   has no alpha, so the CSS drop shadow is flattened into two offset rings. */
+#define APP_TITLE_H 31
+
+/* Rounded top corners, flat bottom. A plain fb_fill_rect inside a rounded
+   window squares off the corner and leaves the border arc floating, which is
+   exactly what made the corners read as "not connected". */
+static void fill_cap(int x, int y, int w, int h, int r, uint32_t color) {
+  gui_draw_rounded_rect(x, y, w, 2 * r, r, color);
+  if (h > r) fb_fill_rect(x, y + r, w, h - r, color);
+}
+
+/* .wg-title: mono, 9px, uppercase, letter-spacing .16em */
+static int meep_tracked_w(const char *s) {
+  return meep_text_w(&meep_m100, s) + s_len(s);
+}
+
+static void meep_tracked(int x, int y, const char *s, uint32_t color) {
+  char one[2] = { 0, 0 };
+  for (int i = 0; s[i]; i++) {
+    one[0] = s[i];
+    meep_text(&meep_m100, x, y, one, color);
+    x += meep_text_w(&meep_m100, one) + 1;
+  }
+}
+
+/* .wctl button glyphs: 0 = minimise, 1 = maximise, 2 = close (Remix icons) */
+static void wctl_glyph(int cx, int cy, int kind, uint32_t color) {
+  static const int id[3] = { ICON_MIN, ICON_MAX, ICON_CLOSE };
+  const int sz = 12;
+  meep_icon(id[kind % 3], cx - UI_SCALE_VAL(sz) / 2, cy - UI_SCALE_VAL(sz) / 2,
+            sz, color);
+}
+
+static void app_win(int x, int y, int w, int h, const char *title,
+                    const char *meta, int focused) {
+  meep_box(x, y, w, h, 10, focused ? MEEP_LINE : MEEP_LINE_SOFT, MEEP_PAPER2);
+  /* titlebar keeps the body tone when focused; the blurred window greys it */
+  fill_cap(x + 1, y + 1, w - 2, APP_TITLE_H - 1, 9,
+           focused ? MEEP_PAPER2 : MEEP_PAPER);
+  meep_hline(x + 1, y + APP_TITLE_H, w - 2, 1, focused ? MEEP_LINE : MEEP_LINE_SOFT);
+
+  int ty = y + (APP_TITLE_H - meep_line_h(&meep_s130)) / 2;
+  meep_text(&meep_s130, x + 11, ty, title, focused ? MEEP_INK : MEEP_INK_SOFT);
+
+  /* the .wctl group: three 30x26 buttons, 2px apart, 6px off the right edge */
+  int bw = 30, bh = 26, gap = 2;
+  int bx = x + w - 6 - (bw * 3 + gap * 2);
+  int by = y + (APP_TITLE_H - bh) / 2;
+  for (int i = 0; i < 3; i++) {
+    wctl_glyph(bx + i * (bw + gap) + bw / 2, by + bh / 2, i, focused ? MEEP_INK : MEEP_INK_SOFT);
+  }
+  if (meta && meta[0]) {
+    int mw = meep_text_w(&meep_m100, meta);
+    meep_text(&meep_m100, bx - 8 - mw, y + (APP_TITLE_H - meep_line_h(&meep_m100)) / 2,
+              meta, MEEP_INK_SOFT);
+  }
+}
+
+static int app_close_hit(int x, int y, int wx, int wy, int ww) {
+  return (y >= wy && y < wy + APP_TITLE_H && x >= wx + ww - 38 && x < wx + ww - 4);
+}
+
+/* 0 none, 1 minimise, 2 maximise, 3 close - the .wctl group on the right */
+static int app_wctl_hit(int x, int y, int wx, int wy, int ww) {
+  if (y < wy + (APP_TITLE_H - 26) / 2 || y >= wy + (APP_TITLE_H - 26) / 2 + 26) return 0;
+  int bx = wx + ww - 6 - (30 * 3 + 2 * 2);
+  for (int i = 0; i < 3; i++) {
+    int x0 = bx + i * 32;
+    if (x >= x0 && x < x0 + 30) return i + 1;
+  }
+  return 0;
+}
+
+/* maximise keeps the old rect so it can be restored */
+static int app_max[APP_COUNT];
+static int app_saved[APP_COUNT][4];
+
+/* ---- calculator -------------------------------------------------------- */
+typedef struct {
+  long long cur;      /* scaled by 100: 12.34 -> 1234 */
+  long long acc;
+  char op;
+  int fresh, dec, decn, err;
+} calc_state_t;
+
+static calc_state_t cs = { 0, 0, 0, 1, 0, 0, 0 };
+static int calc_hover = -1;
+
+static void calc_digit(int d) {
+  if (cs.err) { cs.err = 0; cs.cur = 0; }
+  if (cs.fresh) { cs.cur = 0; cs.fresh = 0; cs.dec = 0; cs.decn = 0; }
+  if (cs.dec) {
+    if (cs.decn >= 2) return;
+    cs.cur += (long long)d * (cs.decn == 0 ? 10 : 1);
+    cs.decn++;
+  } else {
+    cs.cur = cs.cur * 10 + (long long)d * 100;
+  }
+}
+
+static void calc_apply(char op) {
+  if (op == '+') cs.cur = cs.acc + cs.cur;
+  else if (op == '-') cs.cur = cs.acc - cs.cur;
+  else if (op == '*') cs.cur = (cs.acc * cs.cur) / 100;
+  else if (op == '/') {
+    if (cs.cur) cs.cur = (cs.acc * 100) / cs.cur;
+    else { cs.err = 1; cs.cur = 0; }
+  }
+}
+
+static void calc_key(char k) {
+  if (k >= '0' && k <= '9') { calc_digit(k - '0'); return; }
+  if (k == '.') { if (!cs.dec) { cs.dec = 1; cs.decn = 0; cs.fresh = 0; } return; }
+  if (k == 'C') { cs.cur = cs.acc = 0; cs.op = 0; cs.fresh = 1; cs.dec = cs.decn = 0; cs.err = 0; return; }
+  if (k == 'n') { cs.cur = -cs.cur; return; }
+  if (k == '%') { cs.cur = cs.cur / 100; return; }
+  if (k == '=') {
+    if (cs.op) calc_apply(cs.op);
+    cs.op = 0; cs.fresh = 1; cs.dec = cs.decn = 0;
+    return;
+  }
+  if (k == '+' || k == '-' || k == '*' || k == '/') {
+    if (cs.op) calc_apply(cs.op);
+    cs.acc = cs.cur; cs.op = k; cs.fresh = 1; cs.dec = cs.decn = 0;
+  }
+}
+
+static const char calc_lbl[19] = { 'C', 'n', '%', '/', '7', '8', '9', '*',
+                                   '4', '5', '6', '-', '1', '2', '3', '+',
+                                   '0', '.', '=' };
+
+static void calc_key_rect(int i, int bx, int by, int *kx, int *ky, int *kw, int *kh) {
+  const int kww = 52, khh = 40, gap = 6;
+  int col, row;
+  if (i < 18) { col = i % 4; row = i / 4; }
+  else { col = 2; row = 4; }
+  *kx = bx + col * (kww + gap);
+  *ky = by + row * (khh + gap);
+  *kw = (i == 18) ? kww * 2 + gap : kww;
+  *kh = khh;
+}
+
+static void calc_label(int i, char *out) {
+  switch (calc_lbl[i]) {
+    case 'n': out[0] = '+'; out[1] = '/'; out[2] = '-'; out[3] = 0; return;
+    case '/': out[0] = '/'; out[1] = 0; return;
+    case '*': out[0] = 'x'; out[1] = 0; return;
+    case '-': out[0] = '-'; out[1] = 0; return;
+    case '%': out[0] = '%'; out[1] = 0; return;
+    default: out[0] = calc_lbl[i]; out[1] = 0; return;
+  }
+}
+
+static void draw_calc(void) {
+  meep_app_t *a = &mapp[APP_CALC];
+  if (!a->open) return;
+  app_win(a->x, a->y, a->w, a->h, "Calculator", cs.err ? "error" : "", mapp_focus == APP_CALC);
+
+  int bx = a->x + 12, by = a->y + APP_TITLE_H + 12;
+  int dw = a->w - 24, dh = 64;
+  meep_box(bx, by, dw, dh, 8, MEEP_LINE_SOFT, MEEP_PAPER3);
+
+  char txt[32];
+  if (cs.err) s_cpy(txt, "cannot divide by 0", sizeof txt);
+  else s_money(cs.cur, txt);
+  int th = 34;
+  int tw = big_w(th, txt);
+  int tx = bx + dw - 12 - tw;
+  if (tx < bx + 10) {
+    th = 22;
+    tw = big_w(th, txt);
+    tx = bx + dw - 12 - tw;
+  }
+  big_text(tx, by + (dh - th) / 2, th, txt, MEEP_INK);
+
+  int kbx = bx + 1, kby = by + dh + 10;
+  for (int i = 0; i < 19; i++) {
+    int kx, ky, kw, kh;
+    calc_key_rect(i, kbx, kby, &kx, &ky, &kw, &kh);
+    int hot = (calc_hover == i);
+    int accent = (calc_lbl[i] == '=');
+    meep_box(kx, ky, kw, kh, 6, MEEP_LINE,
+             accent ? (hot ? MAKE_COLOR(0xF2, 0xB4, 0x30) : MEEP_ACCENT)
+                    : (hot ? MEEP_PAPER3 : MEEP_PAPER2));
+    char lbl[8];
+    calc_label(i, lbl);
+    int lw = s_len(lbl) == 1 ? meep_text_w(&meep_s130, lbl) : meep_text_w(&meep_m100, lbl);
+    int lx = kx + (kw - lw) / 2;
+    int ly = ky + (kh - meep_line_h(&meep_s130)) / 2;
+    if (s_len(lbl) == 1)
+      meep_text(&meep_s130, lx, ly, lbl, accent ? MEEP_ACCENT_INK : MEEP_INK);
+    else
+      meep_text(&meep_m100, lx, ky + (kh - meep_line_h(&meep_m100)) / 2, lbl,
+                accent ? MEEP_ACCENT_INK : MEEP_INK);
+  }
+}
+
+static int calc_body_click(int x, int y) {
+  meep_app_t *a = &mapp[APP_CALC];
+  int bx = a->x + 12, by = a->y + APP_TITLE_H + 12 + 64 + 10;
+  for (int i = 0; i < 19; i++) {
+    int kx, ky, kw, kh;
+    calc_key_rect(i, bx + 1, by, &kx, &ky, &kw, &kh);
+    if (x >= kx && x < kx + kw && y >= ky && y < ky + kh) {
+      calc_key(calc_lbl[i]);
+      return 1;
     }
   }
-  
-  /* Bottom highlight line */
-  for (int x = 0; x < (int)screen_width; x++) {
-    fb_put_pixel(x, MENU_BAR_HEIGHT - 1, 0x606060);
+  return 0;
+}
+
+/* ---- notepad ----------------------------------------------------------- */
+#define NP_MAX 4000
+static char np_text[NP_MAX];
+static int np_len = 0, np_cur = 0;
+static int np_blink = 0;
+
+static void np_key(int key) {
+  if (key == '\b' || key == 127) {
+    if (np_cur > 0) {
+      for (int i = np_cur - 1; i < np_len; i++) np_text[i] = np_text[i + 1];
+      np_cur--; np_len--;
+    }
+    return;
+  }
+  if (key == '\n' || key == '\r') {
+    if (np_len < NP_MAX - 1) {
+      for (int i = np_len; i >= np_cur; i--) np_text[i + 1] = np_text[i];
+      np_text[np_cur] = '\n';
+      np_cur++; np_len++;
+    }
+    return;
+  }
+  if (key == KEY_LEFT)  { if (np_cur > 0) np_cur--; return; }
+  if (key == KEY_RIGHT) { if (np_cur < np_len) np_cur++; return; }
+  if (key >= 32 && key < 127 && np_len < NP_MAX - 1) {
+    for (int i = np_len; i >= np_cur; i--) np_text[i + 1] = np_text[i];
+    np_text[np_cur] = (char)key;
+    np_cur++; np_len++;
+  }
+}
+
+static void draw_notes(void) {
+  meep_app_t *a = &mapp[APP_NOTES];
+  if (!a->open) return;
+
+  char meta[24];
+  char num[16];
+  s_num(np_len, num);
+  s_cpy(meta, num, sizeof meta);
+  int ml = s_len(meta);
+  meta[ml] = ' '; meta[ml + 1] = 'c'; meta[ml + 2] = 'h'; meta[ml + 3] = 0;
+
+  app_win(a->x, a->y, a->w, a->h, "Notepad", meta, mapp_focus == APP_NOTES);
+
+  int bx = a->x + 1, by = a->y + APP_TITLE_H + 1;
+  int bw = a->w - 2, bh = a->h - APP_TITLE_H - 2;
+  fb_fill_rect(bx, by, bw, bh, MEEP_PAPER3);
+
+  const mface *f = &meep_m105;
+  int lh = meep_line_h(f) + 3;
+  int cw = meep_text_w(f, "M");
+  int pad = 12;
+  int maxx = bx + bw - pad;
+  int line_x = bx + pad, line_y = by + pad;
+  int caret_x = line_x, caret_y = line_y;
+  int caret_set = 0;
+
+  for (int i = 0; i <= np_len; i++) {
+    if (i == np_cur) { caret_x = line_x; caret_y = line_y; caret_set = 1; }
+    if (i == np_len) break;
+    char ch = np_text[i];
+    if (ch == '\n') { line_x = bx + pad; line_y += lh; continue; }
+    if (line_x + cw > maxx) { line_x = bx + pad; line_y += lh; }
+    if (line_y < by + bh - 20) {
+      char s[2]; s[0] = ch; s[1] = 0;
+      meep_text(f, line_x, line_y, s, MEEP_INK);
+    }
+    line_x += cw;
+  }
+  if (!caret_set) { caret_x = line_x; caret_y = line_y; }
+
+  if (mapp_focus == APP_NOTES && ((np_blink / 15) & 1) == 0) {
+    fb_fill_rect(caret_x, caret_y, 1, meep_line_h(f), MEEP_ACCENT);
+  }
+  if (np_len == 0 && mapp_focus != APP_NOTES) {
+    meep_text(&meep_s130, bx + pad, by + pad, "click, then type", MEEP_INK_SOFT);
   }
 
-  /* Apple logo (using @ as placeholder, bold white) */
-  int font_h = FONT_HEIGHT * ui_scale;
-  int text_y = (MENU_BAR_HEIGHT - font_h) / 2;
-  gui_draw_string(UI_SCALE_VAL(14), text_y, "@", 0xFFFFFF);
-  
-  /* App name - bold */
-  gui_draw_string(UI_SCALE_VAL(36), text_y, "Vib-os", 0xFFFFFF);
+  /* footer hairline + hint */
+  meep_hline(bx, by + bh - 22, bw, 1, MEEP_LINE);
+  meep_text(&meep_m100, bx + pad, by + bh - 17, "RAM only until the disk driver lands",
+            MEEP_INK_SOFT);
+}
 
-  /* Right side - Clock */
-  int clock_w = font_string_width("12:00");
-  gui_draw_string((int)screen_width - clock_w - UI_SCALE_VAL(16), text_y,
-                  "12:00", 0xFFFFFF);
-  
-  /* WiFi icon area */
-  int wx = (int)screen_width - UI_SCALE_VAL(86);
-  int wy = text_y + UI_SCALE_VAL(6);
-  fb_fill_rect(wx, wy + UI_SCALE_VAL(6), UI_SCALE_VAL(2), UI_SCALE_VAL(2),
-               0xFFFFFF);
-  fb_fill_rect(wx - UI_SCALE_VAL(2), wy + UI_SCALE_VAL(3), UI_SCALE_VAL(6),
-               UI_SCALE_VAL(2), 0xFFFFFF);
-  fb_fill_rect(wx - UI_SCALE_VAL(4), wy, UI_SCALE_VAL(10), UI_SCALE_VAL(2),
-               0xFFFFFF);
+/* ---- widgets: shared chrome ------------------------------------------- */
+/* .wg head strip: paper-3, 1px --line-soft hairline, mono 9px uppercase title
+   with .16em tracking, and an 18px .wg-x box on the right. */
+#define WG_HEAD_H 23
 
-  /* Draw dropdown if open */
-  if (menu_open == 1) {
-    int dd_x = UI_SCALE_VAL(8);
-    int dd_y = MENU_BAR_HEIGHT;
-    int dd_w = UI_SCALE_VAL(160);
-    int dd_h = UI_SCALE_VAL(80);
-    
-    /* Shadow */
-    fb_fill_rect(dd_x + UI_SCALE_VAL(3), dd_y + UI_SCALE_VAL(3), dd_w, dd_h,
-                 0x151520);
-    
-    /* Background */
-    fb_fill_rect(dd_x, dd_y, dd_w, dd_h, 0x404050);
-    fb_draw_rect(dd_x, dd_y, dd_w, dd_h, 0x606070);
-    
-    /* Menu items */
-    gui_draw_string(dd_x + UI_SCALE_VAL(12), dd_y + UI_SCALE_VAL(10),
-                    "About Vib-os", 0xFFFFFF);
-    fb_fill_rect(dd_x + UI_SCALE_VAL(8), dd_y + UI_SCALE_VAL(30),
-                 dd_w - UI_SCALE_VAL(16), UI_SCALE_VAL(1), 0x606070);
-    gui_draw_string(dd_x + UI_SCALE_VAL(12), dd_y + UI_SCALE_VAL(38),
-                    "Settings...", 0xFFFFFF);
-    fb_fill_rect(dd_x + UI_SCALE_VAL(8), dd_y + UI_SCALE_VAL(56),
-                 dd_w - UI_SCALE_VAL(16), UI_SCALE_VAL(1), 0x606070);
-    gui_draw_string(dd_x + UI_SCALE_VAL(12), dd_y + UI_SCALE_VAL(62),
-                    "Restart", 0xFFFFFF);
+static int wg_chrome(meep_wg_t *w, int icon, const char *title) {
+  meep_box(w->x, w->y, w->w, w->h, 12, MEEP_LINE, MEEP_PAPER2);
+  fill_cap(w->x + 1, w->y + 1, w->w - 2, WG_HEAD_H - 1, 11, MEEP_PAPER3);
+  meep_hline(w->x + 1, w->y + WG_HEAD_H, w->w - 2, 1, MEEP_LINE_SOFT);
+  int isz = 12;
+  meep_icon(icon, w->x + 9, w->y + (WG_HEAD_H - UI_SCALE_VAL(isz)) / 2, isz,
+            MEEP_INK_SOFT);
+  meep_tracked(w->x + 9 + UI_SCALE_VAL(isz) + UI_SCALE_VAL(5),
+               w->y + (WG_HEAD_H - meep_line_h(&meep_m100)) / 2, title,
+               MEEP_INK_SOFT);
+  int cx = w->x + w->w - 14, cy = w->y + WG_HEAD_H / 2;
+  meep_icon(ICON_CLOSE, cx - UI_SCALE_VAL(6), cy - UI_SCALE_VAL(6), 12,
+            MEEP_INK_SOFT);
+  return w->y + WG_HEAD_H;
+}
+
+/* ---- widgets: sticky note ---------------------------------------------- */
+static void draw_sticky(void) {
+  meep_wg_t *w = &mwg[WG_STICKY];
+  if (!w->on) return;
+  int by = wg_chrome(w, ICON_STICKY, "sticky");
+
+  const mface *f = &meep_s130;
+  int lh = meep_line_h(f) + 4;
+  int cwmax = w->w - 24;
+  int x = w->x + 12, y = by + 10;
+  int cx = x, cy = y;
+
+  if (!sticky_len && wg_focus != WG_STICKY) {
+    meep_text(f, x, y, "click and type", MEEP_INK_SOFT);
+    return;
+  }
+  for (int i = 0; i <= sticky_len; i++) {
+    if (i == sticky_cur) { cx = x; cy = y; }
+    if (i == sticky_len) break;
+    char ch = sticky_text[i];
+    if (ch == '\n') { x = w->x + 10; y += lh; continue; }
+    char s[2]; s[0] = ch; s[1] = 0;
+    if (x + meep_text_w(f, s) > w->x + cwmax) { x = w->x + 12; y += lh; }
+    if (y < w->y + w->h - 12) meep_text(f, x, y, s, MEEP_INK);
+    x += meep_text_w(f, s);
+  }
+  if (wg_focus == WG_STICKY && ((np_blink / 15) & 1) == 0)
+    fb_fill_rect(cx, cy, 1, meep_line_h(f), MEEP_ACCENT);
+}
+
+/* ---- widgets: big clock ------------------------------------------------ */
+static void wd_text(char *out) {
+  static const char *wday[7] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+  static const char *mon[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+  int dom = meep_bcd(meep_cmos(0x07));
+  int m   = meep_bcd(meep_cmos(0x08));
+  int wd  = meep_bcd(meep_cmos(0x06));
+  int i = 0;
+  wd = (wd + 6) % 7;           /* cmos 1..7 = Sun..Sat */
+  if (m < 1 || m > 12) m = 1;
+  const char *a = wday[wd];
+  while (*a) out[i++] = *a++;
+  out[i++] = ' ';
+  char num[8];
+  s_num(dom, num);
+  for (int k = 0; num[k]; k++) out[i++] = num[k];
+  out[i++] = ' ';
+  const char *b = mon[m - 1];
+  while (*b) out[i++] = *b++;
+  out[i] = 0;
+}
+
+static void clock_hm(char *out, char *ampm) {
+  int h = meep_bcd(meep_cmos(0x04));
+  int m = meep_bcd(meep_cmos(0x02));
+  if (h > 23) h = 0;
+  if (m > 59) m = 0;
+  ampm[0] = h < 12 ? 'A' : 'P';
+  ampm[1] = 'M';
+  ampm[2] = 0;
+  int h12 = h % 12;
+  if (h12 == 0) h12 = 12;
+  char a[8], b[8];
+  s_num(h12, a);
+  int i = 0;
+  for (int k = 0; a[k]; k++) out[i++] = a[k];
+  out[i++] = ':';
+  if (m < 10) out[i++] = '0';
+  s_num(m, b);
+  for (int k = 0; b[k]; k++) out[i++] = b[k];
+  out[i] = 0;
+}
+
+static void draw_bigclock(void) {
+  meep_wg_t *w = &mwg[WG_CLOCK];
+  if (!w->on) return;
+  int by = wg_chrome(w, ICON_CLOCK, "clock");
+
+  char hm[16], ampm[4];
+  clock_hm(hm, ampm);
+
+  int apw = meep_text_w(&meep_m115, ampm);
+  int avail = w->w - 24 - apw - 6;
+  int h = 34;
+  int tw = big_w(h, hm);
+  while (tw > avail && h > 18) { h -= 2; tw = big_w(h, hm); }
+  int x = w->x + 12;
+  int ty = by + 9;
+  big_text(x, ty, h, hm, MEEP_INK);
+  meep_text(&meep_m115, x + tw + 9, ty + h - meep_line_h(&meep_m115) - 3, ampm,
+            MEEP_INK_SOFT);
+
+  char dt[24];
+  wd_text(dt);
+  for (int i = 0; dt[i]; i++) if (dt[i] >= 'a' && dt[i] <= 'z') dt[i] -= 32;
+  meep_tracked(w->x + 12, ty + h + 8, dt, MEEP_INK_SOFT);
+}
+
+/* ---- widgets: weather -------------------------------------------------- */
+static void draw_weather(void) {
+  meep_wg_t *w = &mwg[WG_WEATHER];
+  if (!w->on) return;
+  int by = wg_chrome(w, ICON_WEATHER, "weather");
+  int x = w->x + 12;
+
+  if (!wx_ok) {
+    /* no forecast source yet: report the link truthfully, invent nothing */
+    int up = e1000_link();
+    meep_text(&meep_m115, x, by + 11, up ? "link up" : "no uplink", MEEP_INK);
+    meep_tracked(x, by + 33, up ? "OMI NET ONLINE" : "OMI NET OFFLINE",
+                 MEEP_INK_SOFT);
+    meep_hline(x, by + 51, w->w - 24, 1, MEEP_LINE_SOFT);
+    if (up) {
+      meep_text(&meep_m100, x, by + 60, "tcp + http are working.",
+                MEEP_INK_SOFT);
+      meep_text(&meep_m100, x, by + 74, "a forecast needs tls. no tls.",
+                MEEP_INK_SOFT);
+    } else {
+      meep_text(&meep_m100, x, by + 60, "a NIC and the tcp stack",
+                MEEP_INK_SOFT);
+      meep_text(&meep_m100, x, by + 74, "come before a forecast.",
+                MEEP_INK_SOFT);
+    }
+    return;
+  }
+
+  char t[16];
+  s_num(wx_now, t);
+  big_text(x, by + 11, 27, t, MEEP_INK);
+  meep_text(&meep_m105, x + big_w(27, t) + 4, by + 13, "F", MEEP_INK_SOFT);
+  meep_text(&meep_m115, x, by + 46, wx_desc, MEEP_INK_SOFT);
+
+  char a[12], b[12];
+  s_num(wx_hi, a); s_num(wx_lo, b);
+  int hy = by + 68;
+  meep_tracked(x, hy, "HI", MEEP_INK_SOFT);
+  meep_text(&meep_m105, x + 24, hy - 1, a, MEEP_INK);
+  meep_tracked(x + 62, hy, "LO", MEEP_INK_SOFT);
+  meep_text(&meep_m105, x + 86, hy - 1, b, MEEP_INK);
+  meep_hline(x, hy + 17, w->w - 24, 1, MEEP_LINE_SOFT);
+
+  meep_text(&meep_m100, x, w->y + w->h - 18, "Jacksonville - via MeepNet",
+            MEEP_INK_SOFT);
+}
+
+
+/* ---- dashboard apps: replica of the catalog behind :8081/services.html ---- */
+/* Read-only copy of the house catalogue. MeepOS never writes to the dashboard;
+   these tables are regenerated from /api/catalog when the ISO is built. */
+/* ---- Media player / MeepNet: asked for, not built yet ------------------ */
+
+/* ---- audio: sample.mp3 on the HDA DAC --------------------------------
+   There is no mixer graph and no interrupt handler, so this is a pump: the
+   main loop hands the codec ~21 ms of audio at a time and the codec blocks
+   until it has been consumed, which paces playback to real time. MP3s are
+   not always 48 kHz, so everything is resampled to the codec's 48 kHz with
+   linear interpolation. */
+static meep_mp3_t *mp3h;
+static int   mp_playing;
+static int   mp_rate = 48000;
+static int   mp_ch = 2;
+static uint32_t mp_phase;   /* 16.16 fixed point, source frames */
+static int   mp_src_frames;
+static int16_t mp_src[4096];
+static int16_t mp_out[2048];
+static char  mp_note[40] = "ready";
+
+static void mp_note_set(const char *m) {
+  int k = 0;
+  while (m[k] && k < (int)sizeof(mp_note) - 1) { mp_note[k] = m[k]; k++; }
+  mp_note[k] = 0;
+}
+
+static void mp_stop(void) {
+  mp_playing = 0;
+  hda_stream_stop();
+}
+
+static int mp_start(void) {
+  if (!mp3h) {
+    if (!meep_media_mp3 || !meep_media_mp3_len) { mp_note_set("no boot module"); return 0; }
+    mp3h = meep_mp3_open(meep_media_mp3, meep_media_mp3_len);
+    if (!mp3h) { mp_note_set("decode failed"); return 0; }
+    mp_rate = (int)meep_mp3_rate(mp3h);
+    mp_ch = meep_mp3_channels(mp3h);
+    if (mp_ch < 1) mp_ch = 1;
+    if (mp_rate <= 0) mp_rate = 48000;
+  }
+  if (hda_init() != 0) { mp_note_set("no hda codec"); return 0; }
+  meep_mp3_seek(mp3h, 0);
+  mp_phase = 0;
+  mp_src_frames = 0;
+  if (hda_stream_start() != 0) { mp_note_set("stream start failed"); return 0; }
+  mp_note_set("playing sample.mp3");
+  mp_playing = 1;
+  return 1;
+}
+
+/* Hands the codec one chunk per call: decode -> resample to 48 kHz -> write
+   into the running stream. Integer phase only; a float accumulator went NaN
+   here once and killed playback without a word. */
+static void mp_pump(void) {
+  if (!mp_playing || !mp3h) return;
+  int free_bytes = hda_stream_free();
+  for (int guard = 0; guard < 64 && free_bytes >= 4096; guard++) {
+    if (mp_src_frames < 2) {
+      int got = meep_mp3_read(mp3h, mp_src, 4096);
+      if (got <= 0) {
+        mp_playing = 0;
+        hda_stream_stop();
+        mp_note_set("end of track");
+        return;
+      }
+      mp_src_frames = got / mp_ch;
+      mp_phase = 0;
+      if (mp_src_frames < 2) return;
+    }
+    uint32_t step = ((uint32_t)mp_rate << 16) / 48000u;
+    if (step == 0) step = 65536u;
+    int o = 0;
+    uint32_t ph = mp_phase;
+    int idx = (int)(ph >> 16);
+    while (o < 1024 && idx + 1 < mp_src_frames) {
+      int frac = (int)((ph >> 8) & 0xFF);
+      for (int c = 0; c < 2; c++) {
+        int sc = (c < mp_ch) ? c : mp_ch - 1;
+        int a = mp_src[idx * mp_ch + sc];
+        int b = mp_src[(idx + 1) * mp_ch + sc];
+        mp_out[o * 2 + c] = (int16_t)(a + (((b - a) * frac) >> 8));
+      }
+      o++;
+      ph += step;
+      idx = (int)(ph >> 16);
+    }
+    mp_phase = ph;   /* position within this source buffer */
+    if (idx + 1 >= mp_src_frames) { mp_src_frames = 0; mp_phase = 0; }
+    if (o <= 0) return;
+    int w = hda_stream_write(mp_out, o * 4);
+    if (w <= 0) return;
+    free_bytes -= w;
+  }
+}
+
+static void mp_time(uint64_t frames, int rate, char *out) {
+  uint32_t secs = rate > 0 ? (uint32_t)(frames / (uint64_t)rate) : 0;
+  int i = 0;
+  out[i++] = (char)('0' + (secs / 60) / 10);
+  out[i++] = (char)('0' + (secs / 60) % 10);
+  out[i++] = ':';
+  out[i++] = (char)('0' + (secs % 60) / 10);
+  out[i++] = (char)('0' + (secs % 60) % 10);
+  out[i] = 0;
+}
+
+static void draw_media(void) {
+  meep_app_t *a = &mapp[APP_MEDIA];
+  app_win(a->x, a->y, a->w, a->h, "Media player",
+          mp_playing ? "playing" : "idle", mapp_focus == APP_MEDIA);
+  int x = a->x + 14, y = a->y + APP_TITLE_H + 14;
+
+  meep_tracked(x, y, "SAMPLE.MP3", MEEP_INK_SOFT);
+  y += 22;
+  meep_text(&meep_s130, x, y, "sample.mp3", MEEP_INK);
+  y += 26;
+
+  char pos[8], pct[8];
+  uint64_t done = mp3h ? meep_mp3_pos(mp3h) : 0;
+  uint64_t tf = mp3h ? meep_mp3_total(mp3h) : 0;
+  int pm = tf > 0 ? (int)((done * 1000) / tf) : 0;   /* permille */
+  mp_time(done, mp_rate, pos);
+  { int pc = pm / 10;               /* permille -> percent */
+    int i = 0;
+    if (pc >= 100) pct[i++] = (char)('0' + (pc / 100) % 10);
+    if (pc >= 10) pct[i++] = (char)('0' + (pc / 10) % 10);
+    pct[i++] = (char)('0' + pc % 10);
+    pct[i++] = '%';
+    pct[i] = 0; }
+
+  meep_text(&meep_m100, x, y, "intel hda - 48 khz stereo", MEEP_INK_SOFT);
+  y += 20;
+
+  /* progress bar */
+  int bw = a->w - 28;
+  meep_box(x, y, bw, 6, 3, MEEP_LINE, MEEP_PAPER3);
+  if (mp3h) {
+    int fill = (bw - 4) * pm / 1000;
+    if (fill > 0) meep_box(x + 2, y + 1, fill, 4, 2, 0, MEEP_ACCENT);
+  }
+  y += 14;
+  meep_text(&meep_m100, x, y, pos, MEEP_INK);
+  meep_text(&meep_m100, x + 60, y, pct, MEEP_INK_SOFT);
+  y += 22;
+
+  /* play / stop */
+  int pw = 74, ph = 24;
+  meep_box(x, y, pw, ph, 7, MEEP_LINE, MEEP_PAPER3);
+  meep_text(&meep_m100, x + 14, y + (ph - meep_line_h(&meep_m100)) / 2,
+            mp_playing ? "stop" : "play", MEEP_INK);
+
+  meep_text(&meep_m100, x, a->y + a->h - 20, mp_note, MEEP_INK_SOFT);
+}
+
+/* ---- Omi Net ----------------------------------------------------------
+   A real browser needs three things this has: a TCP stream, an HTTP client
+   (net/http.c) and something to paint. There is no TLS, so https-only hosts
+   are refused up front rather than failing mysteriously; the renderer is a
+   tag stripper that keeps block breaks, not a layout engine. */
+#define ON_MAX 40000
+static char on_url[192] = "example.com";
+static char on_text[ON_MAX];
+static char on_lines[400][92];
+static int  on_nlines;
+static int  on_state;          /* 0 idle, 1 loading, 2 ok, 3 failed */
+static int  on_scroll;
+static int  on_caret;
+static int  on_status;
+static http_result_t on_res;
+
+static const char *on_bm[] = {"example.com", "info.cern.ch", "httpforever.com"};
+#define ON_NBM 3
+
+static int on_lc(char c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+static int on_tag(const char *s, int len, int i, const char *name, int *closing) {
+  int n = 0;
+  while (name[n]) n++;
+  int at = i + 1;
+  *closing = 0;
+  if (at < len && s[at] == '/') { *closing = 1; at++; }
+  if (at + n > len) return 0;
+  for (int k = 0; k < n; k++)
+    if (on_lc(s[at + k]) != on_lc(name[k])) return 0;
+  char after = (at + n < len) ? s[at + n] : ' ';
+  return after == ' ' || after == '>' || after == '/' || after == '\r' ||
+         after == '\n' || after == '\t';
+}
+
+/* Drops markup, keeps words and block breaks. `len` is the body length. */
+static int on_flatten(const char *s, int len, char *out, int max) {
+  int o = 0;
+  int skipping = 0;                      /* inside <script>/<style> */
+  const char *skip_name = 0;
+  for (int i = 0; i < len && o < max - 1; i++) {
+    char c = s[i];
+    if (skipping && c != '<') continue;     /* drop script/style bodies */
+    if (c == '<') {
+      int j = i + 1;
+      while (j < len && s[j] != '>') j++;
+      if (j >= len) break;
+      int closing = 0;
+      if (skipping) {
+        if (on_tag(s, len, i, skip_name, &closing) && closing) skipping = 0;
+        i = j;
+        continue;
+      }
+      if (on_tag(s, len, i, "script", &closing) ||
+          on_tag(s, len, i, "style", &closing)) {
+        if (!closing) {
+          skipping = 1;
+          skip_name = on_tag(s, len, i, "script", &closing) ? "script" : "style";
+        }
+        i = j;
+        continue;
+      }
+      int block = 0;
+      static const char *blocks[] = {"p", "div", "br", "li", "tr", "h1", "h2",
+                                     "h3", "h4", "h5", "h6", "ul", "ol",
+                                     "table", "section", "article", "header",
+                                     "footer", "title", "pre", "blockquote"};
+      for (int b = 0; b < (int)(sizeof blocks / sizeof blocks[0]); b++)
+        if (on_tag(s, len, i, blocks[b], &closing)) { block = 1; break; }
+      if (block) {
+        if (o > 0 && out[o - 1] != '\n') out[o++] = '\n';
+        if (o > 1 && out[o - 2] == '\n') o--;      /* no double breaks */
+      }
+      i = j;
+      continue;
+    }
+    if (c == '&') {
+      const char *rep = 0;
+      int adv = 0;
+      if (i + 4 < len && s[i + 1] == 'a' && s[i + 2] == 'm' && s[i + 3] == 'p' && s[i + 4] == ';') { rep = "&"; adv = 5; }
+      else if (i + 3 < len && s[i + 1] == 'l' && s[i + 2] == 't' && s[i + 3] == ';') { rep = "<"; adv = 4; }
+      else if (i + 3 < len && s[i + 1] == 'g' && s[i + 2] == 't' && s[i + 3] == ';') { rep = ">"; adv = 4; }
+      else if (i + 5 < len && s[i + 1] == 'n' && s[i + 2] == 'b' && s[i + 3] == 's' && s[i + 4] == 'p' && s[i + 5] == ';') { rep = " "; adv = 6; }
+      else if (i + 5 < len && s[i + 1] == 'q' && s[i + 2] == 'u' && s[i + 3] == 'o' && s[i + 4] == 't' && s[i + 5] == ';') { rep = "\""; adv = 6; }
+      else if (i + 4 < len && s[i + 1] == '#') {
+        int v = 0, k = i + 2;
+        while (k < len && s[k] >= '0' && s[k] <= '9' && v < 1000) { v = v * 10 + (s[k] - '0'); k++; }
+        if (k < len && s[k] == ';' && v >= 32 && v < 127) {
+          out[o++] = (char)v;
+          i = k;
+          continue;
+        }
+      }
+      if (rep) {
+        for (const char *r = rep; *r && o < max - 1; r++) out[o++] = *r;
+        i += adv - 1;
+        continue;
+      }
+    }
+    if (c == '\r') continue;
+    /* the bitmap face is ascii only: drop whole utf-8 sequences instead of
+       printing a box per byte (page titles are full of em dashes) */
+    if ((unsigned char)c >= 0x80) {
+      while (i + 1 < len && ((unsigned char)s[i + 1] & 0xC0) == 0x80) i++;
+      continue;
+    }
+    if (c == '\t') c = ' ';
+    if (c == '\n') c = ' ';
+    if (c < ' ') continue;
+    if (c == ' ' && o > 0 && out[o - 1] == ' ') continue;   /* collapse runs */
+    out[o++] = c;
+  }
+  out[o] = 0;
+  return o;
+}
+
+/* Columns that actually fit: measured from the mono face, not guessed. */
+static int on_cols(void) {
+  meep_app_t *a = &mapp[APP_BROWSER];
+  int cw = meep_text_w(&meep_m100, "mmmmmmmmmm") / 10;
+  if (cw <= 0) cw = 6;
+  int cols = (a->w - 40) / cw;
+  if (cols < 24) cols = 24;
+  if (cols > 90) cols = 90;
+  return cols;
+}
+
+static void on_wrap(int cols) {
+  on_nlines = 0;
+  int col = 0;
+  int i = 0;
+  char line[92];
+  int ll = 0;
+  line[0] = 0;
+  while (on_text[i] && on_nlines < 400) {
+    if (on_text[i] == '\n') {
+      line[ll] = 0;
+      on_lines[on_nlines][0] = 0;
+      int k = 0;
+      while (k < ll && k < 91) { on_lines[on_nlines][k] = line[k]; k++; }
+      on_lines[on_nlines][k] = 0;
+      on_nlines++;
+      ll = 0; col = 0;
+      i++;
+      continue;
+    }
+    /* word wrap: find the next word */
+    int w = 0;
+    while (on_text[i + w] && on_text[i + w] != ' ' && on_text[i + w] != '\n') w++;
+    if (col + w >= cols && col > 0) {
+      line[ll] = 0;
+      int k = 0;
+      while (k < ll && k < 91) { on_lines[on_nlines][k] = line[k]; k++; }
+      on_lines[on_nlines][k] = 0;
+      on_nlines++;
+      ll = 0; col = 0;
+      if (on_nlines >= 400) break;
+    }
+    for (int k = 0; k < w && ll < 90; k++) { line[ll++] = on_text[i + k]; col++; }
+    i += w;
+    if (on_text[i] == ' ') { if (ll < 90) { line[ll++] = ' '; } col++; i++; }
+  }
+  if (ll > 0 && on_nlines < 400) {
+    int k = 0;
+    while (k < ll && k < 91) { on_lines[on_nlines][k] = line[k]; k++; }
+    on_lines[on_nlines][k] = 0;
+    on_nlines++;
+  }
+}
+
+static void on_load(void) {
+  on_scroll = 0;
+  on_state = 1;
+  on_nlines = 0;
+  on_text[0] = 0;
+  const net_cfg_t *cfg = net_get();
+  if (!cfg->valid || !e1000_link()) { on_state = 3; on_status = 0; return; }
+  char url[256];
+  int u = 0;
+  if (!(on_url[0] == 'h' && on_url[1] == 't')) {
+    const char *p = "http://";
+    while (*p) url[u++] = *p++;
+  }
+  for (int i = 0; on_url[i] && u < 254; i++) url[u++] = on_url[i];
+  url[u] = 0;
+  /* paint "fetching..." before the blocking request, or the desktop just freezes */
+  gui_compose();
+  if (!http_get(cfg, url, on_text, ON_MAX, &on_res)) {
+    on_state = 3;
+    on_status = on_res.status;        /* -1 dns, -2 tcp, -3 send, -4 not http */
+    return;
+  }
+  on_status = on_res.status;
+  on_state = (on_res.status == 200) ? 2 : 3;
+  int n = on_res.len;
+  if (n <= 0) n = 0;
+  on_flatten(on_text, n, on_text, ON_MAX);
+  on_wrap(on_cols());
+}
+
+static void on_chip_rect(int i, int *x, int *y, int *w, int *h) {
+  meep_app_t *a = &mapp[APP_BROWSER];
+  int ty = a->y + APP_TITLE_H;
+  int x0 = a->x + 10;
+  for (int k = 0; k < i; k++)
+    x0 += meep_text_w(&meep_m100, on_bm[k]) + 26;
+  *x = x0;
+  *y = ty + 8;
+  *w = meep_text_w(&meep_m100, on_bm[i]) + 16;
+  *h = 20;
+}
+
+static void draw_browser(void) {
+  meep_app_t *a = &mapp[APP_BROWSER];
+  const char *state = "idle";
+  if (on_state == 1) state = "loading";
+  else if (on_state == 2) state = "live";
+  else if (on_state == 3) state = "no page";
+  app_win(a->x, a->y, a->w, a->h, "Omi Net", state, mapp_focus == APP_BROWSER);
+
+  int ty = a->y + APP_TITLE_H;
+
+  /* bookmarks, in place of the old "new tab" pill */
+  for (int i = 0; i < ON_NBM; i++) {
+    int x, y, w, h;
+    on_chip_rect(i, &x, &y, &w, &h);
+    meep_box(x, y, w, h, 6, MEEP_LINE, MEEP_PAPER3);
+    meep_text(&meep_m100, x + 8, y + (h - meep_line_h(&meep_m100)) / 2,
+              on_bm[i], MEEP_INK_SOFT);
+  }
+
+  /* address pill: typed text, with a caret when focused */
+  int uy = ty + 34, uw = a->w - 20;
+  meep_box(a->x + 10, uy, uw, 24, 12, MEEP_LINE, MEEP_PAPER2);
+  int tw = meep_text_w(&meep_m100, on_url);
+  int avail = uw - 22;
+  int skip = 0;
+  while (tw > avail && skip < (int)sizeof(on_url)) {
+    skip++;
+    tw = meep_text_w(&meep_m100, on_url + skip);
+  }
+  meep_text(&meep_m100, a->x + 16, uy + (24 - meep_line_h(&meep_m100)) / 2,
+            on_url + skip, MEEP_INK);
+  if (mapp_focus == APP_BROWSER && ((on_caret / 20) & 1) == 0)
+    gui_draw_line(a->x + 17 + tw, uy + 6, a->x + 17 + tw, uy + 18, MEEP_INK);
+
+  meep_hline(a->x + 1, uy + 30, a->w - 2, 1, MEEP_LINE_SOFT);
+
+  int bx = a->x + 16, byy = uy + 42;
+  int bottom = a->y + a->h - 26;
+  int line_h = 14;
+
+  if (on_state == 0) {
+    meep_text(&meep_m115, bx, byy, "type a url, press enter", MEEP_INK);
+    byy += 24;
+    meep_text(&meep_m100, bx, byy, "http only - this client has no tls,", MEEP_INK_SOFT);
+    byy += 16;
+    meep_text(&meep_m100, bx, byy, "so https hosts will refuse to load.", MEEP_INK_SOFT);
+  } else if (on_state == 1) {
+    meep_text(&meep_m115, bx, byy, "fetching...", MEEP_INK);
+  } else if (on_state == 3) {
+    meep_text(&meep_m115, bx, byy, "could not load that page", MEEP_INK);
+    byy += 22;
+    const char *why = "the reply did not parse.",
+                   *hint = "try another host.";
+    if (on_status == -1) { why = "dns has no address for that host."; hint = "check the name, or add a dot-com."; }
+    else if (on_status == -2) { why = "the host never opened a port."; hint = "site down, blocked, or https only."; }
+    else if (on_status == -3) { why = "the connection died mid request."; hint = "try again."; }
+    else if (on_status > 0) { why = "the server refused to serve the page."; hint = "it answered, but not with 200."; }
+    meep_text(&meep_m100, bx, byy, why, MEEP_INK_SOFT);
+    byy += 16;
+    meep_text(&meep_m100, bx, byy, hint, MEEP_INK_SOFT);
+  } else {
+    int rows = (bottom - byy) / line_h;
+    for (int i = 0; i < rows; i++) {
+      int li = on_scroll + i;
+      if (li >= on_nlines) break;
+      meep_text(&meep_m100, bx, byy + i * line_h, on_lines[li], MEEP_INK);
+    }
+  }
+
+  /* status strip, like the web shell's .mn-status */
+  char foot[84];
+  int f = 0;
+  const char *p = "http  ";
+  while (*p) foot[f++] = *p++;
+  if (on_status > 0) {
+    int v = on_status, d[4], n = 0;
+    if (!v) d[n++] = 0;
+    while (v) { d[n++] = v % 10; v /= 10; }
+    while (n) foot[f++] = (char)('0' + d[--n]);
+  } else if (on_status < 0) {
+    const char *q = "failed";
+    while (*q) foot[f++] = *q++;
+  } else foot[f++] = '-';
+  p = "   lines ";
+  while (*p) foot[f++] = *p++;
+  { int v = on_nlines, d[6], n = 0; if (!v) d[n++] = 0;
+    while (v) { d[n++] = v % 10; v /= 10; }
+    while (n) foot[f++] = (char)('0' + d[--n]); }
+  p = "   scroll ";
+  while (*p) foot[f++] = *p++;
+  { int v = on_scroll, d[6], n = 0; if (!v) d[n++] = 0;
+    while (v) { d[n++] = v % 10; v /= 10; }
+    while (n) foot[f++] = (char)('0' + d[--n]); }
+  foot[f] = 0;
+  meep_hline(a->x + 1, a->y + a->h - 24, a->w - 2, 1, MEEP_LINE_SOFT);
+  meep_text(&meep_m100, a->x + 14, a->y + a->h - 18, foot, MEEP_INK_SOFT);
+}
+
+/* ---- one z-order for windows *and* widgets ---------------------------- */
+/* Everything on the desktop lives in a single back-to-front list: clicking a
+   window or a widget moves it to the top, exactly like a real window manager. */
+#define Z_WG 100
+static int zl[APP_COUNT + WG_COUNT];
+static int zl_n;
+
+static void z_init(void) {
+  zl_n = 0;
+  for (int i = 1; i < APP_COUNT; i++) zl[zl_n++] = i;
+  for (int i = 0; i < WG_COUNT; i++) zl[zl_n++] = Z_WG + i;
+}
+
+static void z_top(int e) {
+  if (zl_n == 0) z_init();
+  int k = -1;
+  for (int i = 0; i < zl_n; i++) if (zl[i] == e) { k = i; break; }
+  if (k < 0) return;
+  for (int i = k; i < zl_n - 1; i++) zl[i] = zl[i + 1];
+  zl[zl_n - 1] = e;
+}
+
+/* ---- app/widget geometry + hit testing --------------------------------- */
+static void app_defaults(int id, int *x, int *y, int *w, int *h) {
+  switch (id) {
+    case APP_CALC:  *x = 120; *y = 320; *w = 250; *h = APP_TITLE_H + 12 + 64 + 10 + 5 * 40 + 4 * 6 + 14; break;
+    case APP_NOTES: *x = 400; *y = 300; *w = 430; *h = 360; break;
+    case APP_MEDIA: *x = 300; *y = 190; *w = 420; *h = 260; break;
+    case APP_BROWSER: *x = 230; *y = 150; *w = 470; *h = 300; break;
+    default:        *x = 240; *y = 140; *w = 520; *h = 340; break;
+  }
+}
+
+static void app_open(int id) {
+  if (id <= APP_NONE || id >= APP_COUNT) return;
+  meep_app_t *a = &mapp[id];
+  if (!a->open) {
+    int x, y, w, h;
+    app_defaults(id, &x, &y, &w, &h);
+    a->open = 1; a->x = x; a->y = y; a->w = w; a->h = h; a->min = 0;
+    app_max[id] = 0;
+  }
+  a->min = 0;
+  mapp_focus = id;
+  wg_focus = -1;
+  z_top(id);
+  needs_redraw = 1;
+}
+
+static void app_toggle(int id) {
+  if (id <= APP_NONE || id >= APP_COUNT) return;
+  if (mapp[id].open) {
+    mapp[id].open = 0;
+    if (mapp_focus == id) mapp_focus = APP_NONE;
+  } else {
+    app_open(id);
+  }
+  needs_redraw = 1;
+}
+
+static void wg_toggle(int i) {
+  if (i < 0 || i >= WG_COUNT) return;
+  mwg[i].on = !mwg[i].on;
+  if (mwg[i].on) {
+    meep_wg_t *g = &mwg[i];
+    /* a widget must never come back off-screen: clamp it above the taskbar */
+    int bottom = (int)screen_height - dock_height - 8;
+    if (g->x < 8) g->x = 8;
+    if (g->x + g->w > (int)screen_width - 8) g->x = (int)screen_width - 8 - g->w;
+    if (g->y < 8) g->y = 8;
+    if (g->y + g->h > bottom) g->y = bottom - g->h;
+    wg_focus = i;               /* shown widgets take focus, so they paint */
+    z_top(Z_WG + i);
+  } else if (wg_focus == i) {
+    wg_focus = -1;
+  }
+  needs_redraw = 1;
+  full_redraw = 1;              /* a newly shown widget is not in any dirty rect */
+}
+
+static int app_at(int x, int y) {
+  /* focused first, then the rest */
+  if (mapp_focus != APP_NONE) {
+    meep_app_t *a = &mapp[mapp_focus];
+    if (a->open && x >= a->x && x < a->x + a->w && y >= a->y && y < a->y + a->h)
+      return mapp_focus;
+  }
+  for (int id = 1; id < APP_COUNT; id++) {
+    meep_app_t *a = &mapp[id];
+    if (!a->open || a->min) continue;
+    if (x >= a->x && x < a->x + a->w && y >= a->y && y < a->y + a->h) return id;
+  }
+  return APP_NONE;
+}
+
+static int wg_at(int x, int y) {
+  for (int i = WG_COUNT - 1; i >= 0; i--) {
+    if (!mwg[i].on) continue;
+    if (x >= mwg[i].x && x < mwg[i].x + mwg[i].w &&
+        y >= mwg[i].y && y < mwg[i].y + mwg[i].h) return i;
+  }
+  return -1;
+}
+
+/* returns 1 when the click was consumed by an app or a widget */
+
+/* ===================================================================== */
+/* Taskbar: one Windows-style bar along the bottom, carrying the start    */
+/* menu button (the old top-left logo lockup), a button per running app,  */
+/* and the clock at the right. It replaces the top menubar and the        */
+/* floating dock completely - there is no second bar anywhere.            */
+/* ===================================================================== */
+
+#define TB_BASE_H   44
+#define TB_START_W 136
+#define SM_W_BASE  244
+#define SM_ROW_H    32
+#define SM_SEP_H     9
+
+static int start_open = 0, start_hover = -1, tb_hover = -2;
+
+static int taskbar_h(void) { return UI_SCALE_VAL(TB_BASE_H); }
+static int taskbar_y(void) { return (int)screen_height - taskbar_h(); }
+
+static int app_icon(int id) {
+  switch (id) {
+    case APP_CALC:    return ICON_CALC;
+    case APP_NOTES:   return ICON_NOTES;
+    case APP_MEDIA:   return ICON_MEDIA;
+    case APP_BROWSER: return ICON_BROWSER;
+    default:          return ICON_APPS;
+  }
+}
+
+static const char *app_title(int id) {
+  switch (id) {
+    case APP_CALC:    return "calculator";
+    case APP_NOTES:   return "notes";
+    case APP_MEDIA:   return "media player";
+    case APP_BROWSER: return "omi net";
+  }
+  return "";
+}
+
+/* left-to-right walk of the running-app buttons. Used by the draw pass, the
+   1x text pass and every hit test, so they can never disagree. */
+static int tb_walk(int *ids, int *xs, int *ws) {
+  int s = ui_scale;
+  int cx = UI_SCALE_VAL(8) + UI_SCALE_VAL(TB_START_W) + UI_SCALE_VAL(8);
+  int right_limit = (int)screen_width - UI_SCALE_VAL(150);   /* leave the clock clear */
+  int n = 0;
+  for (int id = 1; id < APP_COUNT; id++) {
+    if (!mapp[id].open) continue;
+    int w = UI_SCALE_VAL(28) + meep_text_w(&meep_s130, app_title(id)) * s +
+            UI_SCALE_VAL(14);
+    if (cx + w > right_limit) break;
+    if (ids) ids[n] = id;
+    if (xs) xs[n] = cx;
+    if (ws) ws[n] = w;
+    n++;
+    cx += w + UI_SCALE_VAL(4);
+  }
+  return n;
+}
+
+static int start_button_hit(int x, int y) {
+  if (y < taskbar_y()) return 0;
+  return x >= UI_SCALE_VAL(8) && x < UI_SCALE_VAL(8) + UI_SCALE_VAL(TB_START_W);
+}
+
+/* ---- start menu ------------------------------------------------------- */
+/* kind: 0 = separator, 1 = app, 2 = widget, 3 = appearance */
+typedef struct { const char *label; int kind; int arg; } sm_item;
+
+static const sm_item sm_rows[] = {
+  {"calculator",     1, APP_CALC},
+  {"notes",          1, APP_NOTES},
+  {"media player",   1, APP_MEDIA},
+  {"omi net",        1, APP_BROWSER},
+  {0, 0, 0},
+  {"clock widget",   2, WG_CLOCK},
+  {"weather widget", 2, WG_WEATHER},
+  {"sticky note",    2, WG_STICKY},
+  {0, 0, 0},
+  {"appearance",     3, 0},
+};
+#define SM_N ((int)(sizeof(sm_rows) / sizeof(sm_rows[0])))
+
+static int sm_h(void) {
+  int h = UI_SCALE_VAL(12);
+  for (int i = 0; i < SM_N; i++)
+    h += sm_rows[i].label ? UI_SCALE_VAL(SM_ROW_H) : UI_SCALE_VAL(SM_SEP_H);
+  return h;
+}
+
+static void sm_rect(int *x, int *y, int *w, int *h) {
+  *x = UI_SCALE_VAL(8);
+  *w = UI_SCALE_VAL(SM_W_BASE);
+  *h = sm_h();
+  *y = taskbar_y() - *h - UI_SCALE_VAL(6);
+}
+
+static int sm_row_y(int i) {
+  int y = taskbar_y() - sm_h() - UI_SCALE_VAL(6) + UI_SCALE_VAL(6);
+  for (int k = 0; k < i; k++)
+    y += sm_rows[k].label ? UI_SCALE_VAL(SM_ROW_H) : UI_SCALE_VAL(SM_SEP_H);
+  return y;
+}
+
+static int sm_row_at(int x, int y) {
+  int px, py, pw, ph;
+  sm_rect(&px, &py, &pw, &ph);
+  if (x < px || x >= px + pw || y < py || y >= py + ph) return -1;
+  for (int i = 0; i < SM_N; i++) {
+    if (!sm_rows[i].label) continue;
+    int ry = sm_row_y(i);
+    if (y >= ry && y < ry + UI_SCALE_VAL(SM_ROW_H)) return i;
+  }
+  return -1;
+}
+
+static void sm_activate(int i) {
+  if (i < 0 || i >= SM_N || !sm_rows[i].label) return;
+  if (sm_rows[i].kind == 1) app_toggle(sm_rows[i].arg);
+  else if (sm_rows[i].kind == 2) wg_toggle(sm_rows[i].arg);
+  else if (sm_rows[i].kind == 3) meep_apply_appearance(!appearance_dark);
+}
+
+/* state string on the right of a row, so the menu says what it will do */
+static const char *sm_state(int i) {
+  if (sm_rows[i].kind == 1) return mapp[sm_rows[i].arg].open ? "open" : "";
+  if (sm_rows[i].kind == 2) return mwg[sm_rows[i].arg].on ? "on" : "off";
+  if (sm_rows[i].kind == 3) return appearance_dark ? "midnight" : "paper";
+  return "";
+}
+
+/* ---- drawing (supersampled pass: shapes only) -------------------------- */
+static void tb_brand_glyph(int gx, int gy, int gs) {
+  gui_draw_rounded_rect(gx, gy, gs, gs, UI_SCALE_VAL(5), MEEP_ACCENT);
+  int pad = UI_SCALE_VAL(4), gap = UI_SCALE_VAL(2);
+  int cell = (gs - pad * 2 - gap) / 2;
+  for (int i = 0; i < 4; i++) {
+    int cx = gx + pad + (i % 2) * (cell + gap);
+    int cy = gy + pad + (i / 2) * (cell + gap);
+    fb_fill_rect(cx, cy, cell, cell, MEEP_ACCENT_INK);
+  }
+}
+
+static void draw_start_menu(void) {
+  if (!start_open) return;
+  int px, py, pw, ph;
+  sm_rect(&px, &py, &pw, &ph);
+  meep_box(px, py, pw, ph, UI_SCALE_VAL(10), MEEP_LINE, MEEP_PAPER2);
+
+  for (int i = 0; i < SM_N; i++) {
+    int ry = sm_row_y(i);
+    if (!sm_rows[i].label) {
+      fb_fill_rect(px + UI_SCALE_VAL(8), ry + UI_SCALE_VAL(SM_SEP_H) / 2,
+                   pw - UI_SCALE_VAL(16), UI_SCALE_VAL(1), MEEP_LINE_SOFT);
+      continue;
+    }
+    if (i == start_hover)
+      meep_box(px + UI_SCALE_VAL(4), ry, pw - UI_SCALE_VAL(8),
+               UI_SCALE_VAL(SM_ROW_H), UI_SCALE_VAL(6), MEEP_ACCENT, MEEP_ACCENT);
+    /* icon set: apps and widgets get their Remix glyph, appearance gets the
+       palette; separators have none */
+    int ic = -1;
+    if (sm_rows[i].kind == 1) {
+      static const int app_ic[] = { ICON_CALC, ICON_NOTES, ICON_MEDIA, ICON_BROWSER };
+      int a = sm_rows[i].arg - 1;   /* app ids are 1-based (APP_NONE == 0) */
+      ic = (a >= 0 && a < 4) ? app_ic[a] : ICON_APPS;
+    } else if (sm_rows[i].kind == 2) {
+      static const int wg_ic[] = { ICON_STICKY, ICON_WEATHER, ICON_CLOCK };
+      int w = sm_rows[i].arg;
+      ic = (w >= 0 && w < 3) ? wg_ic[w] : ICON_APPS;
+    } else if (sm_rows[i].kind == 3) {
+      ic = ICON_APPEARANCE;
+    }
+    if (ic >= 0)
+      meep_icon(ic, px + UI_SCALE_VAL(12),
+                ry + (UI_SCALE_VAL(SM_ROW_H) - UI_SCALE_VAL(15)) / 2, 15,
+                (i == start_hover) ? MEEP_ACCENT_INK : MEEP_INK_SOFT);
+  }
+}
+
+static void draw_taskbar(void) {
+  int th = taskbar_h(), ty = taskbar_y(), W = (int)screen_width;
+  fb_fill_rect(0, ty, W, th, MEEP_PAPER2);
+  fb_fill_rect(0, ty, W, UI_SCALE_VAL(1), MEEP_LINE);
+
+  /* start button: the brand lockup from the old menubar, now bottom-left */
+  int sx = UI_SCALE_VAL(8), sw = UI_SCALE_VAL(TB_START_W);
+  int sy = ty + UI_SCALE_VAL(4), sh = th - UI_SCALE_VAL(8);
+  if (start_open || tb_hover == -1) {
+    uint32_t fill = (tb_hover == -1 && !start_open) ? MEEP_PAPER3 : MEEP_PRESS;
+    meep_box(sx, sy, sw, sh, UI_SCALE_VAL(8), MEEP_LINE_SOFT, fill);
+  }
+  int gs = UI_SCALE_VAL(19);
+  int gx = sx + UI_SCALE_VAL(10);
+  tb_brand_glyph(gx, ty + (th - gs) / 2, gs);
+
+  /* wordmark is a single word now: no badge box to reserve space for */
+
+  /* running apps */
+  int ids[APP_COUNT], xs[APP_COUNT], ws[APP_COUNT];
+  int n = tb_walk(ids, xs, ws);
+  for (int i = 0; i < n; i++) {
+    int id = ids[i];
+    uint32_t fill = (mapp_focus == id) ? MEEP_PAPER3 : MEEP_PAPER2;
+    uint32_t bord = (mapp_focus == id) ? MEEP_LINE : MEEP_LINE_SOFT;
+    if (tb_hover == id) fill = MEEP_PRESS;
+    meep_box(xs[i], sy, ws[i], sh, UI_SCALE_VAL(8), bord, fill);
+    meep_icon(app_icon(id), xs[i] + UI_SCALE_VAL(8),
+              sy + (sh - UI_SCALE_VAL(16)) / 2, 16,
+              (mapp_focus == id) ? MEEP_INK : MEEP_INK_SOFT);
+    /* the accent rule under a focused app is the "this one is active" cue */
+    if (mapp_focus == id)
+      fb_fill_rect(xs[i] + UI_SCALE_VAL(12), ty + th - UI_SCALE_VAL(5),
+                   ws[i] - UI_SCALE_VAL(24), UI_SCALE_VAL(2), MEEP_ACCENT);
+  }
+}
+
+/* ---- text: stamped at 1x so the atlas' own coverage survives ----------- */
+static void draw_taskbar_text(void) {
+  int th = taskbar_h(), ty = taskbar_y();
+  int sx = UI_SCALE_VAL(8);
+  int gs = UI_SCALE_VAL(19);
+  int gx = sx + UI_SCALE_VAL(10);
+  int word_x = gx + gs + UI_SCALE_VAL(7);
+  int word_y = ty + (th - meep_line_h(&meep_s145)) / 2;
+  meep_text(&meep_s145, word_x, word_y, BRAND_WORD, MEEP_INK);
+
+  int ids[APP_COUNT], xs[APP_COUNT], ws[APP_COUNT];
+  int n = tb_walk(ids, xs, ws);
+  for (int i = 0; i < n; i++) {
+    int id = ids[i];
+    uint32_t col = (mapp_focus == id) ? MEEP_INK : MEEP_INK_SOFT;
+    meep_text(&meep_s130, xs[i] + UI_SCALE_VAL(28),
+              ty + (th - meep_line_h(&meep_s130)) / 2, app_title(id), col);
+  }
+
+  /* clock, bottom-right */
+  char clock[32];
+  meep_clock_text(clock);
+  int cw = meep_text_w(&meep_m115, clock);
+  meep_text(&meep_m115, (int)screen_width - UI_SCALE_VAL(16) - cw,
+            ty + (th - meep_line_h(&meep_m115)) / 2, clock, MEEP_INK);
+
+  /* the start menu's own labels */
+  if (!start_open) return;
+  int px, py, pw, ph;
+  sm_rect(&px, &py, &pw, &ph);
+  for (int i = 0; i < SM_N; i++) {
+    if (!sm_rows[i].label) continue;
+    int ry = sm_row_y(i);
+    int ly = ry + (UI_SCALE_VAL(SM_ROW_H) - meep_line_h(&meep_s130)) / 2;
+    uint32_t col = (i == start_hover) ? MEEP_ACCENT_INK : MEEP_INK;
+    meep_text(&meep_s130, px + UI_SCALE_VAL(35), ly, sm_rows[i].label, col);
+    const char *st = sm_state(i);
+    if (st && st[0]) {
+      uint32_t scol = (i == start_hover) ? MEEP_ACCENT_INK : MEEP_INK_SOFT;
+      meep_text(&meep_m105, px + pw - UI_SCALE_VAL(14) - meep_text_w(&meep_m105, st),
+                ry + (UI_SCALE_VAL(SM_ROW_H) - meep_line_h(&meep_m105)) / 2, st, scol);
+    }
+  }
+}
+
+static int apps_click(int x, int y, int button) {
+  if (button == 2) return 0;
+  if (zl_n == 0) z_init();
+
+  for (int i = zl_n - 1; i >= 0; i--) {          /* topmost first: what you see is what you hit */
+    int e = zl[i];
+    if (e >= Z_WG) {
+      int w = e - Z_WG;
+      meep_wg_t *g = &mwg[w];
+      if (!g->on) continue;
+      if (x < g->x || x >= g->x + g->w || y < g->y || y >= g->y + g->h) continue;
+      wg_focus = w;
+      mapp_focus = APP_NONE;
+      z_top(e);
+      if (app_close_hit(x, y, g->x, g->y, g->w)) { wg_toggle(w); return 1; }
+      if (y < g->y + 24) { wg_drag = w; wg_dx = x - g->x; wg_dy = y - g->y; }
+      needs_redraw = 1;
+      return 1;
+    }
+    meep_app_t *a = &mapp[e];
+    if (!a->open || a->min) continue;
+    if (x < a->x || x >= a->x + a->w || y < a->y || y >= a->y + a->h) continue;
+    mapp_focus = e;
+    wg_focus = -1;
+    z_top(e);
+    int wc = app_wctl_hit(x, y, a->x, a->y, a->w);
+    if (wc == 3) { a->open = 0; a->min = 0; mapp_focus = APP_NONE; needs_redraw = 1; return 1; }
+    if (wc == 1) { a->min = 1; mapp_focus = APP_NONE; needs_redraw = 1; return 1; }
+    if (wc == 2) {
+      if (app_max[e]) {
+        a->x = app_saved[e][0]; a->y = app_saved[e][1];
+        a->w = app_saved[e][2]; a->h = app_saved[e][3];
+        app_max[e] = 0;
+      } else {
+        app_saved[e][0] = a->x; app_saved[e][1] = a->y;
+        app_saved[e][2] = a->w; app_saved[e][3] = a->h;
+        a->x = 8; a->y = MENU_BAR_HEIGHT + 8;
+        a->w = (int)screen_width - 16;
+        a->h = (int)screen_height - DOCK_HEIGHT - UI_SCALE_VAL(16);
+        app_max[e] = 1;
+      }
+      needs_redraw = 1;
+      return 1;
+    }
+    if (y < a->y + APP_TITLE_H) { drag_app = e; drag_dx = x - a->x; drag_dy = y - a->y; needs_redraw = 1; return 1; }
+    if (e == APP_CALC) calc_body_click(x, y);
+    if (e == APP_MEDIA) {
+      int bx = a->x + 14;
+      int by = a->y + APP_TITLE_H + 14 + 22 + 26 + 20 + 14 + 22;
+      if (x >= bx - 4 && x < bx + 78 && y >= by - 4 && y < by + 28) {
+        if (mp_playing) mp_stop();
+        else if (!mp_start()) mp_playing = 0;
+        needs_redraw = 1;
+        return 1;
+      }
+    }
+    if (e == APP_BROWSER) {
+      for (int i = 0; i < ON_NBM; i++) {
+        int cx, cy, cw, ch;
+        on_chip_rect(i, &cx, &cy, &cw, &ch);
+        if (x >= cx && x < cx + cw && y >= cy && y < cy + ch) {
+          int k = 0;
+          while (on_bm[i][k] && k < (int)sizeof(on_url) - 1) { on_url[k] = on_bm[i][k]; k++; }
+          on_url[k] = 0;
+          on_load();
+          return 1;
+        }
+      }
+    }
+    needs_redraw = 1;
+    return 1;
+  }
+  return 0;
+}
+
+/* keyboard: returns 1 when an app/widget took the key */
+static int apps_key(int key) {
+  if (key == KEY_ESC) {
+    if (wg_focus >= 0) { wg_focus = -1; needs_redraw = 1; return 1; }
+    if (mapp_focus != APP_NONE) { mapp[mapp_focus].open = 0; mapp_focus = APP_NONE; needs_redraw = 1; return 1; }
+    return 0;
+  }
+  if (wg_focus == WG_STICKY) {
+    if (key == '\b' || key == 127) {
+      if (sticky_cur > 0) {
+        for (int i = sticky_cur - 1; i < sticky_len; i++) sticky_text[i] = sticky_text[i + 1];
+        sticky_cur--; sticky_len--;
+      }
+    } else if (key == '\n' || key == '\r') {
+      if (sticky_len < (int)sizeof(sticky_text) - 1) {
+        for (int i = sticky_len; i >= sticky_cur; i--) sticky_text[i + 1] = sticky_text[i];
+        sticky_text[sticky_cur] = '\n'; sticky_cur++; sticky_len++;
+      }
+    } else if (key >= 32 && key < 127 && sticky_len < (int)sizeof(sticky_text) - 1) {
+      for (int i = sticky_len; i >= sticky_cur; i--) sticky_text[i + 1] = sticky_text[i];
+      sticky_text[sticky_cur] = (char)key; sticky_cur++; sticky_len++;
+    } else {
+      return 0;
+    }
+    needs_redraw = 1;
+    return 1;
+  }
+  if (mapp_focus == APP_NOTES) {
+    np_key(key);
+    needs_redraw = 1;
+    return 1;
+  }
+  if (mapp_focus == APP_BROWSER) {
+    int n = 0;
+    while (on_url[n]) n++;
+    if (key == '\b' || key == 127) {
+      if (n > 0) on_url[n - 1] = 0;
+    } else if (key == '\n' || key == '\r') {
+      on_load();
+    } else if (key == KEY_UP) {
+      if (on_scroll > 0) on_scroll--;
+    } else if (key == KEY_DOWN) {
+      if (on_scroll < on_nlines - 1) on_scroll++;
+    } else if (key >= 32 && key < 127 && n < (int)sizeof(on_url) - 1) {
+      on_url[n] = (char)key;
+      on_url[n + 1] = 0;
+    } else {
+      return 0;
+    }
+    needs_redraw = 1;
+    return 1;
+  }
+  return 0;
+}
+
+static void apps_draw(void) {
+  if (zl_n == 0) z_init();
+  for (int i = 0; i < zl_n; i++) {
+    int e = zl[i];
+    if (e >= Z_WG) {
+      int w = e - Z_WG;
+      if (!mwg[w].on) continue;
+      if (w == WG_STICKY) draw_sticky();
+      else if (w == WG_WEATHER) draw_weather();
+      else if (w == WG_CLOCK) draw_bigclock();
+      continue;
+    }
+    if (!mapp[e].open || mapp[e].min) continue;
+    if (e == APP_CALC)  draw_calc();
+    else if (e == APP_NOTES) draw_notes();
+    else if (e == APP_MEDIA) draw_media();
+    else if (e == APP_BROWSER) draw_browser();
+  }
+}
+typedef struct { const char *title; const mitem *items; int n; } mmenu;
+
+static const mitem mi_file[]   = {{"New file window","F"},{"New note","N"},{"New terminal","T"},
+                                  {0,0},{"Close window","esc"}};
+static const mitem mi_apps[]   = {{"Calculator","F9"},{"Notepad","F11"},{0,0},
+                                  {"Media player",""},{"MeepNet",""}};
+static const mitem mi_view[]   = {{"Paper","1"},{"Midnight","2"},{0,0},
+                                  {"Toggle dock",0},{"Toggle grid",0},{0,0},{"Reset desktop",0}};
+static const mitem mi_widgets[]= {{"Sticky note","off"},{"Weather","off"},{"Big clock","off"},
+                                  {0,0},{"Show all",0},{"Hide all",0}};
+static const mitem mi_help[]   = {{"About Omi",0},{"Open terminal",0}};
+
+static const mmenu menus[5] = {
+  {"File", mi_file, 5}, {"Apps", mi_apps, 5}, {"View", mi_view, 7},
+  {"Widgets", mi_widgets, 6}, {"Help", mi_help, 2}
+};
+/* button boxes measured live off :8140 at 1280 wide (5px 9px padding, 13px/500) */
+static const int menu_bx[5] = {124, 164, 214, 263, 332};
+static const int menu_bw[5] = { 39,  49,  48,  68,  46};
+static const int menu_by = 5, menu_bh = 26;
+
+#define POP_W       212
+#define POP_ITEM_H   28
+#define POP_SEP_H    11
+#define POP_PAD       5
+#define POP_TEXT_PAD  8
+
+static int menu_pop_h(int m) {
+  int h = 2 + POP_PAD * 2;                  /* 1px border + 5px padding, both sides */
+  for (int i = 0; i < menus[m].n; i++)
+    h += menus[m].items[i].label ? POP_ITEM_H : POP_SEP_H;
+  return h;
+}
+
+static void menu_pop_rect(int m, int *x, int *y, int *w, int *h) {
+  *x = menu_bx[m];
+  *y = menu_by + menu_bh + 6;               /* top: calc(100% + 6px) */
+  *w = POP_W;
+  *h = menu_pop_h(m);
+}
+
+/* row top of item i, in 1x coords */
+static int menu_row_y(int m, int i) {
+  int y = menu_by + menu_bh + 6 + 1 + POP_PAD;
+  for (int k = 0; k < i; k++)
+    y += menus[m].items[k].label ? POP_ITEM_H : POP_SEP_H;
+  return y;
+}
+
+static int menu_pop_item_at(int m, int x, int y) {
+  if (m < 0) return -1;
+  int px, py, pw, ph;
+  menu_pop_rect(m, &px, &py, &pw, &ph);
+  if (x < px || x >= px + pw || y < py || y >= py + ph) return -1;
+  for (int i = 0; i < menus[m].n; i++) {
+    if (!menus[m].items[i].label) continue;
+    int ry = menu_row_y(m, i);
+    if (y >= ry && y < ry + POP_ITEM_H) return i;
+  }
+  return -1;
+}
+
+static int menu_title_at(int x, int y) {
+  if (y < menu_by || y >= menu_by + menu_bh) return -1;
+  for (int i = 0; i < 5; i++)
+    if (x >= menu_bx[i] && x < menu_bx[i] + menu_bw[i]) return i;
+  return -1;
+}
+
+/* dock tile rects, same walk as draw_dock() but at 1x */
+static void dock_icon_rect(int i, int *rx, int *ry) {
+  int tile = 44, pad = 7, gap = 6, brd = 1, sep_w = 7;
+  int x, y, dw, dh;
+  meep_dock_rect(1, &x, &y, &dw, &dh);
+  int cx = x + brd + pad, cy = y + brd + pad;
+  for (int k = 0; k < NUM_DOCK_ICONS; k++) {
+    if (k == 4) cx += sep_w + gap;
+    if (k == i) { *rx = cx; *ry = cy; return; }
+    cx += tile + gap;
+  }
+  *rx = -1; *ry = -1;
+}
+
+static int dock_icon_at(int x, int y) {
+  for (int i = 0; i < NUM_DOCK_ICONS; i++) {
+    int rx, ry;
+    dock_icon_rect(i, &rx, &ry);
+    if (rx >= 0 && x >= rx && x < rx + 44 && y >= ry && y < ry + 44) return i;
+  }
+  return -1;
+}
+
+static void update_hover(void) {
+  int nh = -2;                             /* -2 nothing, -1 start button, >=0 app */
+  if (mouse_y >= taskbar_y()) {
+    if (start_button_hit(mouse_x, mouse_y)) {
+      nh = -1;
+    } else {
+      int ids[APP_COUNT], xs[APP_COUNT], ws[APP_COUNT];
+      int n = tb_walk(ids, xs, ws);
+      for (int i = 0; i < n; i++)
+        if (mouse_x >= xs[i] && mouse_x < xs[i] + ws[i]) nh = ids[i];
+    }
+  }
+  int sh = start_open ? sm_row_at(mouse_x, mouse_y) : -1;
+  if (nh != tb_hover || sh != start_hover) {
+    tb_hover = nh;
+    start_hover = sh;
+    full_redraw = 1;
+    needs_redraw = 1;
+  }
+}
+
+static void draw_menu_bar(void) {
+  /* MeepOS menubar: 36px paper bar, hairline under it, yellow glyph + "meep OS" badge,
+     five menus, then lan / appearance / clock on the right. */
+  int h = MENU_BAR_HEIGHT;
+  fb_fill_rect(0, 0, screen_width, h, MEEP_PAPER2);
+  fb_fill_rect(0, h - UI_SCALE_VAL(1), screen_width, UI_SCALE_VAL(1), MEEP_LINE);
+
+  int fh = FONT_HEIGHT * ui_scale;
+  int ty = (h - fh) / 2;
+
+  /* hovered or open menu title sits on a paper-3 pill, radius 6 */
+  for (int i = 0; i < 5; i++)
+    if (i == open_menu || i == hover_menu)
+      meep_box(UI_SCALE_VAL(menu_bx[i]), UI_SCALE_VAL(menu_by),
+               UI_SCALE_VAL(menu_bw[i]), UI_SCALE_VAL(menu_bh),
+               UI_SCALE_VAL(6), MEEP_PAPER3, MEEP_PAPER3);
+
+  /* the open dropdown: paper-2 panel, 1px line, radius 8, plus the hovered row */
+  if (open_menu >= 0) {
+    int px, py, pw, ph;
+    menu_pop_rect(open_menu, &px, &py, &pw, &ph);
+    meep_box(UI_SCALE_VAL(px), UI_SCALE_VAL(py), UI_SCALE_VAL(pw), UI_SCALE_VAL(ph),
+             UI_SCALE_VAL(8), MEEP_LINE, MEEP_PAPER2);
+    for (int i = 0; i < menus[open_menu].n; i++) {
+      int ry = menu_row_y(open_menu, i);
+      if (i == hover_item)
+        meep_box(UI_SCALE_VAL(px + 1 + POP_PAD), UI_SCALE_VAL(ry),
+                 UI_SCALE_VAL(pw - 2 - POP_PAD * 2), UI_SCALE_VAL(POP_ITEM_H),
+                 UI_SCALE_VAL(5), MEEP_ACCENT, MEEP_ACCENT);
+      if (!menus[open_menu].items[i].label)      /* separator: 5px 4px margins */
+        fb_fill_rect(UI_SCALE_VAL(px + 4), UI_SCALE_VAL(ry + POP_SEP_H / 2),
+                     UI_SCALE_VAL(pw - 8), UI_SCALE_VAL(1), MEEP_LINE_SOFT);
+    }
+  }
+
+  /* brand glyph: 19px accent square, radius 5, four ink marks in a 2x2 grid */
+  int gs = UI_SCALE_VAL(19);
+  int gx = UI_SCALE_VAL(16);
+  int gy = (h - gs) / 2;
+  gui_draw_rounded_rect(gx, gy, gs, gs, UI_SCALE_VAL(5), MEEP_ACCENT);
+  {
+    int pad = UI_SCALE_VAL(4), gap = UI_SCALE_VAL(2);
+    int cell = (gs - pad * 2 - gap) / 2;
+    for (int i = 0; i < 4; i++) {
+      int cx = gx + pad + (i % 2) * (cell + gap);
+      int cy = gy + pad + (i / 2) * (cell + gap);
+      fb_fill_rect(cx, cy, cell, cell, MEEP_ACCENT_INK);
+    }
+  }
+
+
+  /* the one live indicator the bar draws itself: 6px dot inside a 2px halo */
+  {
+    int cy = ty + fh / 2 - UI_SCALE_VAL(3);
+    int cx = (int)screen_width - UI_SCALE_VAL(299);
+    gui_draw_circle(cx, cy + UI_SCALE_VAL(2), UI_SCALE_VAL(5), 0x00DBE7D2);
+    gui_draw_circle(cx, cy + UI_SCALE_VAL(2), UI_SCALE_VAL(3), MEEP_OK);
+  }
+
+  /* the appearance glyph: U+25D0 is outside the atlas, so draw a half-filled ring */
+  {
+    int cy = ty + fh / 2;
+    int cx = (int)screen_width - UI_SCALE_VAL(244);
+    int r = UI_SCALE_VAL(4), ri = r - UI_SCALE_VAL(1);
+    for (int dy = -r; dy <= r; dy++) {
+      int wo = meep_isqrt(r * r - dy * dy);
+      int wi = (ri > 0 && ri * ri - dy * dy > 0) ? meep_isqrt(ri * ri - dy * dy) : 0;
+      if (wo <= 0) continue;
+      fb_fill_rect(cx - wo, cy + dy, wo - wi, UI_SCALE_VAL(1), MEEP_INK_SOFT);  /* left rim */
+      fb_fill_rect(cx + wi, cy + dy, wo - wi, UI_SCALE_VAL(1), MEEP_INK_SOFT);  /* right rim */
+      /* the filled half is the active appearance: left = paper, right = midnight */
+      if (wi > 0) {
+        if (!appearance_dark)
+          fb_fill_rect(cx - wi, cy + dy, wi, UI_SCALE_VAL(1), MEEP_INK_SOFT);
+        else
+          fb_fill_rect(cx, cy + dy, wi, UI_SCALE_VAL(1), MEEP_INK_SOFT);
+      }
+    }
+  }
+}
+
+/* Text pass: 1x, after the supersampled shell has been box-filtered down, so the
+   atlas' own coverage lands on whole pixels instead of being averaged away. */
+static void draw_menu_bar_text(void) {
+  const int h = 36;
+  int bx = 16 + 19 + 7;
+
+  int tyv = (h - meep_line_h(&meep_s145)) / 2;
+  meep_text(&meep_s145, bx, tyv, BRAND_WORD, MEEP_INK);
+
+  {
+    static const char *menus[5] = {"File", "Apps", "View", "Widgets", "Help"};
+    static const int at[5] = {132, 172, 223, 271, 340};
+    int tym = (h - meep_line_h(&meep_s130)) / 2;
+    for (int i = 0; i < 5; i++)
+      meep_text(&meep_s130, at[i], tym, menus[i], MEEP_INK);
+  }
+
+  {
+    int tys = (h - meep_line_h(&meep_m105)) / 2;
+    meep_text(&meep_m105, (int)screen_width - 287, tys, "lan", MEEP_INK_SOFT);
+    meep_text(&meep_m105, (int)screen_width - 234, tys, "appearance", MEEP_INK_SOFT);
+    char clock[32];
+    meep_clock_text(clock);
+    meep_text(&meep_m115, (int)screen_width - 147, (h - meep_line_h(&meep_m115)) / 2,
+              clock, MEEP_INK);
+  }
+
+  /* the open dropdown's rows: 13px label, 10px mono shortcut, right aligned */
+  if (open_menu >= 0) {
+    int px, py, pw, ph;
+    menu_pop_rect(open_menu, &px, &py, &pw, &ph);
+    for (int i = 0; i < menus[open_menu].n; i++) {
+      const mitem *it = &menus[open_menu].items[i];
+      if (!it->label) continue;
+      int ry = menu_row_y(open_menu, i);
+      uint32_t col = (i == hover_item) ? MEEP_ACCENT_INK : MEEP_INK;
+      meep_text(&meep_s130, px + 1 + POP_PAD + POP_TEXT_PAD,
+                ry + (POP_ITEM_H - meep_line_h(&meep_s130)) / 2, it->label, col);
+      const char *kbd = it->kbd;
+      if (open_menu == 3 && i < 3) kbd = mwg[i].on ? "on" : "off";
+      if (kbd) {
+        int kw = meep_text_w(&meep_m100, kbd);
+        meep_text(&meep_m100, px + pw - 1 - POP_PAD - POP_TEXT_PAD - kw,
+                  ry + (POP_ITEM_H - meep_line_h(&meep_m100)) / 2, kbd,
+                  (i == hover_item) ? MEEP_ACCENT_INK : MEEP_INK_SOFT);
+      }
+    }
   }
 }
 
@@ -2306,7 +4265,7 @@ static void keyboard_callback(int key) {
 
   /* F9: Toggle Calculator */
   if (key == KEY_F9) {
-    calc.visible = !calc.visible;
+    app_toggle(APP_CALC);
     return;
   }
 
@@ -2321,7 +4280,7 @@ static void keyboard_callback(int key) {
 
   /* F11: Toggle Notepad */
   if (key == KEY_F11) {
-    notepad.visible = !notepad.visible;
+    app_toggle(APP_NOTES);
     return;
   }
 
@@ -2330,6 +4289,9 @@ static void keyboard_callback(int key) {
     analog_clock.visible = !analog_clock.visible;
     return;
   }
+
+  /* an open window or a focused widget takes the keystroke */
+  if (apps_key(key)) return;
 
   /* H: Toggle Help (when no text input active) */
   if ((key == 'h' || key == 'H') && !terminal.visible && !notepad.visible && !calc.visible) {
@@ -2483,8 +4445,11 @@ void gui_init(void) {
   int base_dock_padding = 10;
 
   dock_icon_size = base_dock_icon * ui_scale;
-  dock_height = base_dock_height * ui_scale;
-  menu_bar_height = base_menu_height * ui_scale;
+  (void)base_dock_height;
+  dock_height = TB_BASE_H * ui_scale;      /* still the bottom dead-zone for windows */
+  /* MeepOS menubar is exactly 36px at 1x (--bar-h), not the upstream default */
+  (void)base_menu_height;
+  menu_bar_height = 0;                     /* the taskbar replaces the top bar */
   dock_padding = base_dock_padding * ui_scale;
   
   /* Initialize VFS first */
@@ -2592,7 +4557,7 @@ void gui_init(void) {
 
   /* Show terminal and file manager as demo */
   terminal.visible = 1;
-  term_puts("Vib-OS Terminal v1.0\n", 14); /* Cyan */
+  term_puts("Omi Terminal v1.0\n", 14); /* Cyan */
   term_puts("Type 'help' for commands, 'neofetch' for system info.\n\n", 7);
   term_prompt();
 
@@ -2703,340 +4668,54 @@ static void smart_swap_buffers(void) {
   __asm__ volatile("mfence" ::: "memory");
 }
 
-/* Handle mouse clicks */
+/* Handle mouse clicks: the menubar menus open/close, dock tiles acknowledge.
+   Nothing behind them exists yet - that is the next layer. */
+/* the menubar appearance pill: glyph at W-244, word from W-234 */
+static int appearance_hit(int x, int y) {
+  if (y < 0 || y >= 36) return 0;
+  return x >= (int)screen_width - UI_SCALE_VAL(252) &&
+         x <  (int)screen_width - UI_SCALE_VAL(160);
+}
+
 static void handle_mouse_click(int x, int y, int button) {
-  /* Check menu bar */
-  if (y < MENU_BAR_HEIGHT) {
-    if (x < 90) {
-      menu_open = menu_open ? 0 : 1;
+  if (button == 2) {                       /* right click dismisses */
+    if (open_menu >= 0) { open_menu = -1; hover_item = -1; }
+    return;
+  }
+
+  /* the taskbar is chrome: it sits above every window */
+  if (y >= taskbar_y()) {
+    if (start_button_hit(x, y)) {
+      start_open = !start_open;
+      start_hover = -1;
     } else {
-      menu_open = 0;
+      int ids[APP_COUNT], xs[APP_COUNT], ws[APP_COUNT];
+      int n = tb_walk(ids, xs, ws);
+      int hit = -1;
+      for (int i = 0; i < n; i++)
+        if (x >= xs[i] && x < xs[i] + ws[i]) hit = ids[i];
+      if (hit > 0) {
+        if (mapp[hit].min) mapp[hit].min = 0;      /* restore a minimized app */
+        mapp_focus = hit;
+        z_top(hit);
+      }
+      start_open = 0;
     }
+    needs_redraw = 1;
+    full_redraw = 1;
     return;
   }
-  
-  /* Check menu dropdown */
-  if (menu_open && y >= MENU_BAR_HEIGHT &&
-      y < MENU_BAR_HEIGHT + UI_SCALE_VAL(100) &&
-      x < UI_SCALE_VAL(188)) {
-    int rel_y = y - MENU_BAR_HEIGHT;
-    if (rel_y >= UI_SCALE_VAL(8) && rel_y < UI_SCALE_VAL(30)) {
-      /* About clicked */
-      help_win.visible = 1;
-    } else if (rel_y >= UI_SCALE_VAL(38) && rel_y < UI_SCALE_VAL(58)) {
-      /* Settings clicked */
-      file_manager.visible = 1;
-    }
-    menu_open = 0;
-    return;
+
+  if (start_open) {                        /* dismiss, and let the click land */
+    int r = sm_row_at(x, y);
+    start_open = 0;
+    needs_redraw = 1;
+    full_redraw = 1;
+    if (r >= 0) { sm_activate(r); return; }
   }
-  
-  /* Close menu if clicking elsewhere */
-  menu_open = 0;
-  
-  /* Check dock clicks */
-  int dock_y = screen_height - DOCK_HEIGHT + UI_SCALE_VAL(6);
-  if (y >= dock_y && y < (int)screen_height) {
-    int dock_w = NUM_DOCK_ICONS * (DOCK_ICON_SIZE + DOCK_PADDING) + UI_SCALE_VAL(32);
-    int dock_x = (screen_width - dock_w) / 2;
-    
-    if (x >= dock_x && x < dock_x + dock_w) {
-      int rel_x = x - dock_x - UI_SCALE_VAL(16);
-      int icon_idx = rel_x / (DOCK_ICON_SIZE + DOCK_PADDING);
-      
-      if (icon_idx >= 0 && icon_idx < NUM_DOCK_ICONS) {
-        switch (icon_idx) {
-          case 0: terminal.visible = !terminal.visible; break;         /* Terminal */
-          case 1: file_manager.visible = !file_manager.visible; break; /* Files */
-          case 2: calc.visible = !calc.visible; break;                 /* Calculator */
-          case 3: notepad.visible = !notepad.visible; break;           /* Notes */
-          case 4: /* Settings - toggle file manager */ file_manager.visible = !file_manager.visible; break;
-          case 5: analog_clock.visible = !analog_clock.visible; break; /* Clock */
-          case 6: snake.visible = !snake.visible; if (snake.visible) snake_init(); break; /* Snake */
-          case 7: help_win.visible = !help_win.visible; break;         /* Help */
-          case 8: img_viewer.visible = !img_viewer.visible; bring_window_to_front(WIN_IMAGE_VIEWER); break; /* Images/Browser */
-          case 9: /* DOOM - not implemented */ break;
-          default: break;
-        }
-      }
-      return;
-    }
-  }
-  
-  /* Check context menu */
-  if (ctx_menu.visible) {
-    if (x >= ctx_menu.x && x < ctx_menu.x + ctx_menu.width &&
-        y >= ctx_menu.y && y < ctx_menu.y + ctx_menu.height) {
-      /* Click on menu item */
-      int item_h = UI_SCALE_VAL(24);
-      int item_y = ctx_menu.y + UI_SCALE_VAL(4);
-      for (int i = 0; i < ctx_menu.item_count; i++) {
-        if (y >= item_y && y < item_y + item_h - UI_SCALE_VAL(2) && ctx_menu.items[i].enabled) {
-          ctx_menu.visible = 0;
-          /* Handle action */
-          if (strcmp(ctx_menu.items[i].label, "New Folder") == 0) {
-            static int folder_num = 1;
-            char path[64];
-            snprintf(path, 64, "/Desktop/New Folder %d", folder_num++);
-            vfs_mkdir(path);
-          } else if (strcmp(ctx_menu.items[i].label, "New Text Document") == 0) {
-            static int file_num = 1;
-            char path[64];
-            snprintf(path, 64, "/Desktop/document%d.txt", file_num++);
-            vfs_create(path);
-          } else if (strcmp(ctx_menu.items[i].label, "Refresh") == 0) {
-            fm_refresh();
-          } else if (strcmp(ctx_menu.items[i].label, "Open Terminal") == 0) {
-            terminal.visible = 1;
-          } else if (strcmp(ctx_menu.items[i].label, "Change Background") == 0) {
-            wallpaper_next();
-          }
-          return;
-        }
-        item_y += item_h;
-        if (ctx_menu.items[i].separator) item_y += UI_SCALE_VAL(8);
-      }
-    }
-    ctx_menu.visible = 0;
-    return;
-  }
-  
-  /* Right click on desktop - show full context menu like test folder */
-  if (button == 2 && y > MENU_BAR_HEIGHT && y < (int)screen_height - DOCK_HEIGHT) {
-    ctx_menu.visible = 1;
-    ctx_menu.x = x;
-    ctx_menu.y = y;
-    ctx_menu.width = UI_SCALE_VAL(180);
-    ctx_menu.item_count = 0;
-    
-    /* New items */
-    strcpy(ctx_menu.items[ctx_menu.item_count].label, "New Folder");
-    ctx_menu.items[ctx_menu.item_count].enabled = 1;
-    ctx_menu.items[ctx_menu.item_count++].separator = 0;
-    
-    strcpy(ctx_menu.items[ctx_menu.item_count].label, "New Text Document");
-    ctx_menu.items[ctx_menu.item_count].enabled = 1;
-    ctx_menu.items[ctx_menu.item_count++].separator = 1;
-    
-    /* Clipboard */
-    strcpy(ctx_menu.items[ctx_menu.item_count].label, "Paste");
-    ctx_menu.items[ctx_menu.item_count].enabled = 0;
-    ctx_menu.items[ctx_menu.item_count++].separator = 1;
-    
-    /* Sort options */
-    strcpy(ctx_menu.items[ctx_menu.item_count].label, "Sort by Name");
-    ctx_menu.items[ctx_menu.item_count].enabled = 1;
-    ctx_menu.items[ctx_menu.item_count++].separator = 0;
-    
-    strcpy(ctx_menu.items[ctx_menu.item_count].label, "Sort by Type");
-    ctx_menu.items[ctx_menu.item_count].enabled = 1;
-    ctx_menu.items[ctx_menu.item_count++].separator = 1;
-    
-    /* Actions */
-    strcpy(ctx_menu.items[ctx_menu.item_count].label, "Refresh");
-    ctx_menu.items[ctx_menu.item_count].enabled = 1;
-    ctx_menu.items[ctx_menu.item_count++].separator = 0;
-    
-    strcpy(ctx_menu.items[ctx_menu.item_count].label, "Open Terminal");
-    ctx_menu.items[ctx_menu.item_count].enabled = 1;
-    ctx_menu.items[ctx_menu.item_count++].separator = 1;
-    
-    strcpy(ctx_menu.items[ctx_menu.item_count].label, "Change Background");
-    ctx_menu.items[ctx_menu.item_count].enabled = 1;
-    ctx_menu.items[ctx_menu.item_count++].separator = 0;
-    
-    /* Calculate height with separators */
-    ctx_menu.height = UI_SCALE_VAL(8);
-    for (int i = 0; i < ctx_menu.item_count; i++) {
-      ctx_menu.height += UI_SCALE_VAL(24);
-      if (ctx_menu.items[i].separator) ctx_menu.height += UI_SCALE_VAL(8);
-    }
-    
-    /* Keep on screen */
-    if (ctx_menu.x + ctx_menu.width > (int)screen_width)
-      ctx_menu.x = screen_width - ctx_menu.width - UI_SCALE_VAL(4);
-    if (ctx_menu.y + ctx_menu.height > (int)screen_height - DOCK_HEIGHT)
-      ctx_menu.y = screen_height - DOCK_HEIGHT - ctx_menu.height;
-    
-    return;
-  }
-  
-  /* File Manager clicks - buttons and file selection */
-  if (file_manager.visible) {
-    int fx = file_manager.x;
-    int fy = file_manager.y;
-    int fw = file_manager.width;
-    int fh = file_manager.height;
-    
-    /* Check if click is inside file manager window */
-    if (x >= fx && x < fx + fw && y >= fy && y < fy + fh) {
-      bring_window_to_front(WIN_FILE_MANAGER);
-      
-      /* Traffic light buttons (circles at y+16) */
-      int btn_cy = fy + 16;
-      int btn_r = 8;
-      
-      /* Close button (red) at x+16 */
-      int close_cx = fx + 16;
-      if ((x - close_cx) * (x - close_cx) + (y - btn_cy) * (y - btn_cy) <= btn_r * btn_r) {
-        file_manager.visible = 0;
-        return;
-      }
-      
-      /* Minimize button (yellow) at x+36 */
-      int min_cx = fx + 36;
-      if ((x - min_cx) * (x - min_cx) + (y - btn_cy) * (y - btn_cy) <= btn_r * btn_r) {
-        file_manager.visible = 0; /* Hide window */
-        return;
-      }
-      
-      /* Maximize button (green) at x+56 */
-      int max_cx = fx + 56;
-      if ((x - max_cx) * (x - max_cx) + (y - btn_cy) * (y - btn_cy) <= btn_r * btn_r) {
-        /* Toggle maximize */
-        static int fm_maximized = 0;
-        static int fm_saved_x, fm_saved_y, fm_saved_w, fm_saved_h;
-        if (fm_maximized) {
-          file_manager.x = fm_saved_x;
-          file_manager.y = fm_saved_y;
-          file_manager.width = fm_saved_w;
-          file_manager.height = fm_saved_h;
-          fm_maximized = 0;
-        } else {
-          fm_saved_x = file_manager.x;
-          fm_saved_y = file_manager.y;
-          fm_saved_w = file_manager.width;
-          fm_saved_h = file_manager.height;
-          file_manager.x = 0;
-          file_manager.y = MENU_BAR_HEIGHT;
-          file_manager.width = screen_width;
-          file_manager.height = screen_height - MENU_BAR_HEIGHT - DOCK_HEIGHT;
-          fm_maximized = 1;
-        }
-        return;
-      }
-      
-      /* Toolbar buttons - below title bar (y+32) */
-      int toolbar_y = fy + 40;
-      int toolbar_btn_h = 24;
-      
-      /* Back button: x+10, 60 wide */
-      if (x >= fx + 10 && x < fx + 70 && y >= toolbar_y && y < toolbar_y + toolbar_btn_h) {
-        /* Go up one directory */
-        if (strcmp(file_manager.current_path, "/") != 0) {
-          int len = strlen(file_manager.current_path);
-          while (len > 0 && file_manager.current_path[len - 1] != '/') len--;
-          if (len > 1) len--; /* Remove trailing slash unless root */
-          file_manager.current_path[len] = '\0';
-          if (len == 0) {
-            strcpy(file_manager.current_path, "/");
-          }
-          file_manager.selected = -1;
-          fm_refresh();
-        }
-        return;
-      }
-      
-      /* New Folder button: x+80, 90 wide */
-      if (x >= fx + 80 && x < fx + 170 && y >= toolbar_y && y < toolbar_y + toolbar_btn_h) {
-        /* Create new folder */
-        static int folder_num = 1;
-        char path[256];
-        int plen = strlen(file_manager.current_path);
-        if (plen == 1 && file_manager.current_path[0] == '/') {
-          snprintf(path, 256, "/NewFolder%d", folder_num++);
-        } else {
-          snprintf(path, 256, "%s/NewFolder%d", file_manager.current_path, folder_num++);
-        }
-        vfs_mkdir(path);
-        fm_refresh();
-        return;
-      }
-      
-      /* New File button: x+180, 80 wide */
-      if (x >= fx + 180 && x < fx + 260 && y >= toolbar_y && y < toolbar_y + toolbar_btn_h) {
-        /* Create new file */
-        static int file_num = 1;
-        char path[256];
-        int plen = strlen(file_manager.current_path);
-        if (plen == 1 && file_manager.current_path[0] == '/') {
-          snprintf(path, 256, "/NewFile%d.txt", file_num++);
-        } else {
-          snprintf(path, 256, "%s/NewFile%d.txt", file_manager.current_path, file_num++);
-        }
-        vfs_create(path);
-        fm_refresh();
-        return;
-      }
-      
-      /* File list area - grid items (must match draw_file_manager) */
-      int title_h = UI_SCALE_VAL(32);
-      int toolbar_h = UI_SCALE_VAL(40);
-      int loc_h = UI_SCALE_VAL(26);
-      int list_y = fy + title_h + toolbar_h + loc_h;
-      int item_w = UI_SCALE_VAL(90);
-      int item_h = UI_SCALE_VAL(80);
-      int fm_padding = UI_SCALE_VAL(20);
-      int cols = (fw - fm_padding) / item_w;
-      if (cols < 1) cols = 1;
-      if (cols > 6) cols = 6;
-      
-      if (y >= list_y && y < fy + fh) {
-        int rel_x = x - fx - UI_SCALE_VAL(10);
-        int rel_y = y - list_y;
-        if (rel_x >= 0 && rel_x < cols * item_w) {
-          int col = rel_x / item_w;
-          int row = rel_y / item_h;
-          int idx = row * cols + col;
-          
-          if (idx >= 0 && idx < file_manager.entry_count) {
-            file_manager.selected = idx;
-            
-            /* Single click enters directories */
-            if (file_manager.entries[idx].is_dir) {
-              /* Enter directory */
-              int plen = strlen(file_manager.current_path);
-              if (plen == 1 && file_manager.current_path[0] == '/') {
-                char new_path[256];
-                snprintf(new_path, 256, "/%s", file_manager.entries[idx].name);
-                strcpy(file_manager.current_path, new_path);
-              } else {
-                strcat(file_manager.current_path, "/");
-                strcat(file_manager.current_path, file_manager.entries[idx].name);
-              }
-              file_manager.selected = -1;
-              fm_refresh();
-            }
-          }
-        }
-        return;
-      }
-      
-      return; /* Click was elsewhere in window */
-    }
-  }
-  
-  /* Desktop icon clicks */
-  for (int i = 0; i < NUM_DESKTOP_ICONS; i++) {
-    int ix = desktop_icons[i].x * ui_scale;
-    int iy = desktop_icons[i].y * ui_scale;
-    int iw = UI_SCALE_VAL(64);
-    int ih = UI_SCALE_VAL(70);
-    if (x >= ix && x < ix + iw && y >= iy && y < iy + ih) {
-      if (strcmp(desktop_icons[i].name, "Terminal") == 0) {
-        terminal.visible = !terminal.visible;
-      } else if (desktop_icons[i].is_dir) {
-        /* Open folder in file manager */
-        file_manager.visible = 1;
-        bring_window_to_front(WIN_FILE_MANAGER);
-        char path[256];
-        snprintf(path, 256, "/%s", desktop_icons[i].name);
-        strcpy(file_manager.current_path, path);
-        fm_refresh();
-      }
-      return;
-    }
-  }
+
+  apps_click(x, y, button);                 /* windows and widgets own their pixels */
+
 }
 
 /* Window geometry constants (matching reference, unscaled base) */
@@ -3165,6 +4844,30 @@ static void gui_poll_input(void) {
   /* Release dragging on mouse up */
   if (left_release) {
     dragging_window = DRAG_NONE;
+    drag_app = APP_NONE;
+    wg_drag = -1;
+  }
+
+  /* MeepOS windows and widgets drag by their title strip */
+  if (drag_app != APP_NONE && left_held) {
+    meep_app_t *a = &mapp[drag_app];
+    int nx = new_x - drag_dx, ny = new_y - drag_dy;
+    if (ny < MENU_BAR_HEIGHT) ny = MENU_BAR_HEIGHT;
+    if (nx < 0) nx = 0;
+    if (nx > (int)screen_width - 80) nx = screen_width - 80;
+    if (ny > (int)screen_height - 40) ny = screen_height - 40;
+    a->x = nx; a->y = ny;
+    needs_redraw = 1;
+  }
+  if (wg_drag >= 0 && left_held) {
+    meep_wg_t *g = &mwg[wg_drag];
+    int nx = new_x - wg_dx, ny = new_y - wg_dy;
+    if (ny < MENU_BAR_HEIGHT) ny = MENU_BAR_HEIGHT;
+    if (nx < 0) nx = 0;
+    if (nx > (int)screen_width - 60) nx = screen_width - 60;
+    if (ny > (int)screen_height - 40) ny = screen_height - 40;
+    g->x = nx; g->y = ny;
+    needs_redraw = 1;
   }
   
   /* Check if mouse moved */
@@ -3210,7 +4913,9 @@ static void gui_poll_input(void) {
     int num_windows = sizeof(windows) / sizeof(windows[0]);
     
     /* Check windows in z-order (topmost first) */
-    for (int z = NUM_MANAGED_WINDOWS - 1; z >= 0 && !clicked_window; z--) {
+    /* the upstream demo windows are gone: MeepOS apps own their pixels now, so this
+       legacy hit-testing loop is skipped entirely (it used to eat every click) */
+    for (int z = NUM_MANAGED_WINDOWS - 1; z >= 0 && !clicked_window && 0; z--) {
       int win_id = window_z_order[z];
       
       /* Find matching window data */
@@ -3272,7 +4977,7 @@ static void gui_poll_input(void) {
             *windows[w].x = 0;
             *windows[w].y = MENU_BAR_HEIGHT;
             *windows[w].w = screen_width;
-            *windows[w].h = screen_height - MENU_BAR_HEIGHT - DOCK_HEIGHT;
+            *windows[w].h = screen_height - DOCK_HEIGHT - 8;
             maximized[w] = 1;
           }
           clicked_window = 1;
@@ -3381,59 +5086,193 @@ static void gui_poll_input(void) {
     full_redraw = 1;
   }
   
+  if ((prev_buttons & 1) && !(buttons & 1) && press_dock >= 0) {
+    press_dock = -1;                       /* release ends the tile press */
+    full_redraw = 1;
+    needs_redraw = 1;
+  }
+
+  update_hover();
+
   prev_buttons = buttons;
   mouse_buttons = buttons;
 }
 
 /* Draw everything to backbuffer */
-static void gui_draw_all(void) {
-  /* Update context menu hover */
-  if (ctx_menu.visible) {
-    int old_hover = ctx_menu.hover_index;
-    ctx_menu.hover_index = -1;
-    if (mouse_x >= ctx_menu.x && mouse_x < ctx_menu.x + ctx_menu.width) {
-      int item_y = ctx_menu.y + 8;
-      for (int i = 0; i < ctx_menu.item_count; i++) {
-        if (mouse_y >= item_y && mouse_y < item_y + 20) {
-          ctx_menu.hover_index = i;
-          break;
-        }
-        item_y += 24;
-        if (ctx_menu.items[i].separator) item_y += 8;
+/* ===================================================================== */
+/* Supersampled shell                                                    */
+/*                                                                       */
+/* The framebuffer primitives are hard-edged, so the shell is drawn at   */
+/* SX x into an offscreen buffer and box-filtered back down: corners,    */
+/* arcs, hairlines and glyph strokes all land on fractional coverage.    */
+/* The wallpaper is left at 1x - it is already pixel-exact - and the     */
+/* supersampled shell is composited over it.                             */
+/* ===================================================================== */
+
+static int SX = 1;   /* chosen at first use: 3, else 2 */
+
+static uint32_t *ss_buf = 0;
+static int ss_w = 0, ss_h = 0;
+static int cur_box_x = 0, cur_box_y = 0, cur_box_w = 0, cur_box_h = 0;
+
+/* replicate a 1x rect of the wallpaper up into the ss buffer */
+static void ss_fill_region(int x, int y, int w, int h) {
+  if (!ss_buf) return;
+  int W = (int)screen_width, H = (int)screen_height;
+  if (x < 0) { w += x; x = 0; }
+  if (y < 0) { h += y; y = 0; }
+  if (x + w > W) w = W - x;
+  if (y + h > H) h = H - y;
+  if (w <= 0 || h <= 0) return;
+  for (int py = y; py < y + h; py++) {
+    const uint32_t *src = backbuffer + (size_t)py * W;
+    int sy = py * SX;
+    for (int px = x; px < x + w; px++) {
+      uint32_t c = src[px];
+      int sx = px * SX;
+      for (int dy = 0; dy < SX; dy++) {
+        uint32_t *row = ss_buf + (size_t)(sy + dy) * ss_w + sx;
+        for (int dx = 0; dx < SX; dx++) row[dx] = c;
       }
     }
-    if (old_hover != ctx_menu.hover_index) {
-      mark_dirty(ctx_menu.x, ctx_menu.y, ctx_menu.width + 4, ctx_menu.height + 4);
+  }
+}
+
+/* average the ss block back into the 1x backbuffer */
+static void ss_blend_region(int x, int y, int w, int h) {
+  if (!ss_buf) return;
+  int W = (int)screen_width, H = (int)screen_height;
+  if (x < 0) { w += x; x = 0; }
+  if (y < 0) { h += y; y = 0; }
+  if (x + w > W) w = W - x;
+  if (y + h > H) h = H - y;
+  if (w <= 0 || h <= 0) return;
+  const int n = SX * SX;
+  for (int py = y; py < y + h; py++) {
+    uint32_t *dst = backbuffer + (size_t)py * W;
+    int sy = py * SX;
+    for (int px = x; px < x + w; px++) {
+      int sx = px * SX;
+      int r = 0, g = 0, b = 0;
+      for (int dy = 0; dy < SX; dy++) {
+        const uint32_t *row = ss_buf + (size_t)(sy + dy) * ss_w + sx;
+        for (int dx = 0; dx < SX; dx++) {
+          uint32_t c = row[dx];
+          r += (c >> 16) & 0xFF;
+          g += (c >> 8) & 0xFF;
+          b += c & 0xFF;
+        }
+      }
+      dst[px] = MAKE_COLOR(r / n, g / n, b / n);
     }
+  }
+}
+
+static void ss_prepare(void) {
+  if (ss_buf) return;
+  static const int want[3] = {3, 2, 1};
+  for (int k = 0; k < 3; k++) {
+    int s = want[k];
+    if (s < 2) break;
+    int w = (int)screen_width * s, h = (int)screen_height * s;
+    uint32_t *b = (uint32_t *)kmalloc((size_t)w * h * sizeof(uint32_t));
+    if (!b) continue;
+    ss_buf = b; ss_w = w; ss_h = h; SX = s;
+    /* seed with the wallpaper so partial coverage blends into the real
+       background on the very first frame */
+    ss_fill_region(0, 0, (int)screen_width, (int)screen_height);
+    cur_box_w = cur_box_h = 0;
+    return;
+  }
+}
+
+static int cur_pop_x, cur_pop_y, cur_pop_w, cur_pop_h;
+
+static void gui_draw_all(void) {
+  const int rs = ui_scale > 0 ? ui_scale : 1;
+  const int W = (int)screen_width, H = (int)screen_height;
+
+  /* 1. background, at 1x - already matches the browser render pixel for pixel */
+  draw_wallpaper();
+
+  ss_prepare();
+  if (!ss_buf) {                    /* out of memory: fall back to hard edges */
+    draw_taskbar();
+    draw_start_menu();
+    draw_cursor(mouse_x, mouse_y);
+    draw_taskbar_text();
+    return;
   }
 
-  /* Draw everything to backbuffer */
-  draw_wallpaper();
-  draw_desktop_icons();
-  
-  /* Draw windows in z-order (back to front) */
-  for (int z = 0; z < NUM_MANAGED_WINDOWS; z++) {
-    int win_id = window_z_order[z];
-    switch (win_id) {
-      case WIN_FILE_MANAGER: draw_file_manager(); break;
-      case WIN_TERMINAL: draw_terminal(); break;
-      case WIN_CALCULATOR: draw_calculator(); break;
-      case WIN_SNAKE: draw_snake_game(); break;
-      case WIN_NOTEPAD: draw_notepad(); break;
-      case WIN_CLOCK: draw_clock_widget(); break;
-      case WIN_HELP: draw_help_window(); break;
-      case WIN_IMAGE_VIEWER: draw_image_viewer(); break;
-    }
+  /* 2. the rects the shell covers, in 1x coords */
+  int mb_h = 0;                    /* there is no top bar any more */
+  int dx = 0, dy = taskbar_y() - 2 * rs, dw = W, dh = taskbar_h() + 4 * rs;
+  int cw = 16 * rs + 4, chh = 16 * rs + 6;
+  int nx = mouse_x - 2, ny = mouse_y - 2;
+
+  /* the dropdown lives below the bar, so it needs a region of its own */
+  int px = 0, py = 0, pw = 0, ph = 0;
+  if (start_open) {                          /* the start menu needs its own region */
+    sm_rect(&px, &py, &pw, &ph);
+    px -= 4; py -= 4; pw += 8; ph += 8;      /* slack for the radius + shadow */
   }
-  
-  draw_dock();
-  draw_menu_bar();
-  draw_context_menu();
-  draw_cursor(mouse_x, mouse_y);
+
+  /* 3. repaint last frame's shell pixels from the wallpaper (kills the old cursor) */
+  ss_fill_region(0, 0, W, mb_h);
+  ss_fill_region(dx, dy, dw, dh);
+  if (cur_box_w) ss_fill_region(cur_box_x, cur_box_y, cur_box_w, cur_box_h);
+  if (cur_pop_w) ss_fill_region(cur_pop_x, cur_pop_y, cur_pop_w, cur_pop_h);
+
+  /* 4. draw the shell into the supersampled buffer */
+  uint32_t *rb = backbuffer;
+  uint32_t rw = screen_width, rh = screen_height;
+  backbuffer = ss_buf;
+  screen_width = rw * SX;
+  screen_height = rh * SX;
+  ui_scale = rs * SX;
+  int mb_saved = menu_bar_height;          /* menu_bar_height is cached at 1x */
+  menu_bar_height = 0;
+
+  draw_start_menu();                       /* under the bar, above the windows */
+  draw_taskbar();
+  draw_cursor(mouse_x * SX, mouse_y * SX);
+
+  backbuffer = rb;
+  screen_width = rw;
+  screen_height = rh;
+  ui_scale = rs;
+  menu_bar_height = mb_saved;
+
+  /* 5. box-filter back down over the wallpaper */
+  ss_blend_region(0, 0, W, mb_h);
+  ss_blend_region(dx, dy, dw, dh);
+  ss_blend_region(nx, ny, cw, chh);
+  if (pw) ss_blend_region(px, py, pw, ph);
+
+  cur_box_x = nx; cur_box_y = ny; cur_box_w = cw; cur_box_h = chh;
+  cur_pop_x = px; cur_pop_y = py; cur_pop_w = pw; cur_pop_h = ph;
+
+  /* 6. apps and widgets sit on the wallpaper, under the shell's own chrome */
+  apps_draw();
+
+  /* 6b. the taskbar and an open start menu are chrome: never behind a window */
+  ss_blend_region(dx, dy, dw, dh);
+  if (pw) ss_blend_region(px, py, pw, ph);
+
+  /* 7. type on top, at 1x, with the atlas' own anti-aliasing */
+  draw_taskbar_text();
+  draw_cursor(mouse_x, mouse_y);        /* keep the pointer above the windows */
+
+  full_redraw = 1;                  /* dirty rects are in ss coords; blit whole frames */
 }
 
 void gui_compose(void) {
   gui_poll_input();
+
+  if (appearance_wall_dirty) {      /* the toggle repaints the desktop too */
+    appearance_wall_dirty = 0;
+    wallpaper_cache_dirty = 1;
+  }
 
   if (wallpaper_cache_dirty) {
     full_redraw = 1;
@@ -3449,11 +5288,21 @@ void gui_compose(void) {
 }
 
 void gui_main_loop(void) {
+  meep_apply_appearance(appearance_dark);   /* midnight is the boot look */
   /* Initial full redraw */
   full_redraw = 1;
   needs_redraw = 1;
+
   
+  unsigned idle = 0;
   while (1) {
+    mp_pump();                       /* paces playback at real time */
+    /* a focused Omi Net window needs a caret tick even when nothing happens */
+    if (++idle > 3000000u) {
+      idle = 0;
+      on_caret++;
+      if (mapp_focus == APP_BROWSER && mapp[APP_BROWSER].open) needs_redraw = 1;
+    }
     /* Poll input aggressively - USB legacy emulation requires frequent polling */
     for (int poll = 0; poll < 20; poll++) {
       ps2_poll();
@@ -3462,7 +5311,8 @@ void gui_main_loop(void) {
     }
     
     gui_compose();
-    
+
+
     /* Minimal yield - just a few pause instructions */
     for (volatile int i = 0; i < 50; i++) {
       __asm__ volatile("pause");
