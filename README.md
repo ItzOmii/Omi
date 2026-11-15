@@ -8,7 +8,7 @@ from-scratch userspace — with the network, the sound, the browser and the shel
 
 ![Omi Net fetching a page](docs/assets/omi-net-window.png)
 
-**Landing page:** https://itzomii.github.io/Omi/ · **Bootable ISO:** [v0.1.0 release](https://github.com/ItzOmii/Omi/releases/tag/v0.1.0) (7.4 MB)
+**Landing page:** https://itzomii.github.io/Omi/ · **Bootable ISO:** [v0.2.0 release](https://github.com/ItzOmii/Omi/releases/tag/v0.2.0) (9.5 MB)
 
 ## What Omi adds
 
