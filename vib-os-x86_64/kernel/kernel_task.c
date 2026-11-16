@@ -19,6 +19,7 @@
 #include "include/idt.h"
 #include "include/gdt.h"
 #include "include/ring3.h"
+#include "include/socket.h"
 
 extern void serial_puts(const char *s);
 
@@ -134,6 +135,9 @@ extern void sched_yield_entry(void);
 extern void sched_irq0_entry(void);
 
 static task_t tasks[TASK_MAX];
+/* Monotonic, so a tgen is never equal to one handed out before. Only matters if
+ * task slots ever get reused; today task_alloc appends and never frees. */
+static uint32_t task_gen_counter;
 static int ntasks;
 static int cur = -1;
 static volatile uint64_t total_ticks;
@@ -284,6 +288,10 @@ void task_sleep_ticks(uint64_t ticks) {
  * saves belongs to a task that the scheduler will not pick again. */
 void task_kill_current(uint64_t code) {
   if (cur > 0 && cur < ntasks) {
+    /* A dying task must not leave a registration behind in a socket's waiter
+     * table: the slot would name a task that can never be woken. */
+    tasks[cur].wait_obj = 0;
+    sock_drop_waiters(cur);
     mm_on_exit(&tasks[cur]);       /* last thread out frees the address space */
     tasks[cur].state = TASK_DEAD;
     tasks[cur].work = code;
@@ -351,6 +359,8 @@ static task_t *task_alloc(const char *name) {
   t->wait_mm = 0;
   t->wake_at = 0;
   t->timed_out = 0;
+  t->wait_obj = 0;
+  t->tgen = ++task_gen_counter;   /* a fresh slot is a new identity */
   int i = 0;
   while (name[i] && i < 23) { t->name[i] = name[i]; i++; }
   t->name[i] = 0;

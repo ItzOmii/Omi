@@ -97,13 +97,49 @@ static ofile_t *ofile_get(void) {
   return 0;
 }
 
+/* Destruction is the only path that tears down a transport, and it runs only
+ * when nothing can reach the description any more: no descriptor, and no task
+ * inside a backend call. */
+static void ofile_destroy(ofile_t *o) {
+  if (o->kind == FK_SOCKET && o->sock) sock_close(o->sock);
+  zero(o, sizeof *o);
+}
+
+static void ofile_maybe_destroy(ofile_t *o) {
+  if (!o || o->kind == FK_CONSOLE) return;    /* static, never freed */
+  if (o->refs > 0 || o->pins > 0) return;
+  ofile_destroy(o);
+}
+
+/* The last descriptor is gone. Stop new work and release anyone parked - but
+ * leave the object (and its transport) alive while tasks are still inside it. */
+static void ofile_shutdown(ofile_t *o) {
+  if (!o || o->kind == FK_CONSOLE || o->closing) return;   /* idempotent */
+  o->closing = 1;
+  if (o->kind == FK_SOCKET && o->sock) sock_shutdown(o->sock);
+}
+
 static void ofile_put(ofile_t *o) {
   /* The connection belongs to the description: closing one of two dup'd
    * descriptors must not tear down the socket the other is still using. */
   if (!o || o->kind == FK_CONSOLE) return;    /* static, never freed */
-  if (--o->refs > 0) return;
-  if (o->kind == FK_SOCKET && o->sock) sock_close(o->sock);
-  zero(o, sizeof *o);
+  if (o->refs > 0) o->refs--;
+  if (o->refs > 0) return;
+  ofile_shutdown(o);
+  ofile_maybe_destroy(o);
+}
+
+/* A pin is not a descriptor: it keeps the object alive without granting new
+ * operations. Taken before the first backend access, released after the last. */
+void ofile_pin(ofile_t *o) {
+  if (!o || o->kind == FK_CONSOLE) return;
+  o->pins++;
+}
+
+void ofile_unpin(ofile_t *o) {
+  if (!o || o->kind == FK_CONSOLE) return;
+  if (o->pins > 0) o->pins--;
+  ofile_maybe_destroy(o);
 }
 
 /* ------------------------------------------------------------ descriptor tables */

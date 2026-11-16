@@ -66,6 +66,14 @@ typedef struct {
   mm_t    *wait_mm;
   uint64_t wake_at;     /* tick at which a timed sleep gives up, 0 = never */
   int      timed_out;
+  /* Object this task is parked on (a socket today), 0 = not waiting. Paired with
+   * the waiter slot inside that object so a wake must match on both sides: the
+   * object alone does not prove the task is still the one that registered. */
+  void    *wait_obj;
+  /* Bumped when a task slot is reused. Slots are never reused today (task_alloc
+   * only appends), so this guards a future change rather than a live bug - see
+   * docs/readiness-design.md. */
+  uint32_t tgen;
 } task_t;
 
 void task_init(void);

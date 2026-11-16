@@ -63,7 +63,9 @@ typedef struct {
   int      kind;
   int      flags;
   uint64_t off;
-  int      refs;
+  int      refs;           /* descriptor references: dup() adds one, close drops one */
+  int      pins;           /* tasks inside a backend call or parked on readiness */
+  int      closing;        /* the last descriptor went: no new operations */
   rfile_t *file;
   struct socket *sock;     /* FK_SOCKET: the endpoint, shared by every dup */
   int      used;
@@ -87,6 +89,12 @@ int  fd_dup(fdtable_t *t, int fd);
 int  fd_socket(fdtable_t *t);
 unsigned fd_poll(fdtable_t *t, int fd);   /* OMI_POLL* bits, never blocks */
 int  fd_count_kind(fdtable_t *t, int kind);
+
+/* Pin a description while a task is inside it. The last descriptor ref triggers
+ * shutdown; destruction waits for the last pin, so a backend call cannot run
+ * against a freed transport. */
+void ofile_pin(ofile_t *o);
+void ofile_unpin(ofile_t *o);
 int  fd_connect(fdtable_t *t, int fd, uint32_t ip, uint16_t port);
 
 #endif

@@ -1191,4 +1191,8 @@ void ring3_init(void) {
   iso_selftest();
   pt_selftest();
   sock_selftest();
+  /* Readiness runs here, on the fake backend, before any client exists: the
+   * scheduler is up (task_demo_start ran first) but no real traffic is in
+   * flight, so a temporary backend swap cannot disturb anything. */
+  sock_readiness_selftest();
 }

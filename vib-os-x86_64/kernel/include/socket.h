@@ -34,6 +34,42 @@ long sock_recv(struct socket *s, void *buf, uint64_t n, int timeout_ms);
 /* Readiness of this endpoint, in OMI_POLL* bits. Never blocks. */
 unsigned sock_poll(struct socket *s);
 
+/* ---- readiness and waiters ---------------------------------------------
+ * Level-triggered: a waiter re-checks readiness after every wake, so waking all
+ * waiters of one transition is correct - one takes the data, the rest re-block.
+ * Waiter slots live in this object because a node on a blocked task's stack
+ * would dangle if that task's address space were freed underneath it.
+ */
+#define SOCK_WAITERS 4
+
+/* Announce that readiness changed: bump the sequence, then wake waiters. Every
+ * transition must call this before the state it reports is observable, so a
+ * waiter that snapshotted the sequence can detect a change that landed between
+ * its check and its block. */
+void sock_notify(struct socket *s, unsigned mask);
+
+/* The last descriptor is gone: no new operations, waiters leave with POLLERR,
+ * and the transport stays alive until the last pin is released. Idempotent. */
+void sock_shutdown(struct socket *s);
+
+/* Block until `want` bits are ready or something terminal happens. Returns the
+ * readiness bits, -EAGAIN if `deadline_ticks` elapsed with nothing ready, or
+ * -ENOBUFS when the waiter table is full - never a silent block. */
+int sock_wait(struct socket *s, unsigned want, uint64_t deadline_ticks);
+
+int      sock_waiters_live(struct socket *s);
+void     sock_drop_waiters(int task_id);   /* task exit: drop its registrations */
+uint32_t sock_gen(struct socket *s);
+
+/* Internals the readiness self-test drives directly; not part of the VFS. */
+struct sock_stats { uint64_t blocks, wakes, drops, registered, spurious, overflows; };
+struct sock_stats sock_stats_get(void);
+void     sock_test_skip_recheck(int on);
+void     sock_test_inject_after_register(struct socket *s, unsigned mask, int times);
+int      sock_waiter_add(struct socket *s);
+void     sock_test_plant(struct socket *s, uint32_t gen, int task, uint32_t tgen);
+void     sock_waiter_clear(struct socket *s, int slot);
+
 /* Called exactly once, by the open-file layer, when the last descriptor goes. */
 void sock_close(struct socket *s);
 
@@ -47,5 +83,8 @@ void sock_report_after_space(int had);
 /* Backend substitution test: runs the descriptor sequence against a
  * deterministic backend, then restores the kernel's own. */
 void sock_selftest(void);
+
+/* Milestone 1: the wait protocol and lifetime rules, on a fake backend. */
+void sock_readiness_selftest(void);
 
 #endif /* OMI_SOCKET_H */
