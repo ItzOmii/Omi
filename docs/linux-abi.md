@@ -52,7 +52,7 @@ swap to. Adding it belongs with SMP, not before.
 |---|---|---|
 | 0,1 | read, write | the existing handlers |
 | 2,3,8 | open, close, lseek | `open`'s mode argument ignored |
-| 9,11 | mmap, munmap | anonymous, or file-backed `MAP_PRIVATE`; `MAP_FIXED` replaces exactly the range it names, splitting what it lands inside; `MAP_SHARED` over a file is `-ENOSYS` |
+| 9,11 | mmap, munmap | anonymous, file-backed `MAP_PRIVATE`, or `MAP_SHARED` over a shared file or of anonymous memory; `MAP_FIXED` replaces exactly the range it names, splitting what it lands inside; `MAP_SHARED` over a read-only boot module is `-ENOSYS`; `MAP_SHARED` together with `MAP_PRIVATE` is `-EINVAL` |
 | 10 | mprotect | per-area `PROT_*` bits plus live PTEs; `PROT_NONE` releases the pages, and a range spanning several areas takes each area's intersection |
 | 12 | brk | one lazily-populated 16 MB area, pointer moved inside it |
 | 16 | ioctl | `TCGETS`/`TIOCGWINSZ` only |
@@ -68,6 +68,8 @@ swap to. Adding it belongs with SMP, not before.
 | 102..110 | getuid/getgid/euid/egid/getppid | zero |
 | 158 | arch_prctl | `ARCH_SET_FS` / `ARCH_GET_FS` |
 | 202 | futex | Linux op numbers, timespec converted to ticks |
+| 77 | ftruncate | the length of a shared file; a read-only boot module answers `-EROFS` |
+| 319 | memfd_create | an anonymous file whose purpose is to be mapped; the name is validated and dropped; `MFD_HUGETLB` is `-EINVAL` |
 | 232,233,291 | epoll_wait, epoll_ctl, epoll_create1 | a kept set of descriptors, reported level-triggered; `EPOLLONESHOT` removes the entry after it is reported; `EPOLLET` is `-EINVAL`; `EPOLL_CLOEXEC` accepted and ignored |
 
 Everything else returns `-ENOSYS` and is logged once per number. Logging once
@@ -178,6 +180,9 @@ of the program runs - which is exactly what the first `PT_INTERP` boot did.
 A libc's second thread is where a single-threaded kernel starts lying, and three
 lies had to go:
 
+- **Shared files are one object, not a page cache.** A memfd's frames belong to the object, and a
+  reference is dropped where the mapping and the descriptor end, so a program that maps and unmaps in
+  a loop cannot leak pages; the `[shf]` audit in the boot log is there to say so out loud.
 - **`clone(56)`.** Only the thread half: `CLONE_VM` or `-ENOSYS`, because a
   `fork()` answered with a shared address space would corrupt two processes at
   once, and copying a space is a separate job. The kernel is not given the
@@ -381,7 +386,20 @@ span; `mmap`/`munmap` writable end to end; `arch_prctl(SET_FS)` verified by
 reading `%fs:0`; unknown number `-ENOSYS`.
 
 Boot: `[linux3] 27/27 ok`, `[musl] OK`, `[threads] ... OK`, `[stat] OK` and `[fork] OK`, alongside `[pipe] 37/37`,
-`[pipe3] 30/30`, `[rdy] 56/56`, `vfs 16/16`, `futex 3/3`, `[rfs] module files exposed=24 skipped=0`
+`[pipe3] 30/30`, `[rdy] 56/56`, `vfs 16/16`, `futex 3/3`,
+`[memfdtest] 23/23` (a write through one mapping read back through another, through the
+descriptor, and in a forked child; a private mapping that starts as a copy and stays one; a shared
+mapping that outlives its descriptor; refusals for huge pages, for both `PRIVATE` and `SHARED` at
+once, for a mapping longer than its file, and for a boot module), `[rfs] module files exposed=25
+skipped=0`
+
+`MAP_SHARED` is real sharing rather than a claim: a shared file's frames *are* the file, so a
+mapping is a window onto them and `read(2)` returns what the mapping wrote with no copy in between.
+The mapping's pages are marked `PTE_SHARED`, which is what keeps an unmap from freeing a file's
+frame and carries the same frame into a forked child. The boot log's `[shf] live=0 pages=0` after
+each space is freed is the audit for it: a shared file that outlived every program would show up
+here as a nonzero count, and the reference the mapping holds is dropped where the address space
+goes, not where the descriptor does.
 with `[modtest] OK 15/15`, `[maptest] OK 24/24` (file-backed `mmap`, `MAP_FIXED` over a
 reservation, a `PROT_NONE` page that kills the child that reads it, a store into a read-only page
 that kills the child that writes it, and the three refusals), `[dyntest] OK 14/14` **twice** (a PIE run

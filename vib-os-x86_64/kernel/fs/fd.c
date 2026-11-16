@@ -5,6 +5,7 @@
 
 #include "../include/fd.h"
 #include "../include/epoll.h"
+#include "../include/shfile.h"
 #include "../include/errno.h"
 #include "../include/kmalloc.h"
 #include "../include/omi_net.h"
@@ -148,6 +149,7 @@ static void ofile_destroy(ofile_t *o) {
    * ofile, so the pipe's counts already say the right thing. */
   if (o->kind == FK_PIPE && o->pipe) pipe_unref(o->pipe, (o->flags & 3) == O_WRONLY);
   if (o->kind == FK_EPOLL && o->ep) epoll_free(o->ep);
+  if (o->kind == FK_SHFILE && o->shf) shfile_unref(o->shf);
   zero(o, sizeof *o);
 }
 
@@ -293,6 +295,25 @@ int fd_socket(fdtable_t *t) {
   return fd;
 }
 
+int fd_shfile(fdtable_t *t) {
+  if (!t) return -EMFILE;
+  ofile_t *o = ofile_get();
+  if (!o) return -EMFILE;
+  o->kind = FK_SHFILE;
+  o->flags = O_RDWR;
+  o->shf = shfile_new();
+  if (!o->shf) { ofile_put(o); return -EMFILE; }
+  int fd = fd_alloc(t, o);
+  if (fd < 0) { ofile_put(o); return fd; }
+  return fd;
+}
+
+struct shfile *fd_shfile_of(fdtable_t *t, int fd) {
+  if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return 0;
+  ofile_t *o = t->fd[fd];
+  return o->kind == FK_SHFILE ? o->shf : 0;
+}
+
 int fd_epoll(fdtable_t *t) {
   if (!t) return -EMFILE;
   ofile_t *o = ofile_get();
@@ -352,6 +373,7 @@ unsigned fd_poll(fdtable_t *t, int fd) {
   if (o->kind == FK_PIPE)    return pipe_poll(o->pipe, (o->flags & 3) == O_WRONLY);
   if (o->kind == FK_FILE)    return OMI_POLLIN | OMI_POLLOUT;
   if (o->kind == FK_EPOLL)   return epoll_any_ready(o->ep, t) ? OMI_POLLIN : 0;
+  if (o->kind == FK_SHFILE)  return OMI_POLLIN | OMI_POLLOUT;   /* memory: always ready */
   if (o->kind == FK_CONSOLE) return 0;      /* no keyboard path yet */
   return OMI_POLLERR;
 }
@@ -458,6 +480,13 @@ long fd_read_ticks(fdtable_t *t, int fd, void *kbuf, uint64_t n, uint64_t ticks)
   if (o->kind == FK_SOCKET) return sock_read_wait(o, kbuf, n, ticks);
   if (o->kind == FK_PIPE)   return pipe_read(o->pipe, kbuf, n, ticks);
   if (o->kind == FK_CONSOLE) return 0;        /* no keyboard path yet: EOF */
+  if (o->kind == FK_SHFILE) {
+    /* Read from the same pages a mapping sees, at the descriptor's offset: the
+     * point of a shared file is that there is one copy of the bytes. */
+    long r = (long)shfile_read(o->shf, o->off, kbuf, n);
+    if (r > 0) o->off += (uint64_t)r;
+    return r;
+  }
   rfile_t *f = o->file;
   if (!f || !f->used) return -EBADF;
   if (o->off >= f->size) return 0;
@@ -502,6 +531,12 @@ long fd_write_ticks(fdtable_t *t, int fd, const void *kbuf, uint64_t n, uint64_t
     return (long)n;
   }
 
+  if (o->kind == FK_SHFILE) {
+    long r = (long)shfile_write(o->shf, o->off, kbuf, n);
+    if (r > 0) o->off += (uint64_t)r;
+    return r;
+  }
+
   rfile_t *f = o->file;
   if (!f || !f->used) return -EBADF;
   if (f->ro) return -EROFS;
@@ -526,7 +561,12 @@ long fd_seek(fdtable_t *t, int fd, int64_t off, int whence) {
   if (o->kind == FK_CONSOLE) return -ESPIPE;   /* a terminal has no offset */
 
   int64_t base;
-  uint32_t size = o->file ? o->file->size : 0;
+  /* A shared file's length is the file's own, not the boot module's: a program
+   * that ftruncates a memfd and seeks to its end is asking about the object it
+   * made, and answering from the wrong one would report a size no read agrees
+   * with. */
+  uint64_t size = o->kind == FK_SHFILE ? shfile_size(o->shf)
+                : (o->file ? o->file->size : 0);
   if (whence == SEEK_SET)      base = 0;
   else if (whence == SEEK_CUR) base = (int64_t)o->off;
   else if (whence == SEEK_END) base = (int64_t)size;
@@ -534,7 +574,9 @@ long fd_seek(fdtable_t *t, int fd, int64_t off, int whence) {
 
   int64_t target = base + off;
   if (target < 0) return -EINVAL;
-  if (target > (int64_t)(o->file ? o->file->cap : 0)) return -EINVAL;
+  int64_t limit = o->kind == FK_SHFILE ? (int64_t)shfile_size(o->shf)
+                : (int64_t)(o->file ? o->file->cap : 0);
+  if (target > limit) return -EINVAL;
   o->off = (uint64_t)target;
   return (long)target;
 }

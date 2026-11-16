@@ -23,6 +23,7 @@
 #include "include/errno.h"
 #include "include/elf.h"   /* elf_prepare_image: the load half of execve */
 #include "include/epoll.h"  /* registration sets: the ABI epoll_ctl and friends speak */
+#include "include/shfile.h"  /* the pages a MAP_SHARED mapping windows onto */
 #include "include/kmalloc.h"
 #include "include/net.h"
 #include "include/omi_net.h"
@@ -164,6 +165,13 @@ mm_t *ring3_new_mm(void) {
 /* An address space cannot be freed while its CR3 is the one the CPU and the
  * kernel are still standing on. So the scheduler reaps: it has just loaded the
  * incoming task's CR3, which is exactly the moment the old space is dead. */
+/* Every place an area stops existing goes through here. A shared area holds a
+ * reference on its file, and a reference that is dropped in three places out of
+ * four is a file that never frees its pages - a leak that looks like nothing
+ * until a program maps and unmaps in a loop. */
+static void  area_release(vm_area_t *a);
+/* Reads a NUL-terminated string out of the caller's space, or says why not. */
+static int   user_str(char *dst, uint64_t max, uint64_t uptr);
 static mm_t *zombie[8];
 static int   nzombies;
 
@@ -178,6 +186,16 @@ void mm_on_exit(task_t *t) {
     serial_puthex((uint64_t)mm->refcount);
     serial_puts(mm->cow_participant ? " participant\n" : "\n");
     return;
+  }
+  /* Reached only when the space is really going away - a thread exiting leaves
+   * the space to its siblings, and their mappings still need these files. A
+   * mapping's claim ends with the mapping, and nothing will walk these areas
+   * again after the space is on the zombie list. */
+  for (int i = 0; i < TASK_AREAS; i++) {
+    if (mm->areas[i].used && mm->areas[i].shf) {
+      shfile_unref((shfile_t *)mm->areas[i].shf);
+      mm->areas[i].shf = 0;
+    }
   }
   if (nzombies < (int)(sizeof zombie / sizeof zombie[0])) {
     zombie[nzombies++] = mm;
@@ -333,6 +351,15 @@ void mm_reap(void) {
       serial_puts("[mm] cow participant's space freed\n");
       cow_audit();                     /* the space is gone: the bank must agree */
     }
+    /* Shared files outlive the descriptors that made them, by design: a mapping
+     * keeps the pages. So the number that matters is not "did this program free
+     * it" but "is anything left once every program has exited", and the last line
+     * before the boot audit is that answer. */
+    serial_puts("[shf] live=");
+    serial_puthex((uint64_t)shfile_live_objects());
+    serial_puts(" pages=");
+    serial_puthex((uint64_t)shfile_live_pages());
+    serial_puts("\n");
     zombie[i] = zombie[--nzombies];
     i--;
   }
@@ -599,6 +626,34 @@ static int vm_fault_in(uint64_t addr, int err) {
      * of a mapping may start before EOF and end after it - that is how ld.so
      * maps a segment whose size is not a page multiple, and the tail is meant to
      * be zeros, which a fresh frame already is. */
+    /* A shared region maps the file's frames themselves, marked so that nothing
+     * frees them with the space: they belong to the file, they survive the
+     * descriptor, and a fork carries the same frames into the child instead of
+     * copying them. This is the only place a mapping and a descriptor end up
+     * looking at one page of memory, so it is the only place that has to be
+     * right. */
+    if (a->shf) {
+      int idx = (int)((page - a->base) >> 12);
+      void *fr = shfile_page((shfile_t *)a->shf, idx, 1);
+      if (!fr) return 0;                 /* past the file's end: a real fault */
+      if (a->flags & PTE_SHARED) {
+        /* Shared: the page the program touches is the page the file owns, so a
+         * write through this mapping is a write to the file, visible to every
+         * other mapping of it and to read(2). */
+        if (ring3_map_existing(t->cr3, page, to_phys(fr), a->flags) != 0) return 0;
+        return 1;
+      }
+      /* Private: the bytes come from the file, the frame does not. alloc_frame
+       * hands back a zeroed page, so a page the file has never written needs no
+       * copy - the zeroes are already right. */
+      void *copy = alloc_frame();
+      if (!copy) return 0;
+      const uint8_t *s = fr;
+      uint8_t *d = copy;
+      for (int i = 0; i < 4096; i++) d[i] = s[i];
+      if (ring3_map_existing(t->cr3, page, to_phys(copy), a->flags) != 0) return 0;
+      return 1;
+    }
     if (a->src) {
       uint64_t off = page - a->base;
       if (off < a->src_len) {
@@ -710,7 +765,7 @@ static long sys_vm_free(uint64_t addr, uint64_t len) {
     serial_puts(" free of ");
     serial_puthex(pmm_total_pages());
     serial_puts("\n");
-    if (base == a->base && len >= a->len) a->used = 0;
+    if (base == a->base && len >= a->len) area_release(a);
     return 0;
   }
   return -EINVAL;                          /* no region covers that range */
@@ -980,7 +1035,14 @@ static mm_t *mm_clone(mm_t *src) {
   /* The lazy regions travel with the pages: a child that faults where its parent
    * had already allocated must land on the same area, or it will grow into
    * addresses the parent owns. */
-  for (int i = 0; i < TASK_AREAS; i++) dst->areas[i] = src->areas[i];
+  for (int i = 0; i < TASK_AREAS; i++) {
+    dst->areas[i] = src->areas[i];
+    /* The child's areas are new claims on the same files, and the frames travel
+     * as PTE_SHARED rather than being copied: a child that writes into a shared
+     * region is writing into its parent's memory, which is what MAP_SHARED is
+     * for and what a forked worker expects. */
+    if (dst->areas[i].shf) shfile_ref((shfile_t *)dst->areas[i].shf);
+  }
   for (int i = 0; i < 32; i++) dst->sig_act[i] = src->sig_act[i];
   dst->mmap_hint = src->mmap_hint;
   dst->stack_hint = src->stack_hint;
@@ -1453,6 +1515,48 @@ static long linux_clock_nanosleep(uint64_t clk, uint64_t flags, uint64_t req_u, 
   return sleep_ticks_for((uint64_t)(want - have));
 }
 
+/* ==================================================== memfd (roadmap 9)
+ *
+ * An anonymous file whose only purpose is to be mapped. Chrome asks for one per
+ * shared region, hands the descriptor to the other end of a pipe and maps it, so
+ * the thing that matters is not the file at all: it is that two processes can
+ * look at the same bytes without a copy in between.
+ *
+ * The name is accepted and dropped. There is no /proc to carry it and no
+ * directory entry to invent, and a name that goes nowhere is still better than
+ * refusing a call whose whole payload is the descriptor.
+ *
+ * MFD_CLOEXEC (1) and MFD_ALLOW_SEALING (2) are accepted and ignored, and the
+ * header says so: nothing in this system is marked close-on-exec, so honouring
+ * the bit would describe an inheritance rule that does not exist. MFD_HUGETLB (4)
+ * is -EINVAL - a program that asked for huge pages and got ordinary ones has been
+ * lied to about the one thing it asked for.
+ */
+static long linux_memfd_create(uint64_t name_u, uint64_t flags) {
+  task_t *t = task_at(task_current());
+  if (!t || !t->mm) return -EINVAL;
+  if (flags & ~3ull) return -EINVAL;
+  if (name_u) {
+    char name[32];
+    /* Validated, then dropped: a program that passes a bad pointer gets -EFAULT
+     * for it rather than a descriptor for a file it never named. */
+    if (user_str(name, sizeof name, name_u) != 0) return -EFAULT;
+  }
+  return fd_shfile(t->mm->fds);
+}
+
+/* ftruncate(77), for the one kind of file whose length is a program's to set.
+ * A boot module is read-only and says so with -EROFS rather than -EINVAL: those
+ * mean different things to a caller, and only one of them is true here. */
+static long linux_ftruncate(uint64_t fd, uint64_t len) {
+  task_t *t = task_at(task_current());
+  if (!t || !t->mm) return -EINVAL;
+  shfile_t *f = fd_shfile_of(t->mm->fds, (int)fd);
+  if (f) return shfile_truncate(f, len);
+  if (fd_file(t->mm->fds, (int)fd)) return -EROFS;
+  return -EBADF;
+}
+
 /* ============================================================ epoll (roadmap 8)
  *
  * epoll is poll with the set kept. The wait below is the same readiness loop
@@ -1790,6 +1894,15 @@ static void area_drop_front(vm_area_t *a, uint64_t d) {
   a->len  -= d;
 }
 
+static void area_release(vm_area_t *a) {
+  if (!a || !a->used) return;
+  if (a->shf) {
+    shfile_unref((shfile_t *)a->shf);
+    a->shf = 0;
+  }
+  a->used = 0;
+}
+
 static void area_drop_tail(vm_area_t *a, uint64_t keep) {
   a->len = keep;
   if (a->src && a->src_len > keep) a->src_len = (uint32_t)keep;
@@ -1807,7 +1920,7 @@ static int vm_unmap_range(task_t *t, mm_t *mm, uint64_t base, uint64_t len) {
     if (ae <= base || ab >= end) continue;              /* no overlap */
 
     if (ab >= base && ae <= end) {                       /* swallowed whole */
-      a->used = 0;
+      area_release(a);
       continue;
     }
 
@@ -1817,6 +1930,9 @@ static int vm_unmap_range(task_t *t, mm_t *mm, uint64_t base, uint64_t len) {
       if (slot < 0) return -ENOMEM;                      /* caller keeps what it had */
       vm_area_t *high = &mm->areas[slot];
       *high = *a;
+      /* A split leaves two areas where there was one, so the file is now claimed
+       * twice and the count has to say so. */
+      if (high->shf) shfile_ref((shfile_t *)high->shf);
       area_drop_front(high, end - ab);
       area_drop_tail(a, base - ab);
       continue;
@@ -1834,9 +1950,17 @@ static int vm_unmap_range(task_t *t, mm_t *mm, uint64_t base, uint64_t len) {
  *   file-backed - pages appear filled from a boot module's bytes, and the frame
  *                 is private to this space, which is what MAP_PRIVATE means.
  *
- * MAP_SHARED over a file is -ENOSYS: nothing here can write a frame back into a
- * boot module, and a "shared" mapping that silently is not shared is worse than
- * a refusal.
+ *   shared      - pages are the file's own, in a memfd, and everybody who maps
+ *                 the same file sees the same bytes (MAP_SHARED).
+ *
+ * MAP_SHARED over a boot module is -ENOSYS, and stays that way: the module is
+ * read-only kernel memory with no write-back path, and a "shared" mapping that
+ * silently is not shared is worse than a refusal. MAP_SHARED over a memfd is
+ * real sharing, because there is nothing to write back - the pages *are* the
+ * file. MAP_SHARED|MAP_ANONYMOUS used to fall through to the anonymous path and
+ * be silently private; it now gets a file of its own, so a forked child shares
+ * those pages the way every program that assumes a forked buffer is shared
+ * expects.
  *
  * A mapping is refused (-EINVAL) when its offset is not page-aligned or when the
  * offset starts at or past EOF: an area with no file behind it is a bug in the
@@ -1858,7 +1982,35 @@ static long linux_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t lfla
   if (!t || !t->mm || !len) return -EINVAL;
   mm_t *mm = t->mm;
   int anon = (lflags & LINUX_MAP_ANONYMOUS) != 0;
-  if (!anon && (lflags & LINUX_MAP_SHARED)) return -ENOSYS;
+  int shared = (lflags & LINUX_MAP_SHARED) != 0;
+  /* Exactly one of the two, as Linux insists: a request that says both has not
+   * decided, and guessing which half to honour hides the bug in the caller. */
+  if (shared && (lflags & LINUX_MAP_PRIVATE)) return -EINVAL;
+  shfile_t *backing = 0;
+  int backing_shared = 1;
+  /* The anonymous case builds the file, so this function owns the reference that
+   * shfile_new handed back; the descriptor case borrows the file table's, which
+   * is not ours to drop. Every early return below has to know which it is - an
+   * extra unref here is a file freed while its descriptor still points at it, and
+   * the frames come back one short. */
+  int backing_owns_ref = 0;
+  if (!anon) {
+    shfile_t *shf = fd_shfile_of(mm->fds, fd);
+    if (shf) {
+      /* Both modes start from the same bytes - the difference is whether the
+       * mapping sees the file's pages or its own copy of them. */
+      backing = shf;
+      backing_shared = shared;
+    } else if (shared) {
+      return -ENOSYS;                  /* a boot module: read-only, no write-back */
+    }
+    /* otherwise a boot module, mapped privately below out of the blob */
+  } else if (shared) {
+    backing = shfile_new();            /* a file for nobody but this mapping */
+    if (!backing) return -ENOMEM;
+    backing_owns_ref = 1;
+    if (shfile_truncate(backing, len) != 0) { shfile_unref(backing); return -ENOMEM; }
+  }
 
   len = (len + 0xFFF) & ~0xFFFULL;
   if (len > (RING3_MMAP_TOP - RING3_MMAP_BASE)) return -ENOMEM;
@@ -1868,7 +2020,16 @@ static long linux_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t lfla
 
   const uint8_t *src = 0;
   uint32_t src_len = 0;
-  if (!anon) {
+  if (backing) {
+    /* Neither mode may name a page the file does not have: the fault would have
+     * nothing to hand out, and a mapping longer than its file is a program bug
+     * that Linux reports rather than satisfies. The blob path cannot describe a
+     * memfd at all - its bytes are pages, not a contiguous image - so a private
+     * mapping of one is filled page by page from those same frames under a plain
+     * PTE, which makes the copy real and keeps later writes local. */
+    if (off & 0xFFF) { if (backing_owns_ref) shfile_unref(backing); return -EINVAL; }
+    if (off + len > shfile_size(backing)) { if (backing_owns_ref) shfile_unref(backing); return -EINVAL; }
+  } else if (!anon) {
     if (off & 0xFFF) return -EINVAL;
     rfile_t *f = fd_file(mm->fds, fd);
     if (!f) return -EBADF;
@@ -1879,13 +2040,16 @@ static long linux_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t lfla
 
   int slot = -1;
   for (int i = 0; i < TASK_AREAS; i++) if (!mm->areas[i].used) { slot = i; break; }
-  if (slot < 0) return -ENOMEM;
+  if (slot < 0) { if (backing_owns_ref) shfile_unref(backing); return -ENOMEM; }
 
   uint64_t base;
   if (lflags & LINUX_MAP_FIXED) {
     if (addr & 0xFFF) return -EINVAL;
     base = addr;
-    if (base < RING3_MMAP_BASE || base + len > RING3_MMAP_TOP) return -ENOMEM;
+    if (base < RING3_MMAP_BASE || base + len > RING3_MMAP_TOP) {
+      if (backing_owns_ref) shfile_unref(backing);
+      return -ENOMEM;
+    }
     /* The caller is taking these addresses: exactly these, no more. */
     if (vm_unmap_range(t, mm, base, len) != 0) return -ENOMEM;
   } else {
@@ -1903,12 +2067,21 @@ static long linux_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t lfla
         }
       }
     }
-    if (vm_overlaps(mm, base, len)) return -ENOMEM;
-    if (base + len > RING3_MMAP_TOP) return -ENOMEM;
+    if (vm_overlaps(mm, base, len)) { if (backing_owns_ref) shfile_unref(backing); return -ENOMEM; }
+    if (base + len > RING3_MMAP_TOP) { if (backing_owns_ref) shfile_unref(backing); return -ENOMEM; }
     mm->mmap_hint = base + len + 0x1000;   /* leave one guard page between regions */
   }
 
   vm_area_t *a = &mm->areas[slot];
+  if (backing) shfile_ref(backing);    /* the area's claim, dropped with the area */
+  a->shf = backing;
+  /* The mapping now holds the file, so the caller's own claim is handed over
+   * rather than kept: an anonymous region is freed by nobody else. */
+  if (backing_owns_ref) shfile_unref(backing);
+  /* a->flags already carries the bits the pages get, and the fault path reads
+   * PTE_SHARED there to tell "hand out the file's frame" from "take a copy of
+   * it": one flag, one meaning, on the area the pages belong to. */
+  if (backing && backing_shared) pte |= PTE_SHARED;
   a->base = base;
   a->len = len;
   a->flags = pte;
@@ -2385,6 +2558,8 @@ static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, 
     case 57:  return sys_fork();                            /* fork */
     case 59:  return linux_execve(a0, a1, a2);              /* execve */
     case 35:  return linux_nanosleep(a0, a1);               /* nanosleep */
+    case 77:  return linux_ftruncate(a0, a1);               /* ftruncate */
+    case 319: return linux_memfd_create(a0, a1);            /* memfd_create */
     case 230: return linux_clock_nanosleep(a0, a1, a2, a3); /* clock_nanosleep */
     case 232: return sys_epoll_wait(a0, a1, a2, a3);        /* epoll_wait */
     case 233: return sys_epoll_ctl(a0, a1, a2, a3);         /* epoll_ctl */

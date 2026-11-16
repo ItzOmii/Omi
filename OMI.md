@@ -99,8 +99,12 @@ qemu-system-x86_64 -m 512 -cdrom omi.iso -boot d -vga std \
   is no shell and no `PATH`, so the kernel's spawn list is still how a session begins. Two limits on
   the call itself: `envp` is ignored because nothing in this system has an environment, and exec from
   a space shared with another thread is refused rather than ending that thread.
-- **Shared file mappings are missing.** `MAP_SHARED` over a file is `-ENOSYS`: there is no write-back
-  path, so a shared mapping would be a lie about durability. `PROT_NONE` is implemented - a read of a
+- **Shared file mappings exist for memfds and not for boot modules.** `MAP_SHARED` over a shared
+  file is real sharing - the frames *are* the file, so a mapping needs no write-back path and
+  `read(2)` returns what the mapping wrote (`[memfdtest] 23/23`). Over a boot module it is still
+  `-ENOSYS`: that memory is read-only, so a shared mapping would be a lie about durability. There is
+  no page cache and no write-back machinery: one program's memfd cannot be handed to another except
+  by mapping the same descriptor, and nothing survives the process that made it. `PROT_NONE` is implemented - a read of a
   guard faults, and so does a store into a read-only page (`[maptest] OK 24/24`), with one difference
   from Linux: the bytes under a no-access span are dropped rather than preserved.
 - **No microphone capture** on real hardware — no capture endpoint is exposed by most onboard HDA.

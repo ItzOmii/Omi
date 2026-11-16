@@ -40,6 +40,7 @@ object runs under musl's own `ld.so` - the kernel loads two images and hands ove
 | Dynamic linking: `ld.so`, `PT_INTERP`, `ET_DYN` | **done** |
 | `execve`: a program replaces its own image, argv and descriptors intact | **done** |
 | `epoll`: a kept set of descriptors, and `nanosleep` for a program that waits | **done** |
+| `memfd` + `MAP_SHARED`: one set of bytes with several doors onto it | **done** |
 | TCP teardown (FIN/RST/`TIME_WAIT`), retransmission | not yet |
 | UDP sockets, `bind`/`listen`/`accept` | not yet |
 | TLS from user mode | not yet |
@@ -308,7 +309,8 @@ To boot real hardware: `sudo dd if=omi.iso of=/dev/sdX bs=4M status=progress`.
 - **Dynamic linking works, with sharp edges.** A PIE that names an interpreter runs: the kernel maps
   the program at the base of the user window and `ld.so` at +1 MB in the same space, passes the
   program's phdrs and entry in the auxv, and starts the interpreter. What is missing is around it —
-  `MAP_SHARED` over a file is `-ENOSYS` (there is no write-back path), the interpreter's address is a
+  `MAP_SHARED` over a boot module is `-ENOSYS` (read-only memory, no write-back path) while
+  `MAP_SHARED` over a memfd is real sharing (the pages *are* the file), the interpreter's address is a
   kernel constant, and a range painted `PROT_NONE` loses its bytes when it is given access again,
   where Linux would preserve them.
 - **The VFS is RAM only** — three files seeded at boot, 24 slots, no disk and no directories below the

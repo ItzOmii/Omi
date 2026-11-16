@@ -58,8 +58,11 @@ struct pipe;
 /* An epoll instance is a sixth kind for the same reason: the descriptor layer
  * names the pointer and does not learn what a registration set is. */
 struct epoll;
+/* A shared file: pages owned by the object and handed to mappings, so that a
+ * MAP_SHARED mapping and the descriptor read the same bytes. */
+struct shfile;
 
-enum { FK_NONE = 0, FK_CONSOLE, FK_FILE, FK_SOCKET, FK_PIPE, FK_EPOLL };
+enum { FK_NONE = 0, FK_CONSOLE, FK_FILE, FK_SOCKET, FK_PIPE, FK_EPOLL, FK_SHFILE };
 
 /* The file: shared by every open of the same name. */
 typedef struct {
@@ -86,6 +89,7 @@ typedef struct {
   struct socket *sock;     /* FK_SOCKET: the endpoint, shared by every dup */
   struct pipe   *pipe;     /* FK_PIPE: the ring; the end is in flags (O_WRONLY) */
   struct epoll  *ep;       /* FK_EPOLL: the set of watched descriptors */
+  struct shfile *shf;      /* FK_SHFILE: the pages a shared mapping windows onto */
   int      used;
 } ofile_t;
 
@@ -142,6 +146,13 @@ int  fd_count_kind(fdtable_t *t, int kind);
 /* A descriptor for a new epoll instance, or a negative errno when the table or
  * the open-file table is full. */
 int  fd_epoll(fdtable_t *t);
+
+/* A descriptor for a new shared file, or a negative errno. The object starts
+ * empty: size comes from ftruncate, as it does on Linux. */
+int  fd_shfile(fdtable_t *t);
+/* The shared file behind this descriptor, or NULL when it is not one. mmap needs
+ * this to tell "map the pages" from "copy the bytes". */
+struct shfile *fd_shfile_of(fdtable_t *t, int fd);
 
 /* Pin a description while a task is inside it. The last descriptor ref triggers
  * shutdown; destruction waits for the last pin, so a backend call cannot run

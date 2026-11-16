@@ -30,6 +30,7 @@ PROGS += libmap.elf
 PROGS += dyntest.elf
 PROGS += exectest.elf
 PROGS += epolltest.elf
+PROGS += memfdtest.elf
 PROGS += exectarget.elf
 # Not a program: a shared object, built with musl-gcc so its relocations and its
 # NEEDED entry are real. Copied to the ISO's /lib and loaded as a boot module.
@@ -65,6 +66,10 @@ libprobe.elf: libprobe.c
 libmap.elf: libmap.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping libmap"; exit 0; }
 	musl-gcc -static -O2 -no-pie -o $@ $<
+
+memfdtest.elf: memfdtest.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping memfdtest"; exit 0; }
+	@musl-gcc -O2 -static -o $@ $< && echo "built $@" || echo "memfdtest build failed"
 
 epolltest.elf: epolltest.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping epolltest"; exit 0; }

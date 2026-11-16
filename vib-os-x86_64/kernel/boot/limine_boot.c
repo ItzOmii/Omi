@@ -531,6 +531,7 @@ void _start(void) {
    * output can be mistaken for the test that started it. */
   ring3_spawn_elf("exectest", "exectest.elf", 0);
   ring3_spawn_elf("epolltest", "epolltest.elf", 0);
+  ring3_spawn_elf("memfdtest", "memfdtest.elf", 0);
   }
 
   serial_puts("Starting main loop...\n");

@@ -58,6 +58,11 @@ typedef struct {
   const uint8_t *src;
   uint32_t src_off;     /* offset of base inside the blob */
   uint32_t src_len;     /* blob bytes from src_off to EOF */
+  /* A shared region (MAP_SHARED over a memfd). The pages are the file's own, so
+   * this area holds a reference for as long as it exists: the descriptor may be
+   * closed while the mapping stays, which is what Linux does and what a program
+   * that maps a memfd and closes it expects. */
+  void    *shf;
 } vm_area_t;
 
 /* An address space. Threads share one: a page-table root, the lazily-mapped
