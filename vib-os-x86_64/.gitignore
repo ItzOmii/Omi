@@ -27,3 +27,6 @@ serial.log
 # Test files
 test/
 tests/
+
+# build artifacts: the ISO carries the shared object, the Makefile builds it
+*.so

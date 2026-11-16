@@ -502,6 +502,28 @@ void _start(void) {
    * call, and readiness that stops being claimed once drained. */
   static const char *pt[] = { "polltest", "10.0.2.2", "8899", "/hold.txt" };
   ring3_spawn_elf_argv("polltest", "polltest.elf", 4, pt);
+  /* Pipes, from a program that owns the descriptors: readiness, EOF across a
+   * dup, and -EPIPE when the reader is gone. */
+  ring3_spawn_elf("pipetest", "pipetest.elf", 0);
+  /* The other door: the `syscall` instruction with Linux numbers, driven from a
+   * program that has no libc to do it for it. */
+  ring3_spawn_elf("linuxtest", "linuxtest.elf", 0);
+  /* A program musl built, not us: linked at its natural 0x400000, started from a
+   * Linux-shaped stack with an auxv, and expecting a libc's worth of syscalls. */
+  {
+    static const char *const musl_argv[] = { "muslhello", "--from-omi" };
+    ring3_spawn_elf_argv("muslhello", "muslhello.elf", 2, musl_argv);
+    ring3_spawn_elf("muslthreads", "muslthreads.elf", 0);
+    ring3_spawn_elf("muslstat", "muslstat.elf", 0);
+    ring3_spawn_elf("muslfork", "muslfork.elf", 0);
+    /* fork's reference counts against lifetimes that actually stress them:
+     * ancestors dying first, three generations, four children on one page, and
+     * a shared segment that must survive all of it. */
+    ring3_spawn_elf("cowlives", "cowlives.elf", 0);
+    /* Boot modules as files: the read half of the dynamic linker's job. Runs
+     * last so the earlier suites' output is not interleaved with a file test. */
+    ring3_spawn_elf("libprobe", "libprobe.elf", 0);
+  }
 
   serial_puts("Starting main loop...\n");
 

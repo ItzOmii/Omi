@@ -36,6 +36,21 @@ int meep_module_find(const char *suffix, void **ptr, uint64_t *len) {
   return 0;
 }
 
+/* Random access to the module list, so a caller can register every module as a
+ * file without guessing at names. Returns 1 and fills the out-params when index
+ * i exists, 0 past the end. */
+int meep_module_at(uint64_t i, const char **path, void **ptr, uint64_t *len) {
+  if (!mod_resp || i >= mod_resp->module_count) return 0;
+  struct meep_limine_file *f = mod_resp->modules[i];
+  if (!f) return 0;
+  if (path) *path = f->path;
+  if (ptr)  *ptr  = f->address;
+  if (len)  *len  = f->size;
+  return 1;
+}
+
+uint64_t meep_module_count(void) { return mod_resp ? mod_resp->module_count : 0; }
+
 int meep_modules_probe(void *response_ptr) {
   mod_resp = (struct meep_module_response *)response_ptr;
   if (!mod_resp) {

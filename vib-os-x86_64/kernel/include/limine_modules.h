@@ -63,4 +63,9 @@ int meep_modules_probe(void *response_ptr);
  */
 int meep_module_find(const char *suffix, void **ptr, uint64_t *len);
 
+/* Index access to the module list, for callers that want all of them (the module
+ * filesystem exposes each one under the path Limine was told to use). */
+int      meep_module_at(uint64_t i, const char **path, void **ptr, uint64_t *len);
+uint64_t meep_module_count(void);
+
 #endif /* _MEEPOS_LIMINE_MODULES_H */

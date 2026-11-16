@@ -32,6 +32,7 @@
 #define EIO 5
 #define EPIPE 32
 #define ENOSPC      28
+#define EROFS       30
 #define ESPIPE      29
 #define EDEADLK     35
 #define ENOSYS      38

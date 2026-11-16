@@ -48,7 +48,13 @@ static void set_entry(int i, uint32_t base, uint32_t limit, uint8_t access, uint
   gdt[i].access    = access;
 }
 
-void gdt_set_kernel_stack(uint64_t rsp0) { tss.rsp0 = rsp0; }
+/* The stack SYSCALL entry switches to. `syscall` does not touch rsp, so the stub
+ * needs the current task's kernel stack top somewhere it can load without a
+ * scratch register - a global. Kept in step with tss.rsp0 by this one function so
+ * the two can never disagree: every task switch already calls it. */
+uint64_t gdt_syscall_rsp;
+
+void gdt_set_kernel_stack(uint64_t rsp0) { tss.rsp0 = rsp0; gdt_syscall_rsp = rsp0; }
 
 void gdt_init(void) {
   set_entry(0, 0, 0, 0, 0);

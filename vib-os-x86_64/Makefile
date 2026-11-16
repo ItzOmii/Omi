@@ -75,6 +75,7 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/mm/kmalloc.c \
            $(KERNEL_DIR)/mm/mmio.c \
            $(KERNEL_DIR)/mm/pmm.c \
+           $(KERNEL_DIR)/cow.c \
            $(KERNEL_DIR)/fs/vfs.c \
            $(KERNEL_DIR)/drivers/framebuffer.c \
            $(KERNEL_DIR)/drivers/idt.c \
@@ -102,6 +103,7 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/elf.c \
            $(KERNEL_DIR)/fs/fd.c \
            $(KERNEL_DIR)/fs/socket.c \
+           $(KERNEL_DIR)/fs/pipe.c \
            $(KERNEL_DIR)/fs/fd_opaque_check.c \
            $(KERNEL_DIR)/fs/socket_selftest.c \
            $(KERNEL_DIR)/fs/readiness_selftest.c \
@@ -235,7 +237,7 @@ $(LIMINE_DIR):
 userland/%.elf: userland/%.c
 	$(MAKE) -C userland $*.elf
 
-$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -256,6 +258,18 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	cp userland/cat.elf $(ISO_ROOT)/apps/cat.elf
 	cp userland/httpget.elf $(ISO_ROOT)/apps/httpget.elf
 	cp userland/polltest.elf $(ISO_ROOT)/apps/polltest.elf
+	cp userland/pipetest.elf $(ISO_ROOT)/apps/pipetest.elf
+	cp userland/linuxtest.elf $(ISO_ROOT)/apps/linuxtest.elf
+	@if [ -f userland/muslhello.elf ]; then cp userland/muslhello.elf $(ISO_ROOT)/apps/muslhello.elf; else echo "no muslhello.elf: skipping"; fi
+	@if [ -f userland/muslthreads.elf ]; then cp userland/muslthreads.elf $(ISO_ROOT)/apps/muslthreads.elf; else echo "no muslthreads.elf: skipping"; fi
+	@if [ -f userland/muslstat.elf ]; then cp userland/muslstat.elf $(ISO_ROOT)/apps/muslstat.elf; else echo "no muslstat.elf: skipping"; fi
+	@if [ -f userland/muslfork.elf ]; then cp userland/muslfork.elf $(ISO_ROOT)/apps/muslfork.elf; else echo "no muslfork.elf: skipping"; fi
+	@if [ -f userland/cowlives.elf ]; then cp userland/cowlives.elf $(ISO_ROOT)/apps/cowlives.elf; else echo "no cowlives.elf: skipping"; fi
+	@if [ -f userland/libprobe.elf ]; then cp userland/libprobe.elf $(ISO_ROOT)/apps/libprobe.elf; else echo "no libprobe.elf: skipping"; fi
+	# A shared object, in a directory of its own: the loader will look it up by
+	# path, so the path it is copied to is the path that must appear in limine.conf.
+	@mkdir -p $(ISO_ROOT)/lib
+	@if [ -f userland/libgreet.so ]; then cp userland/libgreet.so $(ISO_ROOT)/lib/libgreet.so; else echo "no libgreet.so: skipping"; fi
 	cp userland/spin.elf $(ISO_ROOT)/apps/spin.elf
 
 	# Media samples, exposed to the kernel as boot modules

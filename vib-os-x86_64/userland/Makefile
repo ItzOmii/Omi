@@ -15,7 +15,21 @@ CFLAGS  := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector 
            -mno-red-zone -mcmodel=large -O2 -Wall -Wextra
 LDFLAGS := -nostdlib -static -z noexecstack --no-dynamic-linker
 
-PROGS := cat.elf httpget.elf polltest.elf spin.elf
+PROGS := cat.elf httpget.elf polltest.elf spin.elf pipetest.elf linuxtest.elf
+# muslhello is the only program here not built by our own freestanding toolchain -
+# it is the proof that a real libc works. Optional: skip it (with a note) when
+# musl-gcc is not installed rather than failing the whole build.
+ifneq ($(shell command -v musl-gcc 2>/dev/null),)
+PROGS += muslhello.elf
+PROGS += muslthreads.elf
+PROGS += muslstat.elf
+PROGS += muslfork.elf
+PROGS += cowlives.elf
+PROGS += libprobe.elf
+# Not a program: a shared object, built with musl-gcc so its relocations and its
+# NEEDED entry are real. Copied to the ISO's /lib and loaded as a boot module.
+PROGS += libgreet.so
+endif
 
 all: $(PROGS)
 
@@ -34,6 +48,53 @@ polltest.elf: polltest.o start.o cat.ld
 spin.elf: spin.o start.o cat.ld
 	$(LD) $(LDFLAGS) -T cat.ld -o $@ spin.o start.o
 	@echo "built $@"
+
+cowlives.elf: cowlives.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping cowlives"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+
+libprobe.elf: libprobe.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping libprobe"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+
+# -fPIC and a real dynamic section: the point of this file in the ISO is that the
+# loader has to cope with relocations, not that the code does anything clever.
+libgreet.so: dl/libgreet.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping libgreet"; exit 0; }
+	musl-gcc -shared -fPIC -O2 -o $@ $<
+	@echo "built $@ (shared object, $(shell stat -c%s $@ 2>/dev/null || echo 0) bytes)"
+
+muslfork.elf: muslfork.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping muslfork"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+
+muslstat.elf: muslstat.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping muslstat"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+
+muslthreads.elf: muslthreads.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping muslthreads"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@ (musl static, pthreads)"
+
+muslhello.elf: muslhello.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping muslhello"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@ (musl static)"
+
+linuxtest.elf: linuxtest.o start.o cat.ld
+	$(LD) $(LDFLAGS) -T cat.ld -o $@ linuxtest.o start.o
+	@echo "built $@"
+
+linuxtest.o: linuxtest.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+pipetest.elf: pipetest.o start.o cat.ld
+	$(LD) $(LDFLAGS) -T cat.ld -o $@ pipetest.o start.o
+	@echo "built $@"
+
+pipetest.o: pipetest.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 spin.o: spin.c
 	$(CC) $(CFLAGS) -c -o $@ $<

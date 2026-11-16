@@ -24,7 +24,16 @@
 
 /* Virtual base of a user address space (PML4 slot 1) and the end of the window
  * that a program is allowed to occupy. */
+/* Where our own programs are linked, and where kernel-mediated allocations land. */
 #define RING3_USER_BASE   0x0000008000000000ULL
+
+/* The low edge of what counts as a user address. Our programs sit at
+ * RING3_USER_BASE, but a program from an ordinary toolchain is linked at 0x400000
+ * - musl in particular uses 32-bit absolute relocations in its startup, so it
+ * cannot be moved high at all. Both windows are real, so every user-pointer check
+ * tests against this edge rather than against our linker script's choice.
+ * 0x10000 stays below it, so a null dereference is still a fault. */
+#define RING3_USER_MIN    0x0000000000010000ULL
 /* The window a process may occupy: 256 MB. Segments land near the base, the
  * stack at the top, and SYS_VM_ALLOC hands out ranges in between. Page tables
  * for it are built on demand, so an empty window costs nothing. */
@@ -75,6 +84,7 @@
 #define SYS_RECV       31   /* (fd, buf, len) -> bytes | -EAGAIN (timeout) | 0 (EOF) */
 #define SYS_RESOLVE    32   /* (host, ip_out[4]) -> 0 | -ENOENT            */
 #define SYS_POLL       33   /* (fds, nfds, timeout_ms) -> ready count | -EAGAIN */
+#define SYS_PIPE       34   /* (int fds[2]) -> 0 | -EMFILE  (fds[0] read, fds[1] write) */
 
 /* the switch, the gates and the fault handler */
 void     ring3_init(void);

@@ -318,6 +318,9 @@ int vfs_readdir(const char *path, dirent_t *entries, int max_entries) {
   int count = 0;
   
   for (int i = 0; i < inode_count && count < max_entries; i++) {
+    /* The root's parent is itself, so without this the root lists itself as one
+     * of its own children - a folder that opens onto the folder you are in. */
+    if (i == dir_idx) continue;
     if (inodes[i].parent == dir_idx) {
       str_cpy(entries[count].name, inodes[i].name, MAX_NAME);
       entries[count].type = inodes[i].type;

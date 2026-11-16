@@ -210,6 +210,12 @@ static void switch_to(int next, ctx_t *frame) {
   cur = next;
 
   task_fpu_slot = tasks[next].fpu;         /* the stub restores this on exit */
+  /* %fs is per thread and nothing else switches it, so it is loaded here, with
+   * the task's other state, before it can run a single instruction. */
+#ifndef NO_FS_SWITCH
+  __asm__ volatile("wrmsr" :: "c"(0xC0000100), "a"((uint32_t)tasks[next].fs_base),
+                   "d"((uint32_t)(tasks[next].fs_base >> 32)));
+#endif
   if (tasks[next].kstack_top) gdt_set_kernel_stack(tasks[next].kstack_top);
   uint64_t want = tasks[next].cr3 ? tasks[next].cr3 : ring3_kernel_cr3();
   if (ring3_read_cr3() != want) ring3_write_cr3(want);
@@ -295,6 +301,10 @@ void task_kill_current(uint64_t code) {
     mm_on_exit(&tasks[cur]);       /* last thread out frees the address space */
     tasks[cur].state = TASK_DEAD;
     tasks[cur].work = code;
+    /* A child's death is the event its parent may be waiting for, and there is
+     * no signal to deliver it with, so the parent is woken directly. A parent
+     * that was waiting on something else re-checks and sleeps again. */
+    if (tasks[cur].parent > 0) task_wake(tasks[cur].parent);
   } else {
     serial_puts("[ring3] refusing to kill the kernel task, halting\n");
     for (;;) __asm__ volatile("cli; hlt");
@@ -360,6 +370,7 @@ static task_t *task_alloc(const char *name) {
   t->wake_at = 0;
   t->timed_out = 0;
   t->wait_obj = 0;
+  t->parent = (cur > 0 && cur < ntasks) ? tasks[cur].id : 0;
   t->tgen = ++task_gen_counter;   /* a fresh slot is a new identity */
   int i = 0;
   while (name[i] && i < 23) { t->name[i] = name[i]; i++; }
@@ -386,6 +397,9 @@ static void prime(task_t *t, uint64_t rip, uint64_t cs, uint64_t rdi,
   c->rflags = 0x202;                 /* IF set: the task runs interruptible */
   c->rsp = user ? user_rsp : top;    /* only user frames pop these two */
   c->ss = user ? ss : 0x10;
+  t->fs_base = 0;
+  t->ctid = 0;
+  t->sig_blocked = 0;
   /* Start from the FPU state this cpu is in right now, never from zeros: an
    * fxsave image of all zeros carries an invalid MXCSR. */
   __asm__ volatile("fxsave %0" : "=m"(t->fpu));
@@ -425,6 +439,46 @@ int task_spawn_user_mm(const char *name, uint64_t entry, uint64_t user_sp,
   t->mm = mm;
   mm->refcount++;
   prime(t, entry, 0x23, arg, user_sp, 0x1B, 1);
+  t->state = TASK_READY;
+  return t->id;
+}
+
+/* A second thread born the way Linux's clone() makes one: the caller's saved
+ * registers, the caller's next instruction, a stack of the caller's choosing,
+ * and rax = 0 so the code after the `syscall` knows it is the child. The frame
+ * passed in is the one the syscall stub saved (nineteen qwords), not a ctx_t -
+ * the two differ by the rbp slot, so the fields are copied across by name
+ * rather than memcpy'd. */
+int task_spawn_clone(const char *name, mm_t *mm, const uint64_t *frame,
+                     uint64_t child_rsp, uint64_t fs_base, uint64_t ctid) {
+  task_t *t = task_alloc(name);
+  if (!t) return -1;
+  t->user_entry = frame[14];         /* rip: the instruction after the syscall */
+  t->user_sp = child_rsp;
+  t->user_arg = 0;
+  t->cr3 = mm->cr3;
+  t->mm = mm;
+  mm->refcount++;
+
+  uint64_t top = t->kstack_top;
+  ctx_t *c = (ctx_t *)(uintptr_t)(top - (uint64_t)CTX_USER * 8);
+  uint64_t *w = (uint64_t *)c;
+  for (int i = 0; i < CTX_USER; i++) w[i] = 0;
+  c->r15 = frame[0]; c->r14 = frame[1]; c->r13 = frame[2]; c->r12 = frame[3];
+  c->r11 = frame[4]; c->r10 = frame[5]; c->r9  = frame[6]; c->r8  = frame[7];
+  c->rdi = frame[8]; c->rsi = frame[9]; c->rdx = frame[10];
+  c->rcx = frame[11]; c->rbx = frame[12];
+  c->rax = 0;                        /* the child's return value */
+  c->rip = frame[14];
+  c->cs = frame[15];
+  c->rflags = 0x202;
+  c->rsp = child_rsp;
+  c->ss = frame[18];
+
+  __asm__ volatile("fxsave %0" : "=m"(t->fpu));
+  t->rsp = (uint64_t)(uintptr_t)c;
+  t->fs_base = fs_base;
+  t->ctid = ctid;
   t->state = TASK_READY;
   return t->id;
 }

@@ -11,6 +11,7 @@
 #include "../include/net.h"
 #include "../include/task.h"
 #include "../include/readiness.h"
+#include "../include/pipe.h"
 
 extern void serial_puts(const char *s);
 
@@ -69,6 +70,38 @@ static rfile_t *file_create(const char *name, const char *body) {
   return f;
 }
 
+/* A boot module, addressed by a path the program can name. No copy and no
+ * heap cap: `data` points straight into the module blob, `cap` equals its size
+ * so read() stops at the real end of the file rather than at 4 KB. */
+int rfs_expose(const char *path, uint8_t *blob, uint32_t size) {
+  if (!path || !path[0] || !blob || !size) return -EINVAL;
+  if (file_find(path)) return -EEXIST;
+  int slot = -1;
+  for (int i = 0; i < RFILE_MAX; i++) if (!files[i].used) { slot = i; break; }
+  if (slot < 0) return -ENOSPC;
+  rfile_t *f = &files[slot];
+  zero(f, sizeof *f);
+  strcpy32(f->name, path);
+  f->data = blob;
+  f->size = size;
+  f->cap  = size;
+  f->used = 1;
+  f->ro   = 1;
+  return 0;
+}
+
+int rfs_count(void) {
+  int n = 0;
+  for (int i = 0; i < RFILE_MAX; i++) if (files[i].used) n++;
+  return n;
+}
+
+int rfs_rom_count(void) {
+  int n = 0;
+  for (int i = 0; i < RFILE_MAX; i++) if (files[i].used && files[i].ro) n++;
+  return n;
+}
+
 /* Seeded at boot so open() has something to find. Deliberately small: this is
  * a landing place for the syscalls, not a filesystem anyone should store work
  * in - it lives in kernel heap and vanishes with the machine. */
@@ -104,6 +137,9 @@ static ofile_t *ofile_get(void) {
  * inside a backend call. */
 static void ofile_destroy(ofile_t *o) {
   if (o->kind == FK_SOCKET && o->sock) sock_close(o->sock);
+  /* One ofile is one holder of one end. Two dup'd descriptors are still one
+   * ofile, so the pipe's counts already say the right thing. */
+  if (o->kind == FK_PIPE && o->pipe) pipe_unref(o->pipe, (o->flags & 3) == O_WRONLY);
   zero(o, sizeof *o);
 }
 
@@ -156,6 +192,26 @@ fdtable_t *fdtable_new(void) {
   return t;
 }
 
+/* The descriptor table a forked child is born with: the same descriptors, in the
+ * same slots, pointing at the same open files - a child that writes to a pipe its
+ * parent made has to reach the parent's reader, and a child that closes one must
+ * not close the parent's. That is a reference, not a copy of the file. Consoles
+ * are static objects with no reference to take, the same way fd_dup() treats
+ * them. */
+fdtable_t *fdtable_clone(fdtable_t *src) {
+  if (!src) return 0;
+  fdtable_t *t = (fdtable_t *)kmalloc(sizeof(fdtable_t));
+  if (!t) return 0;
+  zero(t, sizeof *t);
+  for (int i = 0; i < FD_MAX; i++) {
+    ofile_t *o = src->fd[i];
+    if (!o) continue;
+    t->fd[i] = o;
+    if (o->kind != FK_CONSOLE) o->refs++;
+  }
+  return t;
+}
+
 void fdtable_free(fdtable_t *t) {
   if (!t) return;
   for (int i = 0; i < FD_MAX; i++) {
@@ -171,6 +227,8 @@ static int fd_alloc(fdtable_t *t, ofile_t *o) {
   return -EMFILE;
 }
 
+rfile_t *rfs_find(const char *name) { return file_find(name); }
+
 int fd_open(fdtable_t *t, const char *path, int flags) {
   if (!t || !path || !path[0]) return -EINVAL;
   int mode = flags & 3;
@@ -182,6 +240,9 @@ int fd_open(fdtable_t *t, const char *path, int flags) {
     f = file_create(path, 0);
     if (!f) return -ENOSPC;
   }
+  /* A boot module cannot be written: its bytes are the bootloader's image, and
+   * truncating it would corrupt a file other processes are running from. */
+  if (f->ro && (mode != O_RDONLY || (flags & O_TRUNC))) return -EROFS;
 
   ofile_t *o = ofile_get();
   if (!o) return -EMFILE;
@@ -224,6 +285,32 @@ int fd_socket(fdtable_t *t) {
   return fd;
 }
 
+/* Both ends at once, because a pipe with one end is not a thing a program can
+ * use: the pair is the object. pipe_new() hands them over already held (1/1), so
+ * the two ofiles below inherit those counts rather than adding to them - and if
+ * the second slot cannot be found, both are released and the ring goes back. */
+int fd_pipe(fdtable_t *t, int out[2]) {
+  if (!t || !out) return -EINVAL;
+  struct pipe *p = pipe_new();
+  if (!p) return -EMFILE;
+
+  ofile_t *r = ofile_get();
+  if (!r) { pipe_unref(p, 0); pipe_unref(p, 1); return -EMFILE; }
+  r->kind = FK_PIPE; r->flags = O_RDONLY; r->pipe = p;
+  int rfd = fd_alloc(t, r);
+  if (rfd < 0) { ofile_put(r); pipe_unref(p, 1); return rfd; }
+
+  ofile_t *w = ofile_get();
+  if (!w) { fd_close(t, rfd); pipe_unref(p, 1); return -EMFILE; }
+  w->kind = FK_PIPE; w->flags = O_WRONLY; w->pipe = p;
+  int wfd = fd_alloc(t, w);
+  if (wfd < 0) { ofile_put(w); fd_close(t, rfd); return wfd; }
+
+  out[0] = rfd;
+  out[1] = wfd;
+  return 0;
+}
+
 /* How many descriptors of one kind a table holds. Used by teardown accounting:
  * "did this space own network endpoints" is a question about the table, and it
  * has to be asked before the table is freed. */
@@ -241,6 +328,7 @@ unsigned fd_poll(fdtable_t *t, int fd) {
   if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return OMI_POLLERR;
   ofile_t *o = t->fd[fd];
   if (o->kind == FK_SOCKET)  return sock_poll(o->sock);
+  if (o->kind == FK_PIPE)    return pipe_poll(o->pipe, (o->flags & 3) == O_WRONLY);
   if (o->kind == FK_FILE)    return OMI_POLLIN | OMI_POLLOUT;
   if (o->kind == FK_CONSOLE) return 0;      /* no keyboard path yet */
   return OMI_POLLERR;
@@ -283,6 +371,12 @@ int fd_close(fdtable_t *t, int fd) {
  * patience rather than the thread. */
 static long sock_read_wait(ofile_t *o, void *kbuf, uint64_t n, uint64_t ticks) {
   if (o->closing) return -EBADF;
+
+  /* One reader at a time. Without this, two tasks can park on the same socket,
+   * both be woken for the same bytes, and split a stream in scheduler order. */
+  int owner = sock_read_begin(o->sock);
+  if (owner != 0) return owner;          /* -EBUSY, or -EBADF if it is gone */
+
   uint64_t end = task_total_ticks() + ticks;
   long r = 0;
 
@@ -302,6 +396,7 @@ static long sock_read_wait(ofile_t *o, void *kbuf, uint64_t n, uint64_t ticks) {
     /* woken with no readiness bit set: level-triggered, so just look again */
   }
   ofile_unpin(o);
+  sock_read_end(o->sock);                /* released on every path out */
   return r;
 }
 
@@ -339,6 +434,7 @@ long fd_read_ticks(fdtable_t *t, int fd, void *kbuf, uint64_t n, uint64_t ticks)
   ofile_t *o = t->fd[fd];
   if ((o->flags & 3) == O_WRONLY) return -EBADF;
   if (o->kind == FK_SOCKET) return sock_read_wait(o, kbuf, n, ticks);
+  if (o->kind == FK_PIPE)   return pipe_read(o->pipe, kbuf, n, ticks);
   if (o->kind == FK_CONSOLE) return 0;        /* no keyboard path yet: EOF */
   rfile_t *f = o->file;
   if (!f || !f->used) return -EBADF;
@@ -366,6 +462,7 @@ long fd_write_ticks(fdtable_t *t, int fd, const void *kbuf, uint64_t n, uint64_t
   if ((o->flags & 3) == O_RDONLY) return -EBADF;
 
   if (o->kind == FK_SOCKET) return sock_write_wait(o, kbuf, n, ticks);
+  if (o->kind == FK_PIPE)   return pipe_write(o->pipe, kbuf, n, ticks);
 
   if (o->kind == FK_CONSOLE) {
     /* Write all of it. The first version capped every call at 256 bytes and
@@ -385,6 +482,7 @@ long fd_write_ticks(fdtable_t *t, int fd, const void *kbuf, uint64_t n, uint64_t
 
   rfile_t *f = o->file;
   if (!f || !f->used) return -EBADF;
+  if (f->ro) return -EROFS;
   if (o->off >= f->cap) return -ENOSPC;
   uint64_t room = f->cap - o->off;
   uint64_t took = n < room ? n : room;
@@ -393,6 +491,11 @@ long fd_write_ticks(fdtable_t *t, int fd, const void *kbuf, uint64_t n, uint64_t
   o->off += took;
   if (o->off > f->size) f->size = (uint32_t)o->off;
   return (long)took;
+}
+
+ofile_t *fd_ofile(fdtable_t *t, int fd) {
+  if (!t || fd < 0 || fd >= FD_MAX) return 0;
+  return t->fd[fd];
 }
 
 long fd_seek(fdtable_t *t, int fd, int64_t off, int whence) {
