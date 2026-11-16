@@ -273,6 +273,7 @@ void tcp_input(const uint8_t *f, int n) { tcp_dispatch(f, n); }
 
 
 static volatile int rx_busy;
+static volatile uint64_t pump_calls;
 
 /* One frame, then get out. If another task is already inside the NIC we do
  * nothing: its pump dispatches our frames for us. */
@@ -287,7 +288,12 @@ static void tcp_pump(void) {
 
 /* The pump is a service, not a favour: it is one frame at a time, callable from
  * anywhere, and safe to call while a connection call is also inside the NIC. */
-void tcp_service(void) { tcp_pump(); }
+void tcp_service(void) { tcp_pump(); pump_calls++; }
+
+/* How many times the pump has actually been asked to work. A counter, not a
+ * timestamp: "did it run" is the question, and it has to be answerable from
+ * another task without asking the pump's permission. */
+uint64_t tcp_pump_count(void) { return pump_calls; }
 
 /* ---- the connection API ------------------------------------------------ */
 

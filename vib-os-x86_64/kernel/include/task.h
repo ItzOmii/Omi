@@ -100,5 +100,7 @@ const char *task_state_name(int st);
 void task_block(int blocked);   /* 1 = don't schedule this task */
 void task_system_start(void);
 void task_demo_start(void);
+/* Does the timer switch tasks, or only tick? Runs spin.elf; see preempt_selftest.c */
+void preempt_selftest(void);
 
 #endif

@@ -1261,4 +1261,8 @@ void ring3_init(void) {
    * that spun did. One frame per tick, in its own task, so delivery depends on
    * the kernel and not on what ring 3 happens to be doing. */
   task_spawn("netpump", netpump);
+
+  /* Then ask whether that pump can run at all when ring 3 is busy. Separate from
+   * every socket test on purpose: a failure here is a scheduler answer. */
+  preempt_selftest();
 }

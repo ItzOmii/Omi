@@ -105,6 +105,7 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/fs/fd_opaque_check.c \
            $(KERNEL_DIR)/fs/socket_selftest.c \
            $(KERNEL_DIR)/fs/readiness_selftest.c \
+         $(KERNEL_DIR)/fs/preempt_selftest.c \
            $(KERNEL_DIR)/gui/webimg.c \
            $(KERNEL_DIR)/gui/icons_ri.c \
            $(KERNEL_DIR)/net/tcp.c \
@@ -228,7 +229,13 @@ $(LIMINE_DIR):
 # limine.conf is a prerequisite: its module list is part of the ISO's contents,
 # and a stale copy on the image looks exactly like a kernel that cannot find a
 # module that is sitting right there on the disk.
-$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf
+# The ISO recipe builds userland itself, but each .elf is also a prerequisite so
+# that editing a .c rebuilds the image. That needs a rule of its own, or make
+# refuses the prerequisite before the recipe ever runs.
+userland/%.elf: userland/%.c
+	$(MAKE) -C userland $*.elf
+
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -249,6 +256,7 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	cp userland/cat.elf $(ISO_ROOT)/apps/cat.elf
 	cp userland/httpget.elf $(ISO_ROOT)/apps/httpget.elf
 	cp userland/polltest.elf $(ISO_ROOT)/apps/polltest.elf
+	cp userland/spin.elf $(ISO_ROOT)/apps/spin.elf
 
 	# Media samples, exposed to the kernel as boot modules
 	mkdir -p $(ISO_ROOT)/media

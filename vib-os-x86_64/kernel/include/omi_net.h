@@ -40,6 +40,7 @@ void tcp_input(const uint8_t *f, int n);
 /* Drain one frame from the NIC and dispatch it. Safe to call concurrently with a
  * connection call that is inside the NIC: only one of them touches it. */
 void tcp_service(void);
+uint64_t tcp_pump_count(void);   /* frames the pump has been asked to take */
 
 /* Sends the whole buffer. Returns bytes accepted, or -1. */
 int tcp_send(const void *buf, int len);

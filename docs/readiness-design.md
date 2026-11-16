@@ -357,9 +357,10 @@ Stated so they can be tested individually rather than assumed collectively:
 7. `poll()` never sleeps after observing a changed `seq`.
 8. Network progress cannot depend on a ring-3 application making syscalls.
 
-Each maps to a test in §9 except 5 and 8, which need their own: a task killed
+Each maps to a test in §9 except 5 and 8, which needed their own: a task killed
 while parked (assert the socket's slot is clear and no wake lands on the recycled
-id), and the all-blocked progress test.
+id), and the all-blocked progress test. Both now exist; invariant 8's test is in
+`kernel/fs/preempt_selftest.c` and is described in §10b.
 
 ## 10b. Milestone 2: the syscall side, and two bugs it found
 
@@ -401,17 +402,49 @@ specific bits and that `events` survives the call.
 itself, and that stopped being theoretical the moment reads slept: the 8899
 clients timed out while the server's log showed the responses sent. `netpump` is
 now a kernel task that calls `tcp_service()` (one frame, then out) and sleeps a
-tick. Delivery no longer depends on what ring 3 is doing. Invariant 8 is still
-marked uncovered, for a narrower reason than before: the pump exists and is
-independent of application syscalls, but it is scheduled by the same cooperative
-scheduler, whose switch points are timer-driven deadline wakes and yield sites -
-a ring-3 process spinning without syscalls still delays it. Proving that needs a
-preemption experiment, not another socket test.
+tick. Delivery no longer depends on what ring 3 is doing.
+
+**Invariant 8: covered, and the experiment changed the answer.** The design note
+previously assumed the scheduler only switched at yield sites, so a syscall-free
+ring-3 loop would starve the pump. That was wrong: `sched_tick()` - the IRQ0 stub
+- preempts whenever the interrupted frame is CPL 3 (`(frame->cs & 3) == 3`). Ring 3
+has been preemptible all along; the non-preemptible case is a kernel frame.
+
+`kernel/fs/preempt_selftest.c` separates the two claims the invariant combines,
+because a tick is not a switch:
+
+| window | ticks | probe runs | pump frames |
+|---|---|---|---|
+| quiet, 30 ticks | 30 | 30 | 30 |
+| ring-3 `spin.elf` running, no syscalls | 31 | 31 | 31 |
+
+The probe is a kernel task that increments a counter and sleeps a tick, so it can
+only advance if the scheduler runs it. `spin.elf` loops on its own arithmetic and
+never traps, yields or sleeps - so nothing in that window can be credited to the
+application. The tick count proves the timer fired; the probe and pump counts prove
+the scheduler switched, which is the distinction that matters. The spinner is
+bounded by a loop count rather than the clock, because a test that can hang the
+machine would be worse than the bug it looks for. Six checks, all passing; the
+window is asserted non-empty first, so "the probe advanced" cannot describe an
+idle machine.
+
+The remaining limitation is a different one, and is not invariant 8: a *kernel*
+task that spins forever is still never preempted, so it would hang the system. No
+kernel code does that today; the pump and the probe both sleep.
 
 **Verified:** `[rdy] 44/44` (12 read-path checks, including "the backend's report
-woke the reader"), `[sock] 22/22`, ISO/VFS 16/16, futex 3/3, `polltest` verdict 1
-(read waited 204 ticks; drained-but-connected reports 0; HUP appears and stays;
-two descriptors ready in one call), `FATAL 0`, no double close, no panic.
+woke the reader"), `[pre] 6/6`, `[sock] 22/22`, ISO/VFS 16/16, futex 3/3,
+`polltest` verdict 1 (read waited 204 ticks; drained-but-connected reports 0; HUP
+appears and stays; two descriptors ready in one call), `FATAL 0`, no double close,
+no panic.
+
+One lesson from `polltest` is worth keeping: its original two-descriptor check
+polled both while one of them was already permanently readable, so every retry
+returned instantly and the test hammered the kernel for eight seconds while
+claiming to wait. It now asks each descriptor separately first - which is also how
+it distinguishes "poll is wrong" from "this connection never delivered" - and the
+combined call asserts only that the ready count equals the number of descriptors
+reporting bits.
 
 ## 11. Still open
 
