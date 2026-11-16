@@ -78,7 +78,10 @@ int sock_live(void);
 
 /* Called after an address space is freed with `had` socket descriptors in it:
  * asserts every endpoint died with the space that owned it. */
-void sock_report_after_space(int had);
+/* had: endpoints the dying space held. before: live count taken immediately
+ * before its descriptors were released. Global zero is only the right answer
+ * when this space was the last one holding anything; the delta is right always. */
+void sock_report_after_space(int had, int live_before);
 
 /* Backend substitution test: runs the descriptor sequence against a
  * deterministic backend, then restores the kernel's own. */

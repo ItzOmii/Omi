@@ -187,8 +187,9 @@ void mm_on_exit(task_t *t) {
     return;
   }
   int socks = fd_count_kind(mm->fds, FK_SOCKET);
+  int socks_live = sock_live();
   fdtable_free(mm->fds);
-  sock_report_after_space(socks);
+  sock_report_after_space(socks, socks_live);
   mm_free_tables(mm);          /* table full: nothing sane left to do */
   kfree(mm);
 }
@@ -200,8 +201,9 @@ void mm_reap(void) {
   for (int i = 0; i < nzombies; i++) {
     if (zombie[i]->cr3 == now) continue;      /* still the live one */
     int socks = fd_count_kind(zombie[i]->fds, FK_SOCKET);
+    int socks_live = sock_live();
     fdtable_free(zombie[i]->fds);
-    sock_report_after_space(socks);   /* endpoints must not outlive their space */
+    sock_report_after_space(socks, socks_live);   /* endpoints must not outlive their space */
     mm_free_tables(zombie[i]);
     kfree(zombie[i]);
     serial_puts("[mm] address space freed\n");
@@ -709,6 +711,52 @@ static long sys_resolve(uint64_t host_u, uint64_t out_u) {
   return user_put(out_u, ip, 4) == 0 ? 0 : -EFAULT;
 }
 
+/* poll(2), C layout: 8 bytes per entry, {int fd; uint16 events; uint16 revents}.
+ *
+ * One task can only park on one object today (wait_obj is a single pointer), so
+ * this cannot register interest in N sockets at once. It paces instead: compute
+ * every descriptor's readiness, and if nothing is ready, sleep a tick and look
+ * again. Correct, no lost wakeups, at most one tick of added latency - and it is
+ * honest about being a check loop rather than a multi-object wait. A real wait
+ * for many objects needs a registration that names a set, which is a scheduler
+ * change, not a socket one. */
+typedef struct { int32_t fd; uint16_t events; uint16_t revents; } kpollfd_t;
+_Static_assert(__builtin_offsetof(kpollfd_t, revents) == 6, "pollfd layout");
+
+static long sys_poll(uint64_t fds_u, uint64_t nfds, uint64_t timeout_ms) {
+  fdtable_t *t = current_fds();
+  if (!t) return -EBADF;
+  if (nfds == 0 || nfds > 16) return -EINVAL;
+  if (user_prep(fds_u, nfds * 8) != 0) return -EFAULT;
+
+  kpollfd_t set[16];
+  for (uint64_t i = 0; i < nfds; i++)
+    if (user_copy(&set[i], fds_u + i * 8, 8) != 0) return -EFAULT;
+
+  uint64_t end = task_total_ticks() + (timeout_ms + 9) / 10;
+  for (;;) {
+    int ready = 0;
+    for (uint64_t i = 0; i < nfds; i++) {
+      /* ERR and HUP come back whether or not they were asked for: they are not
+       * optional edge conditions, they are the reasons a wait ends. */
+      unsigned r = fd_poll(t, set[i].fd) &
+                   (unsigned)(set[i].events | OMI_POLLERR | OMI_POLLHUP);
+      if (r) ready++;
+      set[i].revents = (uint16_t)r;
+    }
+    if (ready || task_total_ticks() >= end) {
+      /* +6, not +4: the layout is {int fd; uint16 events; uint16 revents}, and
+       * writing at +4 lands on events - which reads back as "ready, no bits". */
+      for (uint64_t i = 0; i < nfds; i++)
+        if (user_put(fds_u + i * 8 + 6, &set[i].revents, 2) != 0) return -EFAULT;
+      return ready;
+    }
+    /* Sleeping here is what keeps poll from burning the cpu: the tick that wakes
+     * us also lets whatever produces the data run. */
+    task_sleep_ticks(1);
+  }
+}
+
 static long sys_open(uint64_t path_u, uint64_t flags) {
   fdtable_t *fds = current_fds();
   if (!fds) return -EBADF;
@@ -851,6 +899,7 @@ long syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, uint6
     case SYS_SEND:         return sys_send(a0, a1, a2);
     case SYS_RECV:         return sys_recv(a0, a1, a2);
     case SYS_RESOLVE:      return sys_resolve(a0, a1);
+    case SYS_POLL:         return sys_poll(a0, a1, a2);
     case SYS_LSEEK: {
       fdtable_t *fds = current_fds();
       return fds ? fd_seek(fds, (int)a0, (int64_t)a1, (int)a2) : -EBADF;
@@ -1176,6 +1225,16 @@ static void pt_selftest(void) {
 
 /* ------------------------------------------------------------------ setup */
 
+/* The pump is deliberately small: one frame, then a tick of sleep. It is a
+ * service, so it must be cheap enough to run for ever and must never hold the
+ * NIC while a connection call wants it (tcp_service handles that with rx_busy). */
+static void netpump(void) {
+  for (;;) {
+    tcp_service();
+    task_sleep_ticks(1);
+  }
+}
+
 void ring3_init(void) {
   kpml4_phys = ring3_read_cr3();
   kpml4_virt = (uint64_t *)(hhdm_offset + kpml4_phys);
@@ -1195,4 +1254,11 @@ void ring3_init(void) {
    * scheduler is up (task_demo_start ran first) but no real traffic is in
    * flight, so a temporary backend swap cannot disturb anything. */
   sock_readiness_selftest();
+
+  /* Independent network progress. A task parked in a socket wait cannot drain
+   * the NIC for itself - and with a real sleeping read that stopped being a
+   * theoretical concern: a client that slept never saw a response that a client
+   * that spun did. One frame per tick, in its own task, so delivery depends on
+   * the kernel and not on what ring 3 happens to be doing. */
+  task_spawn("netpump", netpump);
 }

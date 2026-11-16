@@ -38,6 +38,7 @@
 #define EOVERFLOW   75
 #define ETIMEDOUT  110
 #define ENOBUFS    105   /* no buffer space: a waiter table that cannot take one */
+#define ECONNRESET 104   /* the peer or the last descriptor ended the stream */
 #define EOPNOTSUPP  95
 
 #endif

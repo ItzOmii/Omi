@@ -228,7 +228,7 @@ $(LIMINE_DIR):
 # limine.conf is a prerequisite: its module list is part of the ISO's contents,
 # and a stale copy on the image looks exactly like a kernel that cannot find a
 # module that is sitting right there on the disk.
-$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -248,6 +248,7 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	$(MAKE) -C userland
 	cp userland/cat.elf $(ISO_ROOT)/apps/cat.elf
 	cp userland/httpget.elf $(ISO_ROOT)/apps/httpget.elf
+	cp userland/polltest.elf $(ISO_ROOT)/apps/polltest.elf
 
 	# Media samples, exposed to the kernel as boot modules
 	mkdir -p $(ISO_ROOT)/media

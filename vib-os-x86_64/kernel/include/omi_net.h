@@ -37,6 +37,9 @@ int  tcp_conn_count(void);
  * it: the driver has one receive queue, so a raw waiter can otherwise eat
  * another program's data. */
 void tcp_input(const uint8_t *f, int n);
+/* Drain one frame from the NIC and dispatch it. Safe to call concurrently with a
+ * connection call that is inside the NIC: only one of them touches it. */
+void tcp_service(void);
 
 /* Sends the whole buffer. Returns bytes accepted, or -1. */
 int tcp_send(const void *buf, int len);

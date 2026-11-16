@@ -48,7 +48,13 @@ typedef struct tcp_conn {
   int      used;
   uint8_t  rx[TCP_RX_MAX];
   int      rx_len;
+  /* Readiness callback. The backend reports state changes to whoever owns the
+   * endpoint without knowing what a socket is; NULL until somebody binds. */
+  void   (*cb)(void *, unsigned);
+  void    *ctx;
 } tcp_conn_t;
+
+static void conn_signal(tcp_conn_t *c);
 
 static tcp_conn_t conns[TCP_MAX_CONN];
 static uint32_t port_seed = 0x5A17;
@@ -200,13 +206,14 @@ static void tcp_dispatch(const uint8_t *f, int n) {
   uint8_t flags = t[13];
   uint32_t seq = get32(t + 4);
 
-  if (flags & TCP_RST) { c->open = 0; c->peer_closed = 1; return; }
+  if (flags & TCP_RST) { c->open = 0; c->peer_closed = 1; conn_signal(c); return; }
 
   if ((flags & TCP_SYN) && (flags & TCP_ACK) && !c->open) {
     c->ack = seq + 1;
     c->seq += 1;                 /* our SYN consumed one sequence number */
     c->open = 1;
     conn_seg(c, TCP_ACK, 0, 0);
+    conn_signal(c);              /* POLLOUT appears: a send can progress now */
     return;
   }
 
@@ -218,12 +225,14 @@ static void tcp_dispatch(const uint8_t *f, int n) {
     c->rx_len += payload;
     c->ack += (uint32_t)payload;
     conn_seg(c, TCP_ACK, 0, 0);
+    conn_signal(c);              /* data is readable: wake whoever waits */
   }
 
   if (flags & TCP_FIN) {
     c->ack = seq + (uint32_t)(payload > 0 ? payload : 0) + 1;
     conn_seg(c, TCP_ACK, 0, 0);
     c->peer_closed = 1;
+    conn_signal(c);              /* EOF is readable, and it never un-readies */
   }
 }
 
@@ -261,6 +270,8 @@ static void conn_log(const char *what, tcp_conn_t *c) {
 
 void tcp_input(const uint8_t *f, int n) { tcp_dispatch(f, n); }
 
+
+
 static volatile int rx_busy;
 
 /* One frame, then get out. If another task is already inside the NIC we do
@@ -273,6 +284,10 @@ static void tcp_pump(void) {
   if (n > 0 && n < (int)sizeof r) tcp_dispatch(r, n);
   rx_busy = 0;
 }
+
+/* The pump is a service, not a favour: it is one frame at a time, callable from
+ * anywhere, and safe to call while a connection call is also inside the NIC. */
+void tcp_service(void) { tcp_pump(); }
 
 /* ---- the connection API ------------------------------------------------ */
 
@@ -381,6 +396,8 @@ void tcp_conn_close(tcp_conn_t *c) {
   conn_log("down", c);
   c->used = 0;
   c->rx_len = 0;
+  c->cb = 0;                    /* the endpoint is gone: no more news */
+  c->ctx = 0;
 }
 
 int tcp_conn_used(int n) {
@@ -574,8 +591,21 @@ unsigned tcp_conn_poll(struct tcp_conn *c) {
   return r;
 }
 
+/* The one place the backend reaches upward. It reports a mask, not a socket. */
+static void conn_signal(tcp_conn_t *c) {
+  if (c && c->used && c->cb) c->cb(c->ctx, tcp_conn_poll(c));
+}
+
 /* Thin adapters: the ops table speaks void*, this file speaks tcp_conn_t, and
- * the cast happens in exactly these five lines rather than at every call site. */
+ * the cast happens in exactly these lines rather than at every call site. */
+static void op_bind(void *h, void (*cb)(void *, unsigned), void *ctx) {
+  tcp_conn_t *c = h;
+  if (!c) return;
+  c->cb = cb;
+  c->ctx = ctx;
+  conn_signal(c);       /* state that is already ready must not wait for news */
+}
+
 static void *op_open(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t port) {
   return tcp_conn_open(cfg, ip, port);
 }
@@ -595,6 +625,7 @@ static const struct socket_ops tcp_kernel_ops = {
   .recv  = op_recv,
   .close = op_close,
   .poll  = op_poll,
+  .bind  = op_bind,
 };
 
 /* Static, not installed by an init call: a caller must never be able to observe

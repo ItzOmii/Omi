@@ -197,6 +197,11 @@ void sock_close(struct socket *s) {
 
 /* ---- transport calls ---------------------------------------------------- */
 
+/* Backend news becomes a waiter wake here, and nowhere else. */
+static void sock_ready_cb(void *ctx, unsigned mask) {
+  sock_notify((struct socket *)ctx, mask);
+}
+
 int sock_connect(struct socket *s, const net_cfg_t *cfg, const uint8_t ip[4],
                  uint16_t port) {
   if (!s || !s->used) return -EBADF;
@@ -204,6 +209,9 @@ int sock_connect(struct socket *s, const net_cfg_t *cfg, const uint8_t ip[4],
   if (s->impl) return -EISCONN;
   s->impl = s->ops->open(cfg, ip, port);
   if (!s->impl) return -ECONNREFUSED;
+  /* Register for readiness news before returning: a connection that becomes
+   * readable between open() and the first wait must not be missed. */
+  if (s->ops->bind) s->ops->bind(s->impl, sock_ready_cb, s);
   s->seq++;
   return 0;
 }
@@ -300,9 +308,10 @@ int sock_live(void) {
 /* A space that owned endpoints has just been torn down. Every one of them must
  * be gone: a socket outliving the process that held it is a leak with a
  * connection attached, and it would keep receiving segments for nobody. */
-void sock_report_after_space(int had) {
+void sock_report_after_space(int had, int live_before) {
   if (!had) return;
   int live = sock_live();
+  int want = live_before - had;
   char d[8];
   int o = 0;
   if (live == 0) d[o++] = '0';
@@ -310,8 +319,16 @@ void sock_report_after_space(int had) {
   for (int i = 0; i < o / 2; i++) { char c = d[i]; d[i] = d[o - 1 - i]; d[o - 1 - i] = c; }
   d[o] = 0;
 
-  serial_puts(live ? "[sock] FAILED: endpoints outlived the space that owned them: live "
-                   : "[sock] ok   every endpoint died with its space (live ");
+  serial_puts(live != want ? "[sock] FAILED: endpoints outlived the space that owned them: live "
+                           : "[sock] ok   every endpoint died with its space (live ");
   serial_puts(d);
-  serial_puts(live ? "\n" : ")\n");
+  if (live != want) {
+    char w[8]; int n = 0;
+    if (!want) w[n++] = '0';
+    for (int v = want, i = 0; v > 0 && i < 6; i++) { w[n++] = (char)('0' + v % 10); v /= 10; }
+    for (int i = 0; i < n / 2; i++) { char c = w[i]; w[i] = w[n - 1 - i]; w[n - 1 - i] = c; }
+    serial_puts(", expected ");
+    serial_puts(w);
+  }
+  serial_puts(live != want ? "\n" : ")\n");
 }

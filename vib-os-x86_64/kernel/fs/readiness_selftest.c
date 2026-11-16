@@ -29,6 +29,10 @@ typedef struct {
   int  destroyed;
   int  calls;             /* poll() invocations, for "becomes ready on call N" */
   int  ready_after;       /* 0 = never; else poll() reports POLLIN from call N */
+  int  eof;               /* the stream ended: recv reports the close */
+  void (*cb)(void *, unsigned);   /* what the socket bound us to */
+  void *ctx;
+  int  binds;
   char rd[32];
 } fake_t;
 
@@ -40,13 +44,18 @@ static void *fk_open(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t port) {
   return &fk;
 }
 static int fk_send(void *h, const void *buf, int len) { (void)h; (void)buf; return len; }
+/* The three outcomes the socket layer distinguishes, kept distinct here: bytes,
+ * 0 for "nothing now, ask again" (would block), and -1 for the peer closing. A
+ * fake that conflates the last two cannot test a read that waits. */
 static int fk_recv(void *h, void *buf, int max, int timeout_ms) {
   (void)h; (void)timeout_ms;
-  if (!fk.rd_len) return -1;                 /* peer closed: EOF */
-  int n = fk.rd_len < max ? fk.rd_len : max;
-  memcpy(buf, fk.rd, (size_t)n);
-  fk.rd_len -= n;
-  return n;
+  if (fk.rd_len > 0) {
+    int n = fk.rd_len < max ? fk.rd_len : max;
+    memcpy(buf, fk.rd, (size_t)n);
+    fk.rd_len -= n;
+    return n;
+  }
+  return fk.eof ? -1 : 0;
 }
 static void fk_close(void *h) { (void)h; fk.destroyed++; fk.open = 0; }
 static unsigned fk_poll(void *h) {
@@ -59,15 +68,25 @@ static unsigned fk_poll(void *h) {
   return r;
 }
 
+/* A backend that never takes the callback cannot wake anybody, and no amount of
+ * correct waiting helps: the reader would sit until its deadline every time. So
+ * the fake remembers who bound to it, and the test reports through that. */
+static void fk_bind(void *h, void (*cb)(void *, unsigned), void *ctx) {
+  (void)h;
+  fk.cb = cb;
+  fk.ctx = ctx;
+  fk.binds++;
+}
+
 static const struct socket_ops fk_ops = {
   .name = "readiness-fake",
   .open = fk_open, .send = fk_send, .recv = fk_recv,
-  .close = fk_close, .poll = fk_poll,
+  .close = fk_close, .poll = fk_poll, .bind = fk_bind,
 };
 
 /* ---- one worker, driven by commands -------------------------------------- */
 
-enum { C_IDLE = 0, C_WAIT, C_REGISTER_THEN_DIE };
+enum { C_IDLE = 0, C_WAIT, C_REGISTER_THEN_DIE, C_READ };
 
 static volatile int  w_cmd, w_done, w_bits, w_bytes, w_timed_out;
 static struct socket *w_sock;
@@ -76,6 +95,12 @@ static unsigned      w_want;
 static uint64_t      w_deadline;
 
 static const uint8_t noip[4] = { 0, 0, 0, 0 };
+
+/* For the read-path checks: the worker needs a descriptor table and a buffer. */
+static fdtable_t *wt;
+static int        wfd;
+static uint64_t   wlen;
+static char       wbuf[64];
 
 static void rd_worker(void) {
   for (;;) {
@@ -89,6 +114,9 @@ static void rd_worker(void) {
         long n = sock_recv(w_sock, b, sizeof b, 50);
         w_bytes = (int)n;
       }
+    } else if (c == C_READ) {
+      w_timed_out = 0;
+      w_bits = (int)fd_read_ticks(wt, wfd, wbuf, wlen, 40);
     } else if (c == C_REGISTER_THEN_DIE) {
       /* Register, then die without clearing: the exit path must unlink it. */
       sock_waiter_add(w_sock);
@@ -157,6 +185,7 @@ static void fake_reset(void) {
   /* open: the transport exists, so POLLOUT and no POLLERR. Tests that need the
    * connection gone drive it through shutdown, not by lying about the backend. */
   fk.open = 1; fk.rd_len = 0; fk.destroyed = 0; fk.calls = 0; fk.ready_after = 0;
+  fk.eof = 0; fk.cb = 0; fk.ctx = 0; fk.binds = 0;
 }
 
 void sock_readiness_selftest(void) {
@@ -302,6 +331,65 @@ void sock_readiness_selftest(void) {
   chk("the next registration is refused", sock_waiter_add(c) == -ENOBUFS);
   chk("the refusal did not disturb the filled slots", sock_waiters_live(c) == SOCK_WAITERS);
   for (int i = 0; i < SOCK_WAITERS; i++) sock_waiter_clear(c, i);
+
+  /* 9. the read path itself: partial data returns at once, a would-block read
+   *    becomes a wait rather than an error, and EAGAIN never leaks out.
+   *
+   * The test above killed its worker on purpose, so this section needs one of
+   * its own - and that is worth stating, because a suite that silently inherits
+   * a dead helper reports "never ran" as "wrong answer". */
+  worker_id = task_spawn("rdy2", rd_worker);
+  chk("a second worker for the read path", worker_id >= 0);
+  fake_reset();
+  struct socket *r = sock_new();
+  int crc = sock_connect(r, 0, noip, 0);
+  chk("the socket bound its readiness callback", fk.binds == 1);
+  int rfd = fd_socket(t);
+  chk("a descriptor for the read path", rfd >= 0);
+  /* Probe the socket itself, before any descriptor or task is involved: -EAGAIN
+   * here means "open, connected to the backend, nothing buffered yet". */
+  int probe = (int)sock_recv(r, wbuf, 4, 0);
+  chk("a fresh connection reports would-block, not EOF", probe == -EAGAIN);
+  chk("and it connected", crc == 0);
+  ofile_t *ro = t->fd[rfd];
+  sock_close(ro->sock);
+  ro->sock = r;
+  wt = t; wfd = rfd; wlen = sizeof wbuf;
+
+  memcpy(fk.rd, "abc", 3); fk.rd_len = 3;
+  s0 = sock_stats_get();
+  run_worker(C_READ);
+  s1 = sock_stats_get();
+
+  chk("a partial read returns the bytes it has", w_bits == 3);
+  chk("and does not wait to fill the buffer", s1.blocks - s0.blocks == 0);
+
+  /* Nothing buffered and no EOF: the read must park, not fail. */
+  fk.rd_len = 0;
+  s0 = sock_stats_get();
+  w_done = 0; w_bits = -999; w_cmd = C_READ;
+  wait_ticks(2);
+  chk("an empty stream parks the reader", sock_waiters_live(r) == 1);
+  memcpy(fk.rd, "later!", 6); fk.rd_len = 6;
+  /* Report through the bound callback, not by calling sock_notify directly:
+   * the wire from backend to waiter is the thing that was missing. */
+  fk.cb(fk.ctx, OMI_POLLIN);
+  wait_done();
+  s1 = sock_stats_get();
+  chk("the backend's report woke the reader", w_bits == 6);
+  chk("and it waited exactly once", s1.blocks - s0.blocks == 1);
+
+  /* EOF is a result, not a wait. */
+  fk.rd_len = 0; fk.eof = 1;
+  run_worker(C_READ);
+  chk("eof reads as zero bytes", w_bits == 0);
+
+  /* And a genuine expiry still reports EAGAIN, because that one is the caller's. */
+  fk.eof = 0; fk.rd_len = 0;
+  run_worker(C_READ);
+  chk("a read that runs out of patience says EAGAIN", w_bits == -EAGAIN);
+
+  fd_close(t, rfd);
 
   /* Clean up: release everything the test created. */
   sock_close(first_sock);

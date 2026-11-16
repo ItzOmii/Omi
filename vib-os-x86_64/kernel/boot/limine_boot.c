@@ -498,6 +498,10 @@ void _start(void) {
    * receiving segments. */
   static const char *get5[] = { "httpget", "10.0.2.2", "8899", "/c.txt", "noclose" };
   ring3_spawn_elf_argv("httpget5", "httpget.elf", 5, get5);
+  /* poll() from ring 3: one descriptor that really waits, two watched by a single
+   * call, and readiness that stops being claimed once drained. */
+  static const char *pt[] = { "polltest", "10.0.2.2", "8899", "/hold.txt" };
+  ring3_spawn_elf_argv("polltest", "polltest.elf", 4, pt);
 
   serial_puts("Starting main loop...\n");
 

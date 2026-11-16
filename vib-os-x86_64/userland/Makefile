@@ -15,7 +15,7 @@ CFLAGS  := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector 
            -mno-red-zone -mcmodel=large -O2 -Wall -Wextra
 LDFLAGS := -nostdlib -static -z noexecstack --no-dynamic-linker
 
-PROGS := cat.elf httpget.elf
+PROGS := cat.elf httpget.elf polltest.elf
 
 all: $(PROGS)
 
@@ -26,6 +26,13 @@ cat.elf: cat.o start.o cat.ld
 httpget.elf: httpget.o start.o cat.ld
 	$(LD) $(LDFLAGS) -T cat.ld -o $@ httpget.o start.o
 	@echo "built $@"
+
+polltest.elf: polltest.o start.o cat.ld
+	$(LD) $(LDFLAGS) -T cat.ld -o $@ polltest.o start.o
+	@echo "built $@"
+
+polltest.o: polltest.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 httpget.o: httpget.c
 	$(CC) $(CFLAGS) -c -o $@ $<

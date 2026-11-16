@@ -361,6 +361,58 @@ Each maps to a test in §9 except 5 and 8, which need their own: a task killed
 while parked (assert the socket's slot is clear and no wake lands on the recycled
 id), and the all-blocked progress test.
 
+## 10b. Milestone 2: the syscall side, and two bugs it found
+
+Implemented on top of `d014993`, fake-backend tests kept green.
+
+**What was added.** `fd_read` now has a real wait: it pins the description for the
+whole operation, attempts the backend read with no patience, and only enters
+`sock_wait` on `-EAGAIN`. Positive is bytes, `0` is EOF, `-EAGAIN` means the
+deadline expired (the caller's own timeout), and every other negative propagates
+untouched - so `-EAGAIN` from the would-block attempt can never reach a caller as
+a read failure. Partial data returns immediately; the loop never waits to fill the
+requested buffer. `SYS_POLL` (33) takes `{int fd; uint16 events; uint16 revents}`,
+computes every descriptor's readiness, and paces on a tick rather than registering
+interest in several objects - `wait_obj` is one pointer, so a multi-object wait is
+a scheduler change, not a socket one. `polltest.elf` is the ring-3 caller.
+
+**Bug 1: the fake backend made the tests look finished.** With no way to say "no
+data yet, ask again", `fk_recv` returned `-1` (EOF) for an empty stream, so a read
+that should have parked returned 0 immediately. The fake now models the three
+outcomes separately - bytes, would-block, EOF - because a fake that conflates the
+last two cannot test a wait at all.
+
+**Bug 2: nothing ever notified the socket.** `sock_notify` had exactly one caller:
+the test injector. The 32 milestone-1 checks passed because they called it by
+hand. Real traffic never did, so a parked reader could only be woken by its own
+deadline - measured, not theorised: a read that should have returned after the
+server's 2 s delay returned after 500 ticks (the whole belt). Fix: `socket_ops`
+gained `bind(handle, cb, ctx)`, the socket layer binds `sock_ready_cb`, and the
+TCP path reports readiness at four transitions (RST, handshake, data, FIN). The
+backend reports a mask and never learns what the ctx is; the layer above never
+learns what the handle is. The same read then returned at 204 ticks.
+
+**Bug 3: `revents` was written at offset +4.** That is `events`, so poll came back
+"ready, no bits" and the caller's `events` was silently destroyed. Fixed with
+`_Static_assert(offsetof(kpollfd_t, revents) == 6)`, and `polltest` now asserts the
+specific bits and that `events` survives the call.
+
+**Independent progress.** A task sleeping in a wait cannot drain the NIC for
+itself, and that stopped being theoretical the moment reads slept: the 8899
+clients timed out while the server's log showed the responses sent. `netpump` is
+now a kernel task that calls `tcp_service()` (one frame, then out) and sleeps a
+tick. Delivery no longer depends on what ring 3 is doing. Invariant 8 is still
+marked uncovered, for a narrower reason than before: the pump exists and is
+independent of application syscalls, but it is scheduled by the same cooperative
+scheduler, whose switch points are timer-driven deadline wakes and yield sites -
+a ring-3 process spinning without syscalls still delays it. Proving that needs a
+preemption experiment, not another socket test.
+
+**Verified:** `[rdy] 44/44` (12 read-path checks, including "the backend's report
+woke the reader"), `[sock] 22/22`, ISO/VFS 16/16, futex 3/3, `polltest` verdict 1
+(read waited 204 ticks; drained-but-connected reports 0; HUP appears and stays;
+two descriptors ready in one call), `FATAL 0`, no double close, no panic.
+
 ## 11. Still open
 
 - **Two readers on one socket.** Level-triggered wake-all permits it; concurrent

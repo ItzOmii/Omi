@@ -9,6 +9,8 @@
 #include "../include/omi_net.h"
 #include "../include/socket.h"
 #include "../include/net.h"
+#include "../include/task.h"
+#include "../include/readiness.h"
 
 extern void serial_puts(const char *s);
 
@@ -269,11 +271,45 @@ int fd_close(fdtable_t *t, int fd) {
 
 /* ------------------------------------------------------------------ io */
 
-long fd_read(fdtable_t *t, int fd, void *kbuf, uint64_t n) {
+/* A socket read waits on the SOCKET OBJECT, never on the descriptor number, and
+ * it pins the description for the whole operation - not just while registering.
+ * The pin is what makes the last fd_close safe: it stops new work and wakes us
+ * with POLLERR, but cannot free the transport while a call is in progress. A pin
+ * only for the registration would leave the loop below re-entering a freed
+ * socket after every wake.
+ *
+ * The read loop is level-triggered, so a wake is a hint: look again, and only
+ * the readiness bits decide. Every pass has a deadline, so a lost wake costs
+ * patience rather than the thread. */
+static long sock_read_wait(ofile_t *o, void *kbuf, uint64_t n, uint64_t ticks) {
+  if (o->closing) return -EBADF;
+  uint64_t end = task_total_ticks() + ticks;
+  long r = 0;
+
+  ofile_pin(o);
+  for (;;) {
+    r = sock_recv(o->sock, kbuf, n, 0);   /* one non-blocking attempt */
+    if (r != -EAGAIN) break;              /* bytes, EOF (0), or a hard error */
+
+    uint64_t now = task_total_ticks();
+    if (now >= end) { r = -EAGAIN; break; }
+
+    int w = sock_wait(o->sock, OMI_POLLIN | OMI_POLLERR | OMI_POLLHUP, end - now);
+    if (w < 0) { r = w; break; }          /* -EAGAIN deadline, -ENOBUFS, -EBADF */
+    if (w & OMI_POLLIN) continue;
+    if (w & OMI_POLLERR) { r = -ECONNRESET; break; }   /* closed, not finished */
+    if (w & OMI_POLLHUP) { r = 0; break; }             /* FIN, nothing buffered */
+    /* woken with no readiness bit set: level-triggered, so just look again */
+  }
+  ofile_unpin(o);
+  return r;
+}
+
+long fd_read_ticks(fdtable_t *t, int fd, void *kbuf, uint64_t n, uint64_t ticks) {
   if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
   ofile_t *o = t->fd[fd];
   if ((o->flags & 3) == O_WRONLY) return -EBADF;
-  if (o->kind == FK_SOCKET) return sock_recv(o->sock, kbuf, n, 5000);
+  if (o->kind == FK_SOCKET) return sock_read_wait(o, kbuf, n, ticks);
   if (o->kind == FK_CONSOLE) return 0;        /* no keyboard path yet: EOF */
   rfile_t *f = o->file;
   if (!f || !f->used) return -EBADF;
@@ -284,6 +320,11 @@ long fd_read(fdtable_t *t, int fd, void *kbuf, uint64_t n) {
   for (uint64_t i = 0; i < took; i++) d[i] = f->data[o->off + i];
   o->off += took;
   return (long)took;
+}
+
+/* The default patience keeps the old 5 s behaviour of a blocking socket read. */
+long fd_read(fdtable_t *t, int fd, void *kbuf, uint64_t n) {
+  return fd_read_ticks(t, fd, kbuf, n, 500);
 }
 
 long fd_write(fdtable_t *t, int fd, const void *kbuf, uint64_t n) {

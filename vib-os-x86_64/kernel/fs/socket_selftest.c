@@ -88,10 +88,17 @@ static unsigned tb_poll(void *h) {
   return OMI_POLLIN | OMI_POLLOUT;
 }
 
+/* The fake backend has nothing to report: its readiness only changes when the
+ * test changes it, and the test says so directly. The field still has to exist,
+ * and binding nothing is a valid answer - a backend is allowed to be silent. */
+static void tb_bind(void *h, void (*cb)(void *, unsigned), void *ctx) {
+  (void)h; (void)cb; (void)ctx;
+}
+
 static const struct socket_ops tb_ops = {
   .name = "test-deterministic",
   .open = tb_open, .send = tb_send, .recv = tb_recv,
-  .close = tb_close, .poll = tb_poll,
+  .close = tb_close, .poll = tb_poll, .bind = tb_bind,
 };
 
 /* ---- checks ------------------------------------------------------------ */

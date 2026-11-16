@@ -42,6 +42,12 @@ struct socket_ops {
    * room", "did it hang up" and "did it fail", and a backend that answers by IPC
    * can answer it from cached endpoint state without a round trip. */
   unsigned (*poll)(void *h);
+
+  /* Tell the backend where to send readiness news. The backend calls this
+   * callback whenever its endpoint state changes; it never learns what the
+   * ctx is, and the layer above never learns what the handle is. Without this,
+   * a waiter can only be woken by its own deadline - which is not a wake. */
+  void (*bind)(void *h, void (*cb)(void *, unsigned), void *ctx);
 };
 
 /* The backend in use. Never NULL once the kernel is up. */

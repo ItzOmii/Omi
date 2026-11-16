@@ -74,6 +74,7 @@
 #define SYS_SEND       30   /* (fd, buf, len) -> bytes | -EPIPE */
 #define SYS_RECV       31   /* (fd, buf, len) -> bytes | -EAGAIN (timeout) | 0 (EOF) */
 #define SYS_RESOLVE    32   /* (host, ip_out[4]) -> 0 | -ENOENT            */
+#define SYS_POLL       33   /* (fds, nfds, timeout_ms) -> ready count | -EAGAIN */
 
 /* the switch, the gates and the fault handler */
 void     ring3_init(void);
