@@ -97,9 +97,11 @@ kinds of region:
   multiple maps a page past EOF. Refusing that would refuse every library.
 - **`MAP_SHARED` over a file is `-ENOSYS`** - nothing can write a frame back into
   a boot module, and a shared mapping that is silently private is worse.
-- **`PROT_NONE` is not implemented** - reservations come back readable. `ld.so`
-  only uses them as placeholders it maps over, so nothing depends on it yet.
-  Recorded as a gap, not as a design.
+- **`PROT_NONE` was not implemented** at the time this step was written:
+  reservations came back readable. It is implemented now - the area carries the
+  Linux protection bits, a fault that the range does not allow is a violation
+  rather than a fill, and `[maptest]` checks both directions from a child
+  process, because the assertion is that the child dies.
 
 The test compares the same page fetched two ways, `read()` and the mapping, and
 requires the page to be non-zero, so a zero fill of the right length fails.
@@ -149,7 +151,10 @@ Each one was a real defect in earlier work, invisible until a libc ran:
 
 ### What is still not there
 
-- `PROT_NONE` is not implemented, so a reservation reads as readable memory.
+- A range painted `PROT_NONE` loses its bytes when it is made accessible again.
+  Linux preserves them; nothing here records a frame once its PTE is cleared, so
+  keeping the pages would leak every one of them. A guard is never taken back,
+  which is why this has not mattered yet - and it is a difference, not a plan.
 - The interpreter's base is a kernel constant; `dlopen` cannot choose it.
 - `execve` does not exist, so a program cannot start another program.
 - A library missing from the boot medium is the loader's error to report -

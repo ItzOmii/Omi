@@ -92,8 +92,10 @@ qemu-system-x86_64 -m 512 -cdrom omi.iso -boot d -vga std \
 - **No `exec` from a path.** Programs still start from the kernel's hardcoded spawn list, and one
   program cannot start another: there is no `execve`, so `ld.so` can load libraries but nothing can
   replace its own image with a new program.
-- **`PROT_NONE` and shared file mappings are missing.** A reservation comes back readable instead of
-  faulting, and `MAP_SHARED` over a file is `-ENOSYS`. Neither is on the path a loader takes.
+- **Shared file mappings are missing.** `MAP_SHARED` over a file is `-ENOSYS`: there is no write-back
+  path, so a shared mapping would be a lie about durability. `PROT_NONE` is implemented - a read of a
+  guard faults, and so does a store into a read-only page (`[maptest] OK 24/24`), with one difference
+  from Linux: the bytes under a no-access span are dropped rather than preserved.
 - **No microphone capture** on real hardware — no capture endpoint is exposed by most onboard HDA.
 - **The shell's apps are still kernel-resident windows**, as in upstream vib-OS. Programs run outside
   the kernel, but Calculator, Notepad, the browser and the file manager are structs and draw functions

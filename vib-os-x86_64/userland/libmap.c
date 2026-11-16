@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define LIB_PATH "/lib/libgreet.so"
@@ -127,13 +128,64 @@ int main(void) {
   check(bad == MAP_FAILED, "a shared file mapping is refused", bad == MAP_FAILED ? -1 : 0, -1);
   check(errno == ENOSYS, "  because nothing can write it back (ENOSYS)", errno, ENOSYS);
 
+  /* 6. PROT_NONE has to refuse. A reservation that can still be read is not a
+   * guard, and musl's allocator puts one in front of its heap precisely so that
+   * an overflow faults. The assertion is about a child dying, so it is made from
+   * a child: this process stays alive to prove the range comes back afterwards.
+   * The kernel kills a faulting task with 255 - there is no signal status yet, so
+   * "exited 255" is what a violation looks like here. */
+  unsigned char *g = mmap(0, PAGE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  check(g != MAP_FAILED, "reserve a page with PROT_NONE", g == MAP_FAILED ? -1 : 0, 0);
+  if (g != MAP_FAILED) {
+    pid_t kid = fork();
+    if (kid == 0) {
+      volatile unsigned char v = g[0];   /* the fault this test is about */
+      (void)v;
+      _exit(0);                          /* reached only if PROT_NONE let it */
+    }
+    int st = 0;
+    int reaped = kid > 0 ? (int)waitpid(kid, &st, 0) : -1;
+    int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    check(reaped == (int)kid && code == 255,
+          "a read of a PROT_NONE page kills the reader", code, 255);
+
+    int mp = mprotect(g, PAGE, PROT_READ | PROT_WRITE);
+    check(mp == 0, "mprotect gives a PROT_NONE range back", mp, 0);
+    if (mp == 0) {
+      g[0] = 7;
+      check(g[0] == 7, "and the page takes a write afterwards", g[0], 7);
+    }
+  }
+
+  /* 7. The same has to be true of a page that is present but read-only: a store
+   * into it is a violation, not a lazy copy. If the fork path granted the write,
+   * every read-only mapping would quietly be writable. */
+  unsigned char *ro = mmap(0, PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  check(ro != MAP_FAILED, "map a page PROT_READ", ro == MAP_FAILED ? -1 : 0, 0);
+  if (ro != MAP_FAILED) {
+    pid_t kid = fork();
+    if (kid == 0) {
+      ro[0] = 1;
+      _exit(0);
+    }
+    int st = 0;
+    int reaped = kid > 0 ? (int)waitpid(kid, &st, 0) : -1;
+    int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    check(reaped == (int)kid && code == 255,
+          "a write into a read-only page kills the writer", code, 255);
+    int mp = mprotect(ro, PAGE, PROT_READ | PROT_WRITE);
+    if (mp == 0) ro[0] = 9;
+    check(mp == 0 && ro[0] == 9, "and it was the protection, not the mapping", mp == 0 ? ro[0] : -1, 9);
+    munmap(ro, PAGE);
+  }
+
   munmap(p, PAGE);
 
   if (failures) {
     printf("[maptest] FAIL %d/%d\n", checks - failures, checks);
     return 1;
   }
-  printf("[maptest] OK %d/%d (file-backed MAP_PRIVATE, MAP_FIXED over a reservation, refusals)\n",
+  printf("[maptest] OK %d/%d (file-backed MAP_PRIVATE, MAP_FIXED, PROT_NONE guards, refusals)\n",
          checks, checks);
   return 0;
 }

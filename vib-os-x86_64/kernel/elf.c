@@ -208,6 +208,7 @@ static int area_reserve(mm_t *mm, uint64_t base, uint64_t len) {
     mm->areas[i].base = base;
     mm->areas[i].len = len;
     mm->areas[i].flags = RING3_P | RING3_W | RING3_U;
+    mm->areas[i].prot = 3;          /* an image is read and written */
     mm->areas[i].used = 1;
     mm->areas[i].src = 0;          /* not a file region: pages are already here */
     mm->areas[i].src_off = 0;

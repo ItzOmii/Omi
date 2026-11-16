@@ -53,7 +53,7 @@ swap to. Adding it belongs with SMP, not before.
 | 0,1 | read, write | the existing handlers |
 | 2,3,8 | open, close, lseek | `open`'s mode argument ignored |
 | 9,11 | mmap, munmap | anonymous, or file-backed `MAP_PRIVATE`; `MAP_FIXED` replaces exactly the range it names, splitting what it lands inside; `MAP_SHARED` over a file is `-ENOSYS` |
-| 10 | mprotect | closes a step-2 gap: area flags plus live PTEs |
+| 10 | mprotect | per-area `PROT_*` bits plus live PTEs; `PROT_NONE` releases the pages, and a range spanning several areas takes each area's intersection |
 | 12 | brk | one lazily-populated 16 MB area, pointer moved inside it |
 | 16 | ioctl | `TCGETS`/`TIOCGWINSZ` only |
 | 20 | writev | loops `write`; a partial write is a success |
@@ -377,7 +377,14 @@ reading `%fs:0`; unknown number `-ENOSYS`.
 
 Boot: `[linux3] 27/27 ok`, `[musl] OK`, `[threads] ... OK`, `[stat] OK` and `[fork] OK`, alongside `[pipe] 37/37`,
 `[pipe3] 30/30`, `[rdy] 56/56`, `vfs 16/16`, `futex 3/3`, `[rfs] module files exposed=21 skipped=0`
-with `[modtest] OK 15/15`, `[maptest] OK 17/17` (file-backed `mmap`, `MAP_FIXED` over a
-reservation, and the three refusals), `[dyntest] OK 14/14` (a PIE run through musl's `ld.so`, with a
-library mapped out of the boot medium), no panic, no "killed user task" beyond the isolation probe
-that asks for it.
+with `[modtest] OK 15/15`, `[maptest] OK 24/24` (file-backed `mmap`, `MAP_FIXED` over a
+reservation, a `PROT_NONE` page that kills the child that reads it, a store into a read-only page
+that kills the child that writes it, and the three refusals), `[dyntest] OK 14/14` (a PIE run through
+musl's `ld.so`, with a library mapped out of the boot medium), no panic, no "killed user task" beyond
+the isolation probe that asks for it.
+
+Protection is checked before a page is filled: a fault the range does not allow is a violation, not a
+demand to page in. On x86 there is no write-only page, so `PROT_WRITE` implies read, as it does under
+Linux. One difference worth knowing: a range painted `PROT_NONE` drops its bytes, so making it
+accessible again gives zeroes. Linux preserves them. Nothing here records a frame after its PTE is
+cleared, so the alternative was leaking every page behind a guard nobody lifts.

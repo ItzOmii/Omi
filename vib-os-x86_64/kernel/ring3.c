@@ -576,7 +576,7 @@ int ring3_make_stack(uint64_t cr3) {
 /* Fill in one page of a region on its first touch. Returns 1 when the page
  * appeared (the faulting instruction can simply be retried), 0 when the address
  * is not part of any region and the fault is therefore real. */
-static int vm_fault_in(uint64_t addr) {
+static int vm_fault_in(uint64_t addr, int err) {
   task_t *t = task_at(task_current());
   if (!t || !t->mm) return 0;
   uint64_t page = addr & ~0xFFFULL;
@@ -584,6 +584,15 @@ static int vm_fault_in(uint64_t addr) {
     vm_area_t *a = &t->mm->areas[i];
     if (!a->used) continue;
     if (page < a->base || page >= a->base + a->len) continue;
+    /* What the fault was asking for decides whether the range may give it. A
+     * page inside a PROT_NONE area is not waiting to be paged in, it is refusing
+     * to be touched - musl's allocator puts one in front of its heap so that an
+     * overflow faults instead of quietly eating the page after it. */
+    /* x86 has no write-only page, so PROT_WRITE implies read - which is why
+     * mmap(PROT_WRITE) is readable under Linux. Only a store demands the write
+     * bit; a read is satisfied by read or write. */
+    int ok = (err & 2) ? (a->prot & 2) : ((err & 16) ? (a->prot & 4) : (a->prot & 3));
+    if (!ok) return 0;
     /* A file region's page is filled from the blob, not left zero. The last page
      * of a mapping may start before EOF and end after it - that is how ld.so
      * maps a segment whose size is not a page multiple, and the tail is meant to
@@ -628,6 +637,7 @@ static long sys_vm_alloc(uint64_t len, uint64_t prot) {
   mm->areas[slot].base = base;
   mm->areas[slot].len = len;
   mm->areas[slot].flags = flags;
+  mm->areas[slot].prot = (uint8_t)(prot & 7);
   mm->areas[slot].used = 1;
   /* A reused slot may have described a file region before; anonymous means no
    * source, and a stale pointer here would fill this heap with a library's
@@ -735,6 +745,7 @@ static long sys_thread_create(uint64_t entry, uint64_t arg, uint64_t stack_bytes
   mm->areas[slot].base = base;
   mm->areas[slot].len = stack_bytes;
   mm->areas[slot].flags = PTE_P | PTE_W | PTE_U;
+  mm->areas[slot].prot = 3;            /* a stack is read and written */
   mm->areas[slot].used = 1;
   mm->areas[slot].src = 0;             /* a stack is not a file */
   mm->areas[slot].src_off = 0;
@@ -843,9 +854,30 @@ static int cow_unshare_page(uint64_t va) {
  * again, now against a frame nobody else maps. That the retry *works* is checked
  * by the same address not faulting twice - which is what the repeat line below
  * exists to catch. */
+/* The area a page belongs to, or NULL. Every fault asks this first: whether an
+ * address may be filled, copied or refused is a property of its area, and the
+ * page tables only ever describe what is there now. */
+static vm_area_t *vm_area_of(mm_t *mm, uint64_t page) {
+  for (int i = 0; i < TASK_AREAS; i++) {
+    vm_area_t *a = &mm->areas[i];
+    if (a->used && page >= a->base && page < a->base + a->len) return a;
+  }
+  return 0;
+}
+
 static int cow_fault(uint64_t va) {
   task_t *me = task_at(task_current());
   if (!me) return 0;
+  /* A store into a range mapped without write permission is a violation, not a
+   * copy: granting it would make the mapping's protection a suggestion. This is
+   * the path that catches a write to PROT_READ and to PROT_NONE alike.
+   *
+   * Areas describe ranges that are filled lazily. Pages the kernel mapped
+   * directly - the initial stack, an image's segments - have no area and carry
+   * their permissions in the PTE from the moment they appear, so a missing area
+   * is not a violation: refusing here would kill a task for a bookkeeping gap. */
+  vm_area_t *area = vm_area_of(me->mm, va & ~0xFFFULL);
+  if (area && !(area->prot & 2)) return 0;
   /* A genuine repeat: the same store faulting twice with no fork in between. A
    * fault at an address this task already unshared *after* another fork is the
    * mechanism working, not failing - the new fork re-protected the page. */
@@ -1214,7 +1246,7 @@ static int user_prep(uint64_t uptr, uint64_t n) {
   if (n == 0) return 0;
   if (uptr < RING3_USER_MIN || uptr + n > RING3_LIMIT) return -1;
   for (uint64_t page = uptr & ~0xFFFULL; page < uptr + n; page += 0x1000)
-    if (!user_page_present(page) && !vm_fault_in(page)) return -1;
+    if (!user_page_present(page) && !vm_fault_in(page, 0)) return -1;
   return 0;
 }
 
@@ -1228,7 +1260,7 @@ static long user_string(char *dst, uint64_t src, int max) {
     if (a >= RING3_LIMIT) break;
     if (i == 0 || (a & 0xFFF) == 0) {
       uint64_t page = a & ~0xFFFULL;
-      if (!user_page_present(page) && !vm_fault_in(page)) return -1;
+      if (!user_page_present(page) && !vm_fault_in(page, 0)) return -1;
     }
     if (user_copy(dst + i, a, 1) != 0) return -1;
     if (dst[i] == 0) return i;
@@ -1748,6 +1780,7 @@ static long linux_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t lfla
   a->base = base;
   a->len = len;
   a->flags = pte;
+  a->prot = (uint8_t)(prot & 7);
   a->used = 1;
   a->src = src;
   a->src_off = 0;
@@ -1780,31 +1813,48 @@ static long linux_mprotect(uint64_t addr, uint64_t len, uint64_t prot) {
   task_t *t = task_at(task_current());
   if (!t || !t->mm || !len) return -EINVAL;
   uint64_t base = addr & ~0xFFFULL;
-  len = (len + 0xFFF) & ~0xFFFULL;
+  uint64_t end = (addr + len + 0xFFF) & ~0xFFFULL;
   int hit = 0;
   for (int i = 0; i < TASK_AREAS; i++) {
     vm_area_t *a = &t->mm->areas[i];
     if (!a->used) continue;
-    if (base < a->base || base + len > a->base + a->len) continue;
+    /* A range may cross several areas - a loader protecting a whole library in
+     * one call does exactly that - so each area takes its own intersection. */
+    uint64_t lo = base > a->base ? base : a->base;
+    uint64_t hi = end < a->base + a->len ? end : a->base + a->len;
+    if (lo >= hi) continue;
     hit = 1;
+    a->prot = (uint8_t)(prot & 7);
     if (prot & 2) a->flags |= PTE_W;
     else          a->flags &= ~PTE_W;
-    for (uint64_t off = 0; off < len; off += 4096) {
-      uint64_t *pt = walk_user(t->cr3, base + off);
+
+    /* No access at all: the pages go. Nothing records a frame once its PTE is
+     * cleared, so keeping them would leak every one of them, and a guard page is
+     * the one mapping nobody ever takes back. Linux does preserve the bytes
+     * across a no-access span, and this does not; that difference is written
+     * down in docs/linux-abi.md rather than papered over. */
+    if (!(prot & 7)) {
+      uint64_t kept = 0;
+      vm_release_range(t, lo, hi - lo, &kept);
+      continue;
+    }
+
+    for (uint64_t p = lo; p < hi; p += 4096) {
+      uint64_t *pt = walk_user(t->cr3, p);
       if (!pt) continue;
-      int idx = (int)(((base + off) >> 12) & 511);
+      int idx = (int)((p >> 12) & 511);
       if (!(pt[idx] & PTE_P)) continue;
       if (prot & 2) {
         /* Turning a page writable while another space maps the same frame is a
          * fork waiting to corrupt itself: take the copy here, not at the store. */
         uint64_t phys = pt[idx] & ~0xFFFULL;
         if (!(pt[idx] & PTE_SHARED) && cow_amount(phys) > 1 &&
-            !cow_unshare_page(base + off)) continue;
+            !cow_unshare_page(p)) continue;
         pt[idx] |= PTE_W;
-        flush_page(base + off);
+        flush_page(p);
       } else {
         pt[idx] &= ~PTE_W;
-        flush_page(base + off);
+        flush_page(p);
       }
     }
   }
@@ -2458,7 +2508,7 @@ void ring3_fault(uint64_t *f) {
      * what it lacks is permission, and permission is ours to grant. */
     if ((err & 1) && (err & 2) && cow_fault(cr2 & ~0xFFFULL)) return;
 
-    if (!(err & 1) && vm_fault_in(cr2)) {
+    if (!(err & 1) && vm_fault_in(cr2, err)) {
       static int shown;
       if (shown < 4) {                 /* a few, then stay quiet */
         shown++;

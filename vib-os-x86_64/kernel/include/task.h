@@ -43,6 +43,10 @@ enum { TASK_FREE = 0, TASK_READY = 1, TASK_RUN = 2, TASK_DEAD = 3, TASK_BLOCKED 
 typedef struct {
   uint64_t base, len;   /* byte range, page-aligned */
   uint64_t flags;       /* PTE flags for the pages that appear */
+  /* Linux PROT_* bits (1 read, 2 write, 4 exec), 0 meaning no access at all.
+   * Kept separately from the PTE flags because a range can be reserved with no
+   * permission yet - PROT_NONE has to be a real refusal at fault time, not just
+   * an absence of the write bit, or a guard page guards nothing. */
   int      used;
   /* File-backed regions (mmap of a boot module). `src` is the blob and
    * `src_off` is where this region starts inside it; pages are filled from
@@ -50,6 +54,7 @@ typedef struct {
    * The blob is bootloader memory owned by nobody, so a file region is copied
    * into frames rather than pointing at it: every frame then belongs to the
    * ordinary allocator and releases through cow_release like any other. */
+  uint8_t  prot;
   const uint8_t *src;
   uint32_t src_off;     /* offset of base inside the blob */
   uint32_t src_len;     /* blob bytes from src_off to EOF */
