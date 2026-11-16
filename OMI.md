@@ -89,6 +89,10 @@ qemu-system-x86_64 -m 512 -cdrom omi.iso -boot d -vga std \
 
 ## What does not work yet
 
+- **No edge-triggered readiness.** `epoll` exists - `epoll_create1`/`ctl`/`wait`, level-triggered,
+  with `EPOLLONESHOT` honoured - but `EPOLLET` is refused with `-EINVAL` instead of being quietly
+  served as level. A wait also costs the size of the set rather than the number ready, because it asks
+  every member through the same readiness check `poll` uses; there is no event queue behind it.
 - **Nothing can ask for a program to be run.** `execve` works - a program replaces its own image,
   with argv arriving in the new space and its descriptors carried across, and a PIE can be the target
   so the path runs through `ld.so` as well (`[exectest] OK 7/7`). What is missing is the caller: there

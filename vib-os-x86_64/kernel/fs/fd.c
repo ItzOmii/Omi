@@ -4,6 +4,7 @@
  * ring3.c before the bytes get this far. */
 
 #include "../include/fd.h"
+#include "../include/epoll.h"
 #include "../include/errno.h"
 #include "../include/kmalloc.h"
 #include "../include/omi_net.h"
@@ -146,6 +147,7 @@ static void ofile_destroy(ofile_t *o) {
   /* One ofile is one holder of one end. Two dup'd descriptors are still one
    * ofile, so the pipe's counts already say the right thing. */
   if (o->kind == FK_PIPE && o->pipe) pipe_unref(o->pipe, (o->flags & 3) == O_WRONLY);
+  if (o->kind == FK_EPOLL && o->ep) epoll_free(o->ep);
   zero(o, sizeof *o);
 }
 
@@ -291,6 +293,19 @@ int fd_socket(fdtable_t *t) {
   return fd;
 }
 
+int fd_epoll(fdtable_t *t) {
+  if (!t) return -EMFILE;
+  ofile_t *o = ofile_get();
+  if (!o) return -EMFILE;
+  o->kind = FK_EPOLL;
+  o->flags = O_RDWR;
+  o->ep = epoll_new();
+  if (!o->ep) { ofile_put(o); return -EMFILE; }
+  int fd = fd_alloc(t, o);
+  if (fd < 0) { ofile_put(o); return fd; }
+  return fd;
+}
+
 /* Both ends at once, because a pipe with one end is not a thing a program can
  * use: the pair is the object. pipe_new() hands them over already held (1/1), so
  * the two ofiles below inherit those counts rather than adding to them - and if
@@ -336,6 +351,7 @@ unsigned fd_poll(fdtable_t *t, int fd) {
   if (o->kind == FK_SOCKET)  return sock_poll(o->sock);
   if (o->kind == FK_PIPE)    return pipe_poll(o->pipe, (o->flags & 3) == O_WRONLY);
   if (o->kind == FK_FILE)    return OMI_POLLIN | OMI_POLLOUT;
+  if (o->kind == FK_EPOLL)   return epoll_any_ready(o->ep, t) ? OMI_POLLIN : 0;
   if (o->kind == FK_CONSOLE) return 0;      /* no keyboard path yet */
   return OMI_POLLERR;
 }

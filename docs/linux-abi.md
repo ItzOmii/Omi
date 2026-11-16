@@ -58,6 +58,7 @@ swap to. Adding it belongs with SMP, not before.
 | 16 | ioctl | `TCGETS`/`TIOCGWINSZ` only |
 | 20 | writev | loops `write`; a partial write is a success |
 | 22 | pipe | the step-4 pipe |
+| 35,230 | nanosleep, clock_nanosleep | a deadline in ticks; a request shorter than one tick still yields; `TIMER_ABSTIME` against `CLOCK_REALTIME`/`CLOCK_MONOTONIC`; no `-EINTR`, because nothing delivers a signal |
 | 39,186,218 | getpid, gettid, set_tid_address | the task id |
 | 56,57 | clone, fork | `fork` ignores the flags it cannot honour; a thread shares the table |
 | 59 | execve | replaces image, stack, areas and CR3; descriptors and pid stay; `envp` ignored; refused when the space is shared with a thread |
@@ -67,6 +68,7 @@ swap to. Adding it belongs with SMP, not before.
 | 102..110 | getuid/getgid/euid/egid/getppid | zero |
 | 158 | arch_prctl | `ARCH_SET_FS` / `ARCH_GET_FS` |
 | 202 | futex | Linux op numbers, timespec converted to ticks |
+| 232,233,291 | epoll_wait, epoll_ctl, epoll_create1 | a kept set of descriptors, reported level-triggered; `EPOLLONESHOT` removes the entry after it is reported; `EPOLLET` is `-EINVAL`; `EPOLL_CLOEXEC` accepted and ignored |
 
 Everything else returns `-ENOSYS` and is logged once per number. Logging once
 matters: a libc probing for a syscall in a loop would otherwise fill the serial
@@ -379,15 +381,30 @@ span; `mmap`/`munmap` writable end to end; `arch_prctl(SET_FS)` verified by
 reading `%fs:0`; unknown number `-ENOSYS`.
 
 Boot: `[linux3] 27/27 ok`, `[musl] OK`, `[threads] ... OK`, `[stat] OK` and `[fork] OK`, alongside `[pipe] 37/37`,
-`[pipe3] 30/30`, `[rdy] 56/56`, `vfs 16/16`, `futex 3/3`, `[rfs] module files exposed=23 skipped=0`
+`[pipe3] 30/30`, `[rdy] 56/56`, `vfs 16/16`, `futex 3/3`, `[rfs] module files exposed=24 skipped=0`
 with `[modtest] OK 15/15`, `[maptest] OK 24/24` (file-backed `mmap`, `MAP_FIXED` over a
 reservation, a `PROT_NONE` page that kills the child that reads it, a store into a read-only page
 that kills the child that writes it, and the three refusals), `[dyntest] OK 14/14` **twice** (a PIE run
 through musl's `ld.so` with a library mapped out of the boot medium - once from the spawn list, once as
 the target of an `execve`), `[exectest] OK 7/7` (a refused name leaves the caller running, a child
 becomes another program with its argv and inherited descriptor intact, a PIE can be the target, and the
-parent's own page survives its child's exec), no panic, no "killed user task" beyond the isolation
-probe that asks for it.
+parent's own page survives its child's exec), `[epolltest] OK 24/24` (registration, `EEXIST` on a
+second `ADD`, level triggering, the value handed back per member, `EPOLLHUP` from a closed peer
+without asking for it, `EPOLLONESHOT` reporting once, a wait that really blocks until a child writes
+200 ms later, a timeout that is a deadline, `EPOLLET` refused, a closed instance returning
+`EBADF`), no panic, no "killed user task" beyond the isolation probe that asks for it.
+
+`epoll` is poll with the set kept. There is no event queue and no tree: a wait asks every member
+through the same `fd_poll()` that `poll()` uses, so the cost is the size of the set, not the number
+ready, and that is what the code does rather than what the name promises. What registration buys is
+what an event loop needs - build the set once instead of rebuilding it every iteration. Edge
+triggering is refused (`-EINVAL`) rather than served as level, because a program that asked for edges
+and got levels re-arms nothing and spins, and the resulting stall would look like a kernel fault.
+
+`nanosleep` (35) and `clock_nanosleep` (230) arrived because a test failed: `[epolltest]` gave a child
+200 ms to write and the child wrote at once, because `nanosleep` was `-ENOSYS` and every `sleep()` in
+this system had been returning immediately. The check now asserts the sleep itself (measured >= 180 ms
+for a 200 ms request), so a stub cannot come back quietly.
 
 `execve` (59) replaces the process: image, stack, areas and the page-table root, while the descriptor
 table and the pid stay. The old space is not freed in place - the call is running on its kernel stack -

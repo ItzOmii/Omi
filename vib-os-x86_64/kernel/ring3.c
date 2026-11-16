@@ -22,6 +22,7 @@
 #include "include/pmm.h"
 #include "include/errno.h"
 #include "include/elf.h"   /* elf_prepare_image: the load half of execve */
+#include "include/epoll.h"  /* registration sets: the ABI epoll_ctl and friends speak */
 #include "include/kmalloc.h"
 #include "include/net.h"
 #include "include/omi_net.h"
@@ -1394,6 +1395,136 @@ static long sys_poll(uint64_t fds_u, uint64_t nfds, uint64_t timeout_ms) {
   }
 }
 
+/* A sleep, which this system did not have: nanosleep returned -ENOSYS, so every
+ * sleep() and usleep() in a program returned at once and the program went on to
+ * spin. It was found by a test that expected a child to be late and found it
+ * early - the failing check was measuring a sleep that never happened.
+ *
+ * The wake-up is a deadline in ticks, and the loop re-sleeps if something else
+ * woke the task first. There are no signals here, so there is no interrupted case
+ * to report: -EINTR would name an event that cannot occur.
+ */
+static long sleep_ticks_for(uint64_t nsec) {
+  uint64_t ticks = nsec / (1000000000ull / TASK_TICK_HZ);
+  if (!ticks) ticks = 1;   /* shorter than a tick still yields, or 1ns in a loop is a spin */
+  uint64_t deadline = task_total_ticks() + ticks;
+  while (task_total_ticks() < deadline) {
+    task_sleep_ticks(deadline - task_total_ticks());
+  }
+  return 0;
+}
+
+static long linux_nanosleep(uint64_t req_u, uint64_t rem_u) {
+  if (user_prep(req_u, 16) != 0) return -EFAULT;
+  int64_t tv[2];
+  if (user_copy((char *)tv, req_u, sizeof tv) != 0) return -EFAULT;
+  if (tv[0] < 0 || tv[1] < 0 || tv[1] >= 1000000000) return -EINVAL;
+  uint64_t nsec = (uint64_t)tv[0] * 1000000000ull + (uint64_t)tv[1];
+  long rc = sleep_ticks_for(nsec);
+  if (rc == 0 && rem_u) {
+    /* Nothing was left over, because the loop above runs to the deadline. */
+    int64_t zero[2] = { 0, 0 };
+    if (user_prep(rem_u, 16) == 0) user_put(rem_u, zero, sizeof zero);
+  }
+  return rc;
+}
+
+/* clock_nanosleep(230): the same wait, with the two clocks a program actually
+ * passes and one difference in the arguments - an absolute deadline rather than a
+ * duration. Other clock ids are refused rather than treated as 0, because a
+ * program asking for a clock this kernel does not keep deserves to hear no. */
+static long linux_clock_nanosleep(uint64_t clk, uint64_t flags, uint64_t req_u, uint64_t rem_u) {
+  if (clk != 0 && clk != 1) return -EINVAL;        /* CLOCK_REALTIME, CLOCK_MONOTONIC */
+  if (flags & ~1ull) return -EINVAL;               /* TIMER_ABSTIME is the only flag */
+  if (!(flags & 1)) return linux_nanosleep(req_u, rem_u);
+  if (user_prep(req_u, 16) != 0) return -EFAULT;
+  int64_t tv[2];
+  if (user_copy((char *)tv, req_u, sizeof tv) != 0) return -EFAULT;
+  if (tv[0] < 0 || tv[1] < 0 || tv[1] >= 1000000000) return -EINVAL;
+  /* The same conversion linux_clock_gettime does, done locally: that function
+   * writes to a *user* pointer, and handing it a kernel address would be a way to
+   * make the kernel write where the program said rather than where it meant. */
+  uint64_t ticks = task_total_ticks();
+  int64_t want = tv[0] * 1000000000ll + tv[1];
+  int64_t have = (int64_t)(ticks / TASK_TICK_HZ) * 1000000000ll +
+                 (int64_t)((ticks % TASK_TICK_HZ) * (1000000000 / TASK_TICK_HZ));
+  if (want <= have) return 0;
+  (void)rem_u;   /* an absolute sleep has no remainder to report */
+  return sleep_ticks_for((uint64_t)(want - have));
+}
+
+/* ============================================================ epoll (roadmap 8)
+ *
+ * epoll is poll with the set kept. The wait below is the same readiness loop
+ * sys_poll runs - ask each descriptor, sleep a tick, look again - so its cost is
+ * the set size, not the number ready. What it buys a program is the thing poll
+ * cannot give it: a set that outlives the call, so an event loop is built once
+ * instead of rebuilt on every iteration.
+ *
+ * Edge triggering is refused in the kernel (see epoll.c). EPOLL_CLOEXEC is
+ * accepted and ignored: nothing here is marked close-on-exec, and honouring the
+ * flag for this one call would describe an inheritance rule the rest of the
+ * system does not have.
+ */
+static long sys_epoll_create1(uint64_t flags) {
+  fdtable_t *t = current_fds();
+  if (!t) return -EBADF;
+  (void)flags;
+  return fd_epoll(t);
+}
+
+static long sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fdn, uint64_t ev_u) {
+  fdtable_t *t = current_fds();
+  if (!t) return -EBADF;
+  if (epfd >= FD_MAX || !t->fd[epfd]) return -EBADF;
+  ofile_t *o = t->fd[epfd];
+  if (o->kind != FK_EPOLL || !o->ep) return -EINVAL;
+
+  uint32_t events = 0;
+  uint64_t data = 0;
+  if (op != EPOLL_CTL_DEL) {
+    /* struct epoll_event is *packed* on x86-64: four bytes of bits, then eight of
+     * data at offset 4. Copying it as a struct would insert the padding the ABI
+     * does not have and read the program's data from the wrong place. */
+    if (user_copy(&events, ev_u, 4) != 0) return -EFAULT;
+    if (user_copy(&data, ev_u + 4, 8) != 0) return -EFAULT;
+    if (fdn >= FD_MAX || !t->fd[fdn]) return -EBADF;
+  }
+  return epoll_ctl(o->ep, (int)op, (int)fdn, events, data);
+}
+
+static long sys_epoll_wait(uint64_t epfd, uint64_t ev_u, uint64_t maxevents, uint64_t timeout_ms) {
+  fdtable_t *t = current_fds();
+  if (!t) return -EBADF;
+  if (epfd >= FD_MAX || !t->fd[epfd]) return -EBADF;
+  ofile_t *o = t->fd[epfd];
+  if (o->kind != FK_EPOLL || !o->ep) return -EINVAL;
+  if (maxevents == 0 || maxevents > EPOLL_MAX) return -EINVAL;
+  if (user_prep(ev_u, maxevents * 12) != 0) return -EFAULT;
+
+  /* A negative timeout means wait forever, which is how an event loop spends
+   * almost all of its life; the unsigned argument arrives sign-extended. */
+  int forever = (int64_t)timeout_ms < 0;
+  uint64_t end = task_total_ticks() + (timeout_ms + 9) / 10;
+
+  epitem_t got[EPOLL_MAX];
+  for (;;) {
+    int n = epoll_ready(o->ep, t, got, (int)maxevents);
+    if (n > 0 || (!forever && task_total_ticks() >= end)) {
+      for (int i = 0; i < n; i++) {
+        /* Packed, twelve bytes per event: bits at +0, data at +4. */
+        if (user_put(ev_u + (uint64_t)i * 12, &got[i].events, 4) != 0) return -EFAULT;
+        if (user_put(ev_u + (uint64_t)i * 12 + 4, &got[i].data, 8) != 0) return -EFAULT;
+        /* After the report, never during the scan: a one-shot registration is
+         * removed once it has been handed over, so the next wait does not see it. */
+        epoll_drop_oneshot(o->ep, got[i].fd);
+      }
+      return n;
+    }
+    task_sleep_ticks(1);
+  }
+}
+
 /* Defined with the mmap path below; sys_open sits above it and needs them. */
 extern int r3_dyn_trace;
 extern int r3_dyn_trace_pid;
@@ -2253,6 +2384,11 @@ static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, 
     case 56:  return sys_clone(a0, a1, a2, a3);             /* clone / fork */
     case 57:  return sys_fork();                            /* fork */
     case 59:  return linux_execve(a0, a1, a2);              /* execve */
+    case 35:  return linux_nanosleep(a0, a1);               /* nanosleep */
+    case 230: return linux_clock_nanosleep(a0, a1, a2, a3); /* clock_nanosleep */
+    case 232: return sys_epoll_wait(a0, a1, a2, a3);        /* epoll_wait */
+    case 233: return sys_epoll_ctl(a0, a1, a2, a3);         /* epoll_ctl */
+    case 291: return sys_epoll_create1(a0);                 /* epoll_create1 */
     case 61:  return linux_wait4((int)a0, a1, (int)a2, a3); /* wait4 */
     case 39:  return (long)task_current();                 /* getpid */
     case 60:  r3_exit_now(a0); return 0;                   /* exit */

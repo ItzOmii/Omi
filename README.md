@@ -39,6 +39,7 @@ object runs under musl's own `ld.so` - the kernel loads two images and hands ove
 | Boot modules openable as files, file-backed `mmap` | **done** |
 | Dynamic linking: `ld.so`, `PT_INTERP`, `ET_DYN` | **done** |
 | `execve`: a program replaces its own image, argv and descriptors intact | **done** |
+| `epoll`: a kept set of descriptors, and `nanosleep` for a program that waits | **done** |
 | TCP teardown (FIN/RST/`TIME_WAIT`), retransmission | not yet |
 | UDP sockets, `bind`/`listen`/`accept` | not yet |
 | TLS from user mode | not yet |
@@ -106,6 +107,9 @@ simulation.
   and `poll` for readiness across several descriptors.
   Numbers and semantics live in `kernel/include/ring3.h`; `userland/` carries its own copy. A second
   table answers Linux numbers (`int 0x80` and `syscall`) for libc: 27 checks run against it at boot.
+  What a program written against Linux reaches for beyond that list is now there too: `execve`,
+  `nanosleep`/`clock_nanosleep`, and `epoll` - a kept set of descriptors, level-triggered, which is
+  what an event loop wants and what `poll` cannot express.
 - **Programs are ELF files on the ISO**, not blobs in the kernel. `kernel/elf.c` validates and maps
   the `PT_LOAD` segments, gives `.bss` its zero pages, and `kernel/user/init.c` is built freestanding
   against its own linker script.

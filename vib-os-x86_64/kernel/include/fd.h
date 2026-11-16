@@ -55,8 +55,11 @@ struct socket;
  * this header names the pointer only, for the same reason it does for sockets -
  * the descriptor layer must not learn how a transport or a buffer works. */
 struct pipe;
+/* An epoll instance is a sixth kind for the same reason: the descriptor layer
+ * names the pointer and does not learn what a registration set is. */
+struct epoll;
 
-enum { FK_NONE = 0, FK_CONSOLE, FK_FILE, FK_SOCKET, FK_PIPE };
+enum { FK_NONE = 0, FK_CONSOLE, FK_FILE, FK_SOCKET, FK_PIPE, FK_EPOLL };
 
 /* The file: shared by every open of the same name. */
 typedef struct {
@@ -82,6 +85,7 @@ typedef struct {
   rfile_t *file;
   struct socket *sock;     /* FK_SOCKET: the endpoint, shared by every dup */
   struct pipe   *pipe;     /* FK_PIPE: the ring; the end is in flags (O_WRONLY) */
+  struct epoll  *ep;       /* FK_EPOLL: the set of watched descriptors */
   int      used;
 } ofile_t;
 
@@ -134,6 +138,10 @@ int  fd_socket(fdtable_t *t);
 int  fd_pipe(fdtable_t *t, int out[2]);
 unsigned fd_poll(fdtable_t *t, int fd);   /* OMI_POLL* bits, never blocks */
 int  fd_count_kind(fdtable_t *t, int kind);
+
+/* A descriptor for a new epoll instance, or a negative errno when the table or
+ * the open-file table is full. */
+int  fd_epoll(fdtable_t *t);
 
 /* Pin a description while a task is inside it. The last descriptor ref triggers
  * shutdown; destruction waits for the last pin, so a backend call cannot run
