@@ -23,6 +23,7 @@
  * pages are filled up front), and PROT_NONE reservations (see ring3.c). */
 
 #include "include/elf.h"
+#include "include/errno.h"
 #include "include/limine_modules.h"
 #include "include/ring3.h"
 #include "include/task.h"
@@ -464,8 +465,8 @@ int elf_load_ex(const char *path_suffix, elf_img_t *img, mm_t **mm_out) {
  *
  * rsp ends up 16-byte aligned, which is what the ABI promises at _start.
  */
-#define ARG_MAX 16
-#define ARG_BLK 2048
+#define ARG_MAX ELF_ARG_MAX
+#define ARG_BLK ELF_ARG_BLK
 
 static uint64_t build_initial_stack(uint64_t cr3, int argc, const char *const *argv,
                                     const elf_img_t *img, const char *progname) {
@@ -596,4 +597,35 @@ int ring3_spawn_elf(const char *name, const char *path, uint64_t arg) {
     serial_puts("\n");
   }
   return id;
+}
+/* Load `path` into an address space of its own and build its stack, but do not
+ * start it. execve is the only caller - starting a process and replacing one
+ * differ only in who ends up attached to the result, and everything before that
+ * point is the same work.
+ *
+ * A program that is not on the medium is told apart from one that could not be
+ * loaded, because they are different answers: the first is a name the caller got
+ * wrong, the second is memory the machine did not have.
+ */
+int elf_prepare_image(const char *path, int argc, const char *const *argv,
+                      uint64_t *entry_out, mm_t **mm_out, uint64_t *sp_out) {
+  const uint8_t *b;
+  uint64_t l;
+  const elf64_ehdr_t *e;
+  if (open_image(path, &b, &l, &e) != 0) return -ENOENT;
+
+  elf_img_t img;
+  mm_t *mm = 0;
+  if (elf_load_ex(path, &img, &mm) != 0) return -ENOMEM;
+  uint64_t sp = build_initial_stack(mm->cr3, argc, argv, &img, path);
+  if (!sp) {
+    serial_puts("[elf] ");
+    serial_puts(path);
+    serial_puts(": user stack allocation failed\n");
+    return -ENOMEM;
+  }
+  *entry_out = img.entry;
+  *mm_out = mm;
+  *sp_out = sp;
+  return 0;
 }

@@ -89,9 +89,12 @@ qemu-system-x86_64 -m 512 -cdrom omi.iso -boot d -vga std \
 
 ## What does not work yet
 
-- **No `exec` from a path.** Programs still start from the kernel's hardcoded spawn list, and one
-  program cannot start another: there is no `execve`, so `ld.so` can load libraries but nothing can
-  replace its own image with a new program.
+- **Nothing can ask for a program to be run.** `execve` works - a program replaces its own image,
+  with argv arriving in the new space and its descriptors carried across, and a PIE can be the target
+  so the path runs through `ld.so` as well (`[exectest] OK 7/7`). What is missing is the caller: there
+  is no shell and no `PATH`, so the kernel's spawn list is still how a session begins. Two limits on
+  the call itself: `envp` is ignored because nothing in this system has an environment, and exec from
+  a space shared with another thread is refused rather than ending that thread.
 - **Shared file mappings are missing.** `MAP_SHARED` over a file is `-ENOSYS`: there is no write-back
   path, so a shared mapping would be a lie about durability. `PROT_NONE` is implemented - a read of a
   guard faults, and so does a store into a read-only page (`[maptest] OK 24/24`), with one difference

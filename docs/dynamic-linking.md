@@ -156,7 +156,10 @@ Each one was a real defect in earlier work, invisible until a libc ran:
   keeping the pages would leak every one of them. A guard is never taken back,
   which is why this has not mattered yet - and it is a difference, not a plan.
 - The interpreter's base is a kernel constant; `dlopen` cannot choose it.
-- `execve` does not exist, so a program cannot start another program.
+- `execve` now exists, and it runs through this loader: a static or position-independent program can
+  be its target, and `[exectest]` execs both kinds on every boot. What it does not carry is an
+  environment (`envp` is accepted and ignored), and it refuses rather than ends a sibling thread when
+  the space is shared.
 - A library missing from the boot medium is the loader's error to report -
   `ld.so` prints "Error loading shared library" and exits 127 - not the kernel's.
   The loader does refuse cleanly, before starting anything, when the *interpreter*

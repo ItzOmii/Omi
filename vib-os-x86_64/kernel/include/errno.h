@@ -10,6 +10,7 @@
 #define ESRCH        3
 #define EINTR        4
 #define EIO          5
+#define E2BIG        7   /* execve argv larger than the block it is copied into */
 #define ENOEXEC      8
 #define EAFNOSUPPORT 97
 #define EPROTOTYPE 91

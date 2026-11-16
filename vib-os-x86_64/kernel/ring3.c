@@ -21,6 +21,7 @@
 #include "include/guiipc.h"
 #include "include/pmm.h"
 #include "include/errno.h"
+#include "include/elf.h"   /* elf_prepare_image: the load half of execve */
 #include "include/kmalloc.h"
 #include "include/net.h"
 #include "include/omi_net.h"
@@ -2068,6 +2069,148 @@ static long linux_fcntl(int fd, int cmd, uint64_t arg) {
   }
 }
 
+/* Copy a NUL-terminated string out of the caller's space.
+ *
+ * user_copy's window check is not a presence check, and an argument block that
+ * crosses a page boundary is the normal case rather than the exotic one, so each
+ * page is faulted in as the walk reaches it. A string that does not terminate
+ * inside the budget is refused: guessing past a boundary the caller never wrote
+ * is how a kernel ends up reading whatever comes next.
+ */
+static int user_str(char *dst, uint64_t max, uint64_t uptr) {
+  if (uptr < RING3_USER_MIN || uptr >= RING3_LIMIT) return -1;
+  for (uint64_t i = 0; i < max; i++) {
+    uint64_t at = uptr + i;
+    /* The budget is not the string. A string that starts near the top of the
+     * stack has an address space that ends before its budget does, so the window
+     * is checked per byte: refusing the whole read because the search *could*
+     * have run off the end refuses the common case to protect against the rare
+     * one. */
+    if (at < RING3_USER_MIN || at >= RING3_LIMIT) return -1;
+    if (!user_page_present(at & ~0xFFFULL) && !vm_fault_in(at, 0)) return -1;
+    dst[i] = *(const char *)(uintptr_t)at;
+    if (!dst[i]) return 0;
+  }
+  return -1;
+}
+
+/* execve replaces the calling process: image, stack, areas, page-table root -
+ * everything but the descriptor table and the pid.
+ *
+ * The old space cannot be freed here. This code is running on that space's kernel
+ * stack and its tables are the live ones in CR3, so it goes on the zombie list
+ * and the scheduler frees it once CR3 has moved, exactly as it does for a process
+ * that exits. That ordering is also what makes the case that matters correct: a
+ * child of fork that execs must leave its parent's pages alone, and it does,
+ * because releasing a shared frame only decrements its count.
+ *
+ * envp is accepted and ignored. Nothing in this system has an environment, and
+ * inventing one for execve alone would make the two loading paths disagree about
+ * what a program can expect to find.
+ */
+static long linux_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp) {
+  char path[128];
+  static char argb[ELF_ARG_BLK];
+  const char *argv[ELF_ARG_MAX + 1];
+  int argc = 0;
+  (void)uenvp;
+
+  if (user_str(path, sizeof path, upath) != 0) {
+    serial_puts("[exec] path could not be read out of user space\n");
+    return -EFAULT;
+  }
+
+  uint64_t used = 0;
+  if (uargv) {
+    for (; argc < ELF_ARG_MAX; argc++) {
+      uint64_t p = 0;
+      if (user_copy((char *)&p, uargv + (uint64_t)argc * 8, 8) != 0) {
+        serial_puts("[exec] ");
+        serial_puts(path);
+        serial_puts(": argv pointer unreadable\n");
+        return -EFAULT;
+      }
+      if (!p) break;
+      if (used >= ELF_ARG_BLK) {
+        serial_puts("[exec] ");
+        serial_puts(path);
+        serial_puts(": argv larger than the block\n");
+        return -E2BIG;
+      }
+      argv[argc] = &argb[used];
+      if (user_str(&argb[used], ELF_ARG_BLK - used, p) != 0) {
+        serial_puts("[exec] ");
+        serial_puts(path);
+        serial_puts(": an argv string is unreadable or unterminated\n");
+        return -EFAULT;
+      }
+      while (used < ELF_ARG_BLK && argb[used]) used++;
+      used++;                                  /* the terminator goes with it */
+    }
+  }
+  argv[argc] = 0;
+
+  task_t *t = task_at(task_current());
+  if (!t || !t->mm) return -EINVAL;
+  mm_t *old = t->mm;
+  /* Another thread in this space would keep running the image that is about to be
+   * replaced. Linux ends those threads; this refuses the call rather than leaving
+   * them to execute into an unmapped space. */
+  if (old->refcount > 1) {
+    serial_puts("[exec] refusing: the address space is shared with a thread\n");
+    return -EINVAL;
+  }
+
+  uint64_t entry = 0, sp = 0;
+  mm_t *fresh = 0;
+  long rc = elf_prepare_image(path, argc, argv, &entry, &fresh, &sp);
+  if (rc != 0) {
+    serial_puts("[exec] ");
+    serial_puts(path);
+    serial_puts(": the image could not be prepared, rc=");
+    serial_puthex((uint64_t)rc);
+    serial_puts("\n");
+    return rc;
+  }
+
+  /* Descriptors belong to the process, so they travel: the new space arrives with
+   * an empty table of its own and the real one moves across. */
+  fdtable_free(fresh->fds);
+  fresh->fds = old->fds;
+  old->fds = 0;
+
+  t->mm = fresh;
+  t->cr3 = fresh->cr3;
+  ring3_write_cr3(fresh->cr3);       /* the old tables must stop being the live ones */
+
+  /* Now the old space is nobody's. mm_on_exit() queues it for the scheduler to
+   * reap, which is only safe because CR3 already points at the new tables. */
+  t->mm = old;
+  mm_on_exit(t);
+  t->mm = fresh;
+  t->cr3 = fresh->cr3;
+
+  /* execve does not return: the frame this syscall was entered through is
+   * rewritten to land at the new entry on the new stack. Fourteen saved
+   * registers come first (f[13] is rax, which the dispatcher overwrites with 0),
+   * then ss, rsp, rflags, cs, rip as r3_dispatch_tail built them. */
+  uint64_t *f = (uint64_t *)(uintptr_t)r3_frame_base;
+  for (int i = 0; i < 14; i++) f[i] = 0;
+  f[14] = entry;
+  f[17] = sp;
+
+  serial_puts("[exec] ");
+  serial_puts(path);
+  serial_puts(" entry=");
+  serial_puthex(entry);
+  serial_puts(" sp=");
+  serial_puthex(sp);
+  serial_puts(" argc=");
+  serial_puthex((uint64_t)argc);
+  serial_puts("\n");
+  return 0;
+}
+
 static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
   fdtable_t *fds;
   switch (num) {
@@ -2109,6 +2252,7 @@ static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, 
     case 22:  return sys_pipe(a0);                         /* pipe */
     case 56:  return sys_clone(a0, a1, a2, a3);             /* clone / fork */
     case 57:  return sys_fork();                            /* fork */
+    case 59:  return linux_execve(a0, a1, a2);              /* execve */
     case 61:  return linux_wait4((int)a0, a1, (int)a2, a3); /* wait4 */
     case 39:  return (long)task_current();                 /* getpid */
     case 60:  r3_exit_now(a0); return 0;                   /* exit */

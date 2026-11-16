@@ -59,6 +59,9 @@ swap to. Adding it belongs with SMP, not before.
 | 20 | writev | loops `write`; a partial write is a success |
 | 22 | pipe | the step-4 pipe |
 | 39,186,218 | getpid, gettid, set_tid_address | the task id |
+| 56,57 | clone, fork | `fork` ignores the flags it cannot honour; a thread shares the table |
+| 59 | execve | replaces image, stack, areas and CR3; descriptors and pid stay; `envp` ignored; refused when the space is shared with a thread |
+| 61 | wait4 | `WNOHANG` honoured, `rusage` zeroed |
 | 60,231 | exit, exit_group | one exit path shared with SYS_EXIT |
 | 96,228 | gettimeofday, clock_gettime | the tick counter |
 | 102..110 | getuid/getgid/euid/egid/getppid | zero |
@@ -376,12 +379,21 @@ span; `mmap`/`munmap` writable end to end; `arch_prctl(SET_FS)` verified by
 reading `%fs:0`; unknown number `-ENOSYS`.
 
 Boot: `[linux3] 27/27 ok`, `[musl] OK`, `[threads] ... OK`, `[stat] OK` and `[fork] OK`, alongside `[pipe] 37/37`,
-`[pipe3] 30/30`, `[rdy] 56/56`, `vfs 16/16`, `futex 3/3`, `[rfs] module files exposed=21 skipped=0`
+`[pipe3] 30/30`, `[rdy] 56/56`, `vfs 16/16`, `futex 3/3`, `[rfs] module files exposed=23 skipped=0`
 with `[modtest] OK 15/15`, `[maptest] OK 24/24` (file-backed `mmap`, `MAP_FIXED` over a
 reservation, a `PROT_NONE` page that kills the child that reads it, a store into a read-only page
-that kills the child that writes it, and the three refusals), `[dyntest] OK 14/14` (a PIE run through
-musl's `ld.so`, with a library mapped out of the boot medium), no panic, no "killed user task" beyond
-the isolation probe that asks for it.
+that kills the child that writes it, and the three refusals), `[dyntest] OK 14/14` **twice** (a PIE run
+through musl's `ld.so` with a library mapped out of the boot medium - once from the spawn list, once as
+the target of an `execve`), `[exectest] OK 7/7` (a refused name leaves the caller running, a child
+becomes another program with its argv and inherited descriptor intact, a PIE can be the target, and the
+parent's own page survives its child's exec), no panic, no "killed user task" beyond the isolation
+probe that asks for it.
+
+`execve` (59) replaces the process: image, stack, areas and the page-table root, while the descriptor
+table and the pid stay. The old space is not freed in place - the call is running on its kernel stack -
+so it goes on the zombie list and the scheduler reaps it once CR3 has moved. Two limits: `envp` is
+accepted and ignored, because nothing here has an environment to hand over, and a call from a space
+shared with a sibling thread is refused with `-EINVAL` rather than ending that thread.
 
 Protection is checked before a page is filled: a fault the range does not allow is a violation, not a
 demand to page in. On x86 there is no write-only page, so `PROT_WRITE` implies read, as it does under

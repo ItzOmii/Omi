@@ -237,7 +237,7 @@ $(LIMINE_DIR):
 userland/%.elf: userland/%.c
 	$(MAKE) -C userland $*.elf
 
-$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -268,6 +268,8 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	@if [ -f userland/libprobe.elf ]; then cp userland/libprobe.elf $(ISO_ROOT)/apps/libprobe.elf; else echo "no libprobe.elf: skipping"; fi
 	@if [ -f userland/libmap.elf ]; then cp userland/libmap.elf $(ISO_ROOT)/apps/libmap.elf; else echo "no libmap.elf: skipping"; fi
 	@if [ -f userland/dyntest.elf ]; then cp userland/dyntest.elf $(ISO_ROOT)/apps/dyntest.elf; else echo "no dyntest.elf: skipping"; fi
+	@if [ -f userland/exectest.elf ]; then cp userland/exectest.elf $(ISO_ROOT)/apps/exectest.elf; else echo "no exectest.elf: skipping"; fi
+	@if [ -f userland/exectarget.elf ]; then cp userland/exectarget.elf $(ISO_ROOT)/apps/exectarget.elf; else echo "no exectarget.elf: skipping"; fi
 	# A shared object, in a directory of its own: the loader will look it up by
 	# path, so the path it is copied to is the path that must appear in limine.conf.
 	@mkdir -p $(ISO_ROOT)/lib

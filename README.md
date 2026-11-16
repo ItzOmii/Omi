@@ -38,6 +38,7 @@ object runs under musl's own `ld.so` - the kernel loads two images and hands ove
 | `fork`, copy-on-write, `wait4`, signals | **done** |
 | Boot modules openable as files, file-backed `mmap` | **done** |
 | Dynamic linking: `ld.so`, `PT_INTERP`, `ET_DYN` | **done** |
+| `execve`: a program replaces its own image, argv and descriptors intact | **done** |
 | TCP teardown (FIN/RST/`TIME_WAIT`), retransmission | not yet |
 | UDP sockets, `bind`/`listen`/`accept` | not yet |
 | TLS from user mode | not yet |
@@ -308,7 +309,10 @@ To boot real hardware: `sudo dd if=omi.iso of=/dev/sdX bs=4M status=progress`.
   where Linux would preserve them.
 - **The VFS is RAM only** — three files seeded at boot, 24 slots, no disk and no directories below the
   root. Boot modules are readable as files (read-only, `-EROFS` on write) and a file can be mapped,
-  but there is no `exec` from a path: programs still run from the hardcoded spawn list.
+  and a program can now replace its own image with one of them (`execve`, with argv and its
+  descriptors carried across), so the spawn list is a starting point rather than the only way in.
+  What is still missing is something to *ask*: no shell, no `PATH`, and no environment for one to
+  read.
 - **One window per process**, six ring-3 windows at a time, 48 draw commands and 128 bytes of text
   per command. The wait has no timeout — only input or a close wakes a process.
 - **No forecast.** The network widget reports link state honestly (`tcp, http and tls are up`) because

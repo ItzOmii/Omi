@@ -527,6 +527,9 @@ void _start(void) {
      * proved it could read. */
     ring3_spawn_elf("libmap", "libmap.elf", 0);
   ring3_spawn_elf("dyntest", "dyntest.elf", 0);
+  /* execve last: it replaces the running program, so it is the one test whose
+   * output can be mistaken for the test that started it. */
+  ring3_spawn_elf("exectest", "exectest.elf", 0);
   }
 
   serial_puts("Starting main loop...\n");

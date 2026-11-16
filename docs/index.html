@@ -195,7 +195,7 @@
       <div class="fact"><b>147,000</b><span>lines of our own</span></div>
       <div class="fact"><b>12 MB</b><span>bootable ISO</span></div>
       <div class="fact"><b>34</b><span>syscalls</span></div>
-      <div class="fact"><b>15</b><span>programs on the ISO</span></div>
+      <div class="fact"><b>17</b><span>programs on the ISO</span></div>
     </div>
   </div>
   <div class="hero-shot">
@@ -397,12 +397,12 @@
     <div class="holes">
       <div class="hole">
         <div class="n">01</div>
-        <h4>One program still cannot start another</h4>
-        <p>Dynamic linking landed: a PIE with <span class="mono">PT_INTERP</span> runs under musl's
-          <span class="mono">ld.so</span>, which opens, maps and relocates a shared object out of the
-          boot medium and calls into it. What is missing is the step either side of it —
-          <span class="mono">execve</span>, so a program can replace its own image with another. Every
-          process still comes from the kernel's spawn list.</p>
+        <h4>Nothing can ask for a program to be run</h4>
+        <p><span class="mono">execve</span> landed: a program replaces its own image, argv arrives in
+          the new space, its descriptors cross with it, and the target can be a PIE so the path runs
+          through <span class="mono">ld.so</span> too. What is missing is the caller — no shell, no
+          <span class="mono">PATH</span>, no environment to read one from. A session still begins at
+          the kernel's spawn list.</p>
       </div>
       <div class="hole">
         <div class="n">02</div>
