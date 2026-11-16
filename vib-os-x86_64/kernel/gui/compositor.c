@@ -2390,7 +2390,7 @@ typedef struct { const char *label; const char *kbd; } mitem;
 
 /* MeepOS is its own OS, not a front-end for the house dashboard: only the apps
    that were actually asked for live here (plus the widgets, below). */
-enum { APP_NONE = 0, APP_CALC, APP_NOTES, APP_MEDIA, APP_BROWSER, APP_TASKS, APP_COUNT };
+enum { APP_NONE = 0, APP_CALC, APP_NOTES, APP_MEDIA, APP_BROWSER, APP_TASKS, APP_FILES, APP_COUNT };
 
 typedef struct { int open, x, y, w, h; int min; } meep_app_t;
 
@@ -2684,6 +2684,307 @@ static void u64s(uint64_t v, char *out) {
   int i = 0;
   while (n > 0) out[i++] = tmp[--n];
   out[i] = 0;
+}
+
+/* ---- files: the ram drive ----------------------------------------------
+ * Modelled on the web shell's Files window (sites/meepos/app.js): places down
+ * the left, a breadcrumb with an up control across the top, one row per entry
+ * with a kind glyph, a name and a size, and an empty state that names the folder
+ * instead of showing a blank pane.
+ *
+ * Read-only on purpose. This is the RAM filesystem - the same tree the notepad
+ * and the launcher read - and a delete button is not what it needs. Every
+ * geometry lives in one function used by both the draw pass and the hit test,
+ * so a click can never land somewhere the pixels are not.
+ */
+
+#define FSV_MAX 48
+
+static const char *fsv_places[] = {
+  "/", "/Desktop", "/Documents", "/Downloads", "/Pictures", "/bin", "/etc"
+};
+#define FSV_PLACES ((int)(sizeof fsv_places / sizeof fsv_places[0]))
+
+static struct {
+  char path[72];
+  dirent_t ent[FSV_MAX];
+  int n, sel, err, scroll, inited, places_hot;
+} fsv;
+
+static void files_parent_of(const char *p, char *out, int cap) {
+  if (!p[0] || (p[0] == '/' && !p[1])) { s_cpy(out, "/", cap); return; }
+  int i = s_len(p) - 1;
+  while (i > 0 && p[i] != '/') i--;
+  if (i <= 0) { s_cpy(out, "/", cap); return; }
+  if (i >= cap) i = cap - 1;
+  for (int k = 0; k < i; k++) out[k] = p[k];
+  out[i] = 0;
+}
+
+static void files_join(const char *base, const char *name, char *out, int cap) {
+  int i = 0;
+  if (base[0] != '/') { if (i < cap - 1) out[i++] = '/'; }
+  for (int k = 0; base[k] && i < cap - 1; k++) out[i++] = base[k];
+  if (i > 1 && out[i - 1] != '/') { if (i < cap - 1) out[i++] = '/'; }
+  else if (i == 1 && out[0] == '/') { /* root already ends in a slash */ }
+  for (int k = 0; name[k] && i < cap - 1; k++) out[i++] = name[k];
+  out[i] = 0;
+}
+
+static void files_load(const char *p) {
+  s_cpy(fsv.path, p, (int)sizeof fsv.path);
+  int n = vfs_readdir(fsv.path, fsv.ent, FSV_MAX);
+  fsv.err = (n < 0);
+  fsv.n = (n < 0) ? 0 : n;
+  fsv.sel = -1;
+  fsv.scroll = 0;
+}
+
+static int files_side_w(void) { return UI_SCALE_VAL(118); }
+
+static void files_place_rect(meep_app_t *a, int i, int *x, int *y, int *w, int *h) {
+  *x = a->x + UI_SCALE_VAL(7);
+  *y = a->y + APP_TITLE_H + UI_SCALE_VAL(30) + i * UI_SCALE_VAL(25);
+  *w = files_side_w() - UI_SCALE_VAL(14);
+  *h = UI_SCALE_VAL(21);
+}
+
+static void files_up_rect(meep_app_t *a, int *x, int *y, int *w, int *h) {
+  *x = a->x + files_side_w() + UI_SCALE_VAL(8);
+  *y = a->y + APP_TITLE_H + UI_SCALE_VAL(7);
+  *w = UI_SCALE_VAL(22);
+  *h = UI_SCALE_VAL(20);
+}
+
+static int files_rows_top(meep_app_t *a) {
+  return a->y + APP_TITLE_H + UI_SCALE_VAL(30) + UI_SCALE_VAL(4);
+}
+
+static int files_row_h(void) { return meep_line_h(&meep_m100) + UI_SCALE_VAL(12); }
+
+static void files_row_rect(meep_app_t *a, int i, int *x, int *y, int *w, int *h) {
+  *x = a->x + files_side_w() + UI_SCALE_VAL(4);
+  *y = files_rows_top(a) + (i - fsv.scroll) * files_row_h();
+  *w = a->w - files_side_w() - UI_SCALE_VAL(8);
+  *h = files_row_h();
+}
+
+/* "8 b" / "1.4k" / "2.1m" - integer maths, one decimal, no FPU here. */
+static void files_size(size_t sz, int is_dir, char *out) {
+  if (is_dir) { s_cpy(out, "folder", 12); return; }
+  char num[16];
+  char tmp[8];
+  int k = 0;
+  if (sz < 1024) {
+    s_num((long long)sz, num);
+    s_cpy(out, num, 12);
+    int l = s_len(out);
+    out[l] = ' '; out[l + 1] = 'b'; out[l + 2] = 0;
+    return;
+  }
+  uint64_t div = 1024, unit = 'k';
+  if (sz >= 1024ULL * 1024ULL) { div = 1024ULL * 1024ULL; unit = 'm'; }
+  uint64_t whole = (uint64_t)sz / div;
+  uint64_t tenth = ((uint64_t)sz % div) * 10ULL / div;
+  s_num((long long)whole, num);
+  for (int i = 0; num[i]; i++) tmp[k++] = num[i];
+  tmp[k++] = '.';
+  tmp[k++] = (char)('0' + (int)tenth);
+  tmp[k++] = (char)unit;
+  tmp[k] = 0;
+  s_cpy(out, tmp, 12);
+}
+
+/* A folder glyph and a file glyph out of small filled rectangles: the web shell
+ * uses SVG paths, and at this size a tab plus a body reads the same. */
+static void files_glyph(int kx, int ky, int is_dir, uint32_t ink, uint32_t accent) {
+  int s = UI_SCALE_VAL(1);
+  if (is_dir) {
+    fb_fill_rect(kx, ky + 1 * s, 12 * s, 2 * s, accent);          /* tab  */
+    fb_fill_rect(kx, ky + 3 * s, 15 * s, 9 * s, accent);          /* body */
+    fb_fill_rect(kx + 1 * s, ky + 5 * s, 13 * s, 6 * s, ink);
+    return;
+  }
+  fb_fill_rect(kx + 2 * s, ky + 1 * s, 11 * s, 13 * s, ink);
+  for (int i = 0; i < 3; i++) fb_fill_rect(kx + 4 * s, ky + (4 + i * 3) * s, 7 * s, 1 * s, accent);
+}
+
+static void draw_files(void) {
+  meep_app_t *a = &mapp[APP_FILES];
+  if (!a->open) return;
+  if (!fsv.inited) { files_load("/"); fsv.inited = 1; }
+
+  char sub[24];
+  s_num((long long)fsv.n, sub);
+  int sl = s_len(sub);
+  const char *tail = (fsv.n == 1) ? " item" : " items";
+  for (int i = 0; tail[i] && sl < 22; i++) sub[sl++] = tail[i];
+  sub[sl] = 0;
+
+  app_win(a->x, a->y, a->w, a->h, "Files", sub, mapp_focus == APP_FILES);
+
+  int sx = a->x + 1, sy = a->y + APP_TITLE_H + 1;
+  int sw = a->w - 2, sh = a->h - APP_TITLE_H - 2;
+  fb_fill_rect(sx, sy, sw, sh, MEEP_PAPER3);
+
+  /* ---- places ---------------------------------------------------------- */
+  int side = files_side_w();
+  fb_fill_rect(sx, sy, side, sh, MEEP_PAPER2);
+  fb_fill_rect(sx + side, sy, 1, sh, MEEP_LINE_SOFT);
+  meep_text(&meep_s130, sx + UI_SCALE_VAL(10), sy + UI_SCALE_VAL(9), "places", MEEP_INK_SOFT);
+
+  for (int i = 0; i < FSV_PLACES; i++) {
+    int px, py, pw, ph;
+    files_place_rect(a, i, &px, &py, &pw, &ph);
+    if (py + ph > a->y + a->h - UI_SCALE_VAL(8)) break;
+    /* Compare whole strings. Comparing the first character highlighted every
+     * place at once, since they all start with '/'. */
+    int here = 1;
+    for (int q = 0; ; q++) {
+      if (fsv.path[q] != fsv_places[i][q]) { here = 0; break; }
+      if (!fsv.path[q]) break;
+    }
+    if (here) fb_fill_rect(px, py, pw, ph, MEEP_PRESS);
+    else if (i == fsv.places_hot) fb_fill_rect(px, py, pw, ph, MEEP_LINE_SOFT);
+    files_glyph(px + UI_SCALE_VAL(3), py + UI_SCALE_VAL(3), 1,
+                here ? MEEP_INK : MEEP_INK_SOFT, MEEP_ACCENT);
+    meep_text(&meep_s130, px + UI_SCALE_VAL(22), py + UI_SCALE_VAL(3),
+              fsv_places[i], here ? MEEP_INK : MEEP_INK_SOFT);
+  }
+
+  /* ---- breadcrumb + up ------------------------------------------------- */
+  int ux, uy, uw, uh;
+  files_up_rect(a, &ux, &uy, &uw, &uh);
+  int at_root = (fsv.path[0] == '/' && !fsv.path[1]);
+  fb_fill_rect(ux, uy, uw, uh, at_root ? MEEP_LINE_SOFT : MEEP_PAPER2);
+  {
+    /* an up chevron, drawn rather than fetched: no font glyph needed */
+    int cx2 = ux + uw / 2, cy2 = uy + uh / 2 - UI_SCALE_VAL(2);
+    for (int k = 0; k < 5; k++)
+      fb_fill_rect(cx2 - k, cy2 + k, 1 + 2 * k, 1, at_root ? MEEP_INK_SOFT : MEEP_INK);
+  }
+
+  int bx = ux + uw + UI_SCALE_VAL(10);
+  int has_room = a->x + a->w - bx > UI_SCALE_VAL(60);
+  if (has_room) {
+    /* draw the tail of a long path, the way a shell prompt does */
+    int cw = meep_text_w(&meep_m100, "M");
+    int maxc = (a->x + a->w - bx - UI_SCALE_VAL(10)) / (cw ? cw : 8);
+    int plen = s_len(fsv.path);
+    const char *shown = fsv.path;
+    if (maxc > 2 && plen > maxc) shown = fsv.path + (plen - maxc);
+    meep_text(&meep_m100, bx, uy + UI_SCALE_VAL(3), shown, MEEP_INK);
+    fb_fill_rect(bx, uy + uh + UI_SCALE_VAL(1), a->x + a->w - bx - UI_SCALE_VAL(6), 1, MEEP_LINE_SOFT);
+  }
+
+  /* ---- rows ------------------------------------------------------------ */
+  int y0 = files_rows_top(a);
+  int bottom = a->y + a->h - UI_SCALE_VAL(28);
+  int lh = meep_line_h(&meep_m100);
+
+  if (fsv.n == 0) {
+    const char *t1 = fsv.err ? "Can't open that" : "Empty folder";
+    const char *t2 = fsv.path;
+    int w1 = meep_text_w(&meep_m105, t1);
+    int cx3 = a->x + side + (a->w - side) / 2 - w1 / 2;
+    meep_text(&meep_m105, cx3, y0 + UI_SCALE_VAL(24), t1, MEEP_INK_SOFT);
+    int w2 = meep_text_w(&meep_s130, t2);
+    meep_text(&meep_s130, a->x + side + (a->w - side) / 2 - w2 / 2,
+              y0 + UI_SCALE_VAL(24) + lh + UI_SCALE_VAL(6), t2, MEEP_INK_SOFT);
+  }
+
+  int rows_fit = (bottom - y0) / files_row_h();
+  if (rows_fit < 1) rows_fit = 1;
+  if (fsv.sel >= 0) {
+    if (fsv.sel < fsv.scroll) fsv.scroll = fsv.sel;
+    if (fsv.sel >= fsv.scroll + rows_fit) fsv.scroll = fsv.sel - rows_fit + 1;
+  }
+
+  int drawn = 0;
+  for (int i = fsv.scroll; i < fsv.n && drawn < rows_fit; i++, drawn++) {
+    int rx, ry, rw, rh;
+    files_row_rect(a, i, &rx, &ry, &rw, &rh);
+    int is_dir = fsv.ent[i].type == 1;
+    if (i == fsv.sel) {
+      fb_fill_rect(rx, ry, rw, rh, MEEP_PRESS);
+      fb_fill_rect(rx, ry, UI_SCALE_VAL(2), rh, MEEP_ACCENT);
+    }
+    files_glyph(rx + UI_SCALE_VAL(8), ry + UI_SCALE_VAL(4), is_dir,
+                is_dir ? MEEP_INK : MEEP_INK_SOFT, MEEP_ACCENT);
+
+    char size[12];
+    files_size(fsv.ent[i].size, is_dir, size);
+    int sw2 = meep_text_w(&meep_s130, size);
+    meep_text(&meep_s130, rx + rw - sw2 - UI_SCALE_VAL(10), ry + UI_SCALE_VAL(4), size, MEEP_INK_SOFT);
+
+    int name_max = (rw - sw2 - UI_SCALE_VAL(30)) / (meep_text_w(&meep_s130, "M") ? meep_text_w(&meep_s130, "M") : 7);
+    char nm[40];
+    int np = 0;
+    for (int k = 0; fsv.ent[i].name[k] && np < 38 && (name_max <= 0 || np < name_max); k++)
+      nm[np++] = fsv.ent[i].name[k];
+    if (fsv.ent[i].name[np] && np < 38) { nm[np++] = '.'; nm[np++] = '.'; nm[np++] = '.'; }
+    nm[np] = 0;
+    meep_text(&meep_s130, rx + UI_SCALE_VAL(30), ry + UI_SCALE_VAL(4), nm, MEEP_INK);
+  }
+
+  /* ---- footer ----------------------------------------------------------
+   * A strip across the whole window, painted over the sidebar: the first version
+   * started at the window's left edge and ran underneath the sidebar divider. */
+  int fy = a->y + a->h - UI_SCALE_VAL(26);
+  fb_fill_rect(sx, fy, sw, UI_SCALE_VAL(25), MEEP_PAPER2);
+  fb_fill_rect(sx, fy, sw, 1, MEEP_LINE_SOFT);
+  meep_text(&meep_s130, a->x + UI_SCALE_VAL(10), fy + UI_SCALE_VAL(7),
+            "read-only / ram drive", MEEP_INK_SOFT);
+  char cnt[24];
+  s_num((long long)fsv.n, cnt);
+  int cl = s_len(cnt);
+  const char *ct = (fsv.n == 1) ? " item" : " items";
+  for (int i = 0; ct[i] && cl < 22; i++) cnt[cl++] = ct[i];
+  cnt[cl] = 0;
+  int cw2 = meep_text_w(&meep_s130, cnt);
+  meep_text(&meep_s130, a->x + a->w - cw2 - UI_SCALE_VAL(10), fy + UI_SCALE_VAL(7),
+            cnt, MEEP_INK_SOFT);
+}
+
+/* Click inside the Files window. Returns 1 - the window consumed it either way,
+ * so a click on empty space does not fall through to the desktop. */
+static int files_click(int x, int y, meep_app_t *a) {
+  for (int i = 0; i < FSV_PLACES; i++) {
+    int px, py, pw, ph;
+    files_place_rect(a, i, &px, &py, &pw, &ph);
+    if (x >= px && x < px + pw && y >= py && y < py + ph) {
+      files_load(fsv_places[i]);
+      return 1;
+    }
+  }
+
+  int ux, uy, uw, uh;
+  files_up_rect(a, &ux, &uy, &uw, &uh);
+  if (x >= ux && x < ux + uw && y >= uy && y < uy + uh) {
+    if (fsv.path[0] == '/' && fsv.path[1]) {
+      char up[72];
+      files_parent_of(fsv.path, up, (int)sizeof up);
+      files_load(up);
+    }
+    return 1;
+  }
+
+  int rows_fit = (a->y + a->h - UI_SCALE_VAL(28) - files_rows_top(a)) / files_row_h();
+  for (int i = fsv.scroll; i < fsv.n && i < fsv.scroll + rows_fit; i++) {
+    int rx, ry, rw, rh;
+    files_row_rect(a, i, &rx, &ry, &rw, &rh);
+    if (x >= rx && x < rx + rw && y >= ry && y < ry + rh) {
+      if (fsv.ent[i].type == 1) {
+        char child[72];
+        files_join(fsv.path, fsv.ent[i].name, child, (int)sizeof child);
+        files_load(child);
+      } else {
+        fsv.sel = i;
+      }
+      return 1;
+    }
+  }
+  return 1;
 }
 
 static void draw_tasks(void) {
@@ -3626,6 +3927,7 @@ static void app_defaults(int id, int *x, int *y, int *w, int *h) {
     case APP_MEDIA: *x = 300; *y = 190; *w = 420; *h = 260; break;
     case APP_BROWSER: *x = 230; *y = 150; *w = 470; *h = 300; break;
     case APP_TASKS:   *x = 250; *y = 170; *w = 460; *h = 300; break;
+    case APP_FILES:   *x = 300; *y = 130; *w = 520; *h = 380; break;
     default:        *x = 240; *y = 140; *w = 520; *h = 340; break;
   }
 }
@@ -3728,6 +4030,7 @@ static int app_icon(int id) {
     case APP_MEDIA:   return ICON_MEDIA;
     case APP_BROWSER: return ICON_BROWSER;
     case APP_TASKS:   return ICON_TASKS;
+    case APP_FILES:   return ICON_FILES;
     default:          return ICON_APPS;
   }
 }
@@ -3739,6 +4042,7 @@ static const char *app_title(int id) {
     case APP_MEDIA:   return "media player";
     case APP_BROWSER: return "omi net";
     case APP_TASKS:   return "task manager";
+    case APP_FILES:   return "files";
   }
   return "";
 }
@@ -3778,7 +4082,8 @@ static const sm_item sm_rows[] = {
   {"notes",          1, APP_NOTES},
   {"media player",   1, APP_MEDIA},
   {"omi net",        1, APP_BROWSER},
-  {"task manager",   1, APP_TASKS},
+  {"task manager",    1, APP_TASKS},
+  {"files",           1, APP_FILES},
   {0, 0, 0},
   {"clock widget",   2, WG_CLOCK},
   {"weather widget", 2, WG_WEATHER},
@@ -4169,6 +4474,7 @@ static int apps_click(int x, int y, int button) {
       }
     }
     if (e == APP_CALC) calc_body_click(x, y);
+    if (e == APP_FILES) files_click(x, y, a);
     if (e == APP_MEDIA) {
       int bx = a->x + 14;
       int by = a->y + APP_TITLE_H + 14 + 22 + 26 + 20 + 14 + 22;
@@ -4206,6 +4512,34 @@ static int apps_key(int key) {
     } else if (key >= 32 && key < 127 && sticky_len < (int)sizeof(sticky_text) - 1) {
       for (int i = sticky_len; i >= sticky_cur; i--) sticky_text[i + 1] = sticky_text[i];
       sticky_text[sticky_cur] = (char)key; sticky_cur++; sticky_len++;
+    } else {
+      return 0;
+    }
+    needs_redraw = 1;
+    return 1;
+  }
+  if (mapp_focus == APP_FILES) {
+    /* Arrows move the selection, Enter opens a folder, Backspace goes up - the
+     * keyboard half of what the mouse does, and the reason the selection is
+     * drawn at all. */
+    if (key == KEY_UP) {
+      if (fsv.sel < 0) { if (fsv.n) fsv.sel = 0; }
+      else if (fsv.sel > 0) fsv.sel--;
+    } else if (key == KEY_DOWN) {
+      if (fsv.sel < 0) { if (fsv.n) fsv.sel = 0; }
+      else if (fsv.sel < fsv.n - 1) fsv.sel++;
+    } else if (key == '\n' || key == '\r') {
+      if (fsv.sel >= 0 && fsv.sel < fsv.n && fsv.ent[fsv.sel].type == 1) {
+        char child[72];
+        files_join(fsv.path, fsv.ent[fsv.sel].name, child, (int)sizeof child);
+        files_load(child);
+      }
+    } else if (key == '\b' || key == 127) {
+      if (fsv.path[0] == '/' && fsv.path[1]) {
+        char up[72];
+        files_parent_of(fsv.path, up, (int)sizeof up);
+        files_load(up);
+      }
     } else {
       return 0;
     }
@@ -4563,6 +4897,7 @@ static void apps_draw(void) {
     if (!mapp[e].open || mapp[e].min) continue;
     if (e == APP_CALC)  draw_calc();
     if (e == APP_TASKS) draw_tasks();
+    else if (e == APP_FILES) draw_files();
     else if (e == APP_NOTES) draw_notes();
     else if (e == APP_MEDIA) draw_media();
     else if (e == APP_BROWSER) draw_browser();

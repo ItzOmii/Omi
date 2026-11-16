@@ -50,6 +50,17 @@ struct socket {
   uint32_t gen;
 
   struct sock_waiter waiters[SOCK_WAITERS];
+
+  /* Exactly one blocking read may be in flight on a socket. Two would both park,
+   * both wake on the same byte count, and split a byte stream between them in
+   * whatever order the scheduler happened to pick - which is not a race a caller
+   * can reason about.
+   *
+   * Owner, not a bare flag: a task can be killed while parked inside the read,
+   * and a flag left set would make the socket unreadable for ever with nothing
+   * to explain it. The task-exit hook already sweeps this socket's waiters, so
+   * it clears the owner in the same pass. */
+  int      read_owner;            /* task id, 0 = free */
 };
 
 static struct socket sockets[SOCKET_MAX];
@@ -147,12 +158,35 @@ int sock_waiters_live(struct socket *s) {
 }
 
 void sock_drop_waiters(int task_id) {
-  for (int i = 0; i < SOCKET_MAX; i++)
+  for (int i = 0; i < SOCKET_MAX; i++) {
+    /* Ownership of the read dies with its task, in the same sweep as the waiters:
+     * both are registrations a dead task cannot withdraw itself. */
+    if (sockets[i].used && sockets[i].read_owner == task_id) {
+      sockets[i].read_owner = 0;
+      stats.drops++;
+    }
     for (int k = 0; k < SOCK_WAITERS; k++)
       if (sockets[i].waiters[k].used && sockets[i].waiters[k].task == task_id) {
         sockets[i].waiters[k].used = 0;
         stats.drops++;
       }
+  }
+}
+
+/* Take the read side for this task. Free is free; taken by a task that no longer
+ * exists is free too, because a slot can be reused only after a release. */
+int sock_read_begin(struct socket *s) {
+  if (!s || !s->used) return -EBADF;
+  int me = task_current();
+  if (s->read_owner && s->read_owner != me) { stats.busy++; return -EBUSY; }
+  s->read_owner = me;
+  return 0;
+}
+
+void sock_read_end(struct socket *s) {
+  if (!s) return;
+  int me = task_current();
+  if (s->read_owner == me) s->read_owner = 0;
 }
 
 /* ---- object lifetime ---------------------------------------------------- */
@@ -164,6 +198,7 @@ struct socket *sock_new(void) {
     sockets[i].impl = 0;
     sockets[i].ops = socket_backend();
     sockets[i].closing = 0;
+    sockets[i].read_owner = 0;
     sockets[i].seq = 0;
     for (int k = 0; k < SOCK_WAITERS; k++) sockets[i].waiters[k].used = 0;
     sock_bump_gen(&sockets[i]);          /* new identity in this slot */

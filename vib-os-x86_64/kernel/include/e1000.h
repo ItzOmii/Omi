@@ -22,6 +22,14 @@ int e1000_link(void);
 /* Send one raw ethernet frame. Returns 0 on success. */
 int e1000_send(const void *frame, uint16_t len);
 
+/* Test instrumentation. Forces the outcome of the NEXT send only, and counts
+ * every call, so "did the caller retry?" is answerable rather than assumed.
+ * One-shot on purpose: a sticky override makes a retry indistinguishable from
+ * the first attempt, and the retry is exactly what the -2 policy is about. */
+void     e1000_test_send_outcome(int rc);
+uint32_t e1000_test_send_calls(void);
+void     e1000_test_send_calls_reset(void);
+
 /* Poll for one frame, copied into buf. Returns length, 0 if none, -1 on error. */
 int e1000_poll_recv(void *buf, int max);
 

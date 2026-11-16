@@ -40,7 +40,13 @@ unsigned sock_poll(struct socket *s);
  * Waiter slots live in this object because a node on a blocked task's stack
  * would dangle if that task's address space were freed underneath it.
  */
-#define SOCK_WAITERS 4
+/* Waiter slots per socket. Four was sized for "one reader and a writer", which
+ * is true of one thread and false of any program that polls from a helper or has
+ * two writers. Eight costs 24 sockets x 8 x 32 B = 6 KB of BSS, and the failure
+ * it prevents is not a slow path but a refused wait (-ENOBUFS) for a program
+ * that did nothing wrong. Overflow is still explicit: the ninth waiter is told
+ * no, counted in stats.overflows, and never left blocked-but-unregistered. */
+#define SOCK_WAITERS 8
 
 /* Announce that readiness changed: bump the sequence, then wake waiters. Every
  * transition must call this before the state it reports is observable, so a
@@ -56,13 +62,17 @@ void sock_shutdown(struct socket *s);
  * readiness bits, -EAGAIN if `deadline_ticks` elapsed with nothing ready, or
  * -ENOBUFS when the waiter table is full - never a silent block. */
 int sock_wait(struct socket *s, unsigned want, uint64_t deadline_ticks);
+/* One blocking read at a time. 0 = owned by us, -EBUSY = someone else has it,
+ * -EBADF = the socket is gone. sock_read_end() on every exit path. */
+int  sock_read_begin(struct socket *s);
+void sock_read_end(struct socket *s);
 
 int      sock_waiters_live(struct socket *s);
 void     sock_drop_waiters(int task_id);   /* task exit: drop its registrations */
 uint32_t sock_gen(struct socket *s);
 
 /* Internals the readiness self-test drives directly; not part of the VFS. */
-struct sock_stats { uint64_t blocks, wakes, drops, registered, spurious, overflows; };
+struct sock_stats { uint64_t blocks, wakes, drops, registered, spurious, overflows, busy; };
 struct sock_stats sock_stats_get(void);
 void     sock_test_skip_recheck(int on);
 void     sock_test_inject_after_register(struct socket *s, unsigned mask, int times);

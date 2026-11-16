@@ -100,7 +100,7 @@ static const struct socket_ops fk_ops = {
 
 /* ---- one worker, driven by commands -------------------------------------- */
 
-enum { C_IDLE = 0, C_WAIT, C_REGISTER_THEN_DIE, C_READ, C_WRITE };
+enum { C_IDLE = 0, C_WAIT, C_REGISTER_THEN_DIE, C_READ, C_WRITE, C_OWN_THEN_DIE };
 
 static volatile int  w_cmd, w_done, w_bits, w_bytes, w_timed_out;
 static struct socket *w_sock;
@@ -134,6 +134,12 @@ static void rd_worker(void) {
     } else if (c == C_WRITE) {
       w_timed_out = 0;
       w_bits = (int)fd_write_ticks(wt, wfd, wbuf, wlen, 40);
+    } else if (c == C_OWN_THEN_DIE) {
+      /* Take the read side, then die inside it: the sweep that withdraws a dead
+       * task's waiters must withdraw its read ownership too, or the socket is
+       * unreadable for ever with nothing to point at. */
+      w_bits = sock_read_begin(w_sock);
+      task_kill_current(9);
     } else if (c == C_REGISTER_THEN_DIE) {
       /* Register, then die without clearing: the exit path must unlink it. */
       sock_waiter_add(w_sock);
@@ -449,6 +455,31 @@ void sock_readiness_selftest(void) {
   sock_notify(r, OMI_POLLHUP);
   wait_done();
   chk("hup turns a blocked write into an error", w_bits == -EPIPE);
+
+  /* 11. one reader at a time. A second blocking read is refused, not parked
+   *     beside the first to split the stream in scheduler order. */
+  fake_reset();
+  wlen = 8; fk.rd_len = 0;
+  w_done = 0; w_bits = -999; w_cmd = C_READ;
+  wait_ticks(2);
+  chk("the first reader is parked", sock_waiters_live(r) == 1);
+  long busy = fd_read_ticks(t, rfd, wbuf, 8, 5);
+  chk("a second read is refused, not parked", busy == -EBUSY);
+  memcpy(fk.rd, "four", 4); fk.rd_len = 4;
+  fk.cb(fk.ctx, OMI_POLLIN);
+  wait_done();
+  chk("the parked reader still gets its bytes", w_bits == 4);
+  memcpy(fk.rd, "next", 4); fk.rd_len = 4;
+  long again = fd_read_ticks(t, rfd, wbuf, 8, 40);
+  chk("the read side was released when the read finished", again == 4);
+
+  /* 12. ownership dies with the task holding it. */
+  w_sock = r;
+  w_done = 0; w_bits = -999; w_cmd = C_OWN_THEN_DIE;
+  wait_ticks(3);
+  memcpy(fk.rd, "gone", 4); fk.rd_len = 4;
+  long after_death = fd_read_ticks(t, rfd, wbuf, 8, 40);
+  chk("a dead task's read ownership is released", after_death == 4);
 
   fk.tx_room = 4096;
   wlen = sizeof wbuf;

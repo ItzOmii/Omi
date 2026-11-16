@@ -300,7 +300,15 @@ void e1000_mac(uint8_t out[E1000_MAC_LEN]) {
   for (int i = 0; i < E1000_MAC_LEN; i++) out[i] = mac_addr[i];
 }
 
+static int test_send_rc;              /* 0 = real hardware */
+static uint32_t send_calls;
+void e1000_test_send_outcome(int rc) { test_send_rc = rc; }
+uint32_t e1000_test_send_calls(void) { return send_calls; }
+void e1000_test_send_calls_reset(void) { send_calls = 0; }
+
 int e1000_send(const void *frame, uint16_t len) {
+  send_calls++;
+  if (test_send_rc) { int rc = test_send_rc; test_send_rc = 0; return rc; }
   if (!ready || len > TXBUF) return -1;
   tx_desc_t *d = &tx_ring[tx_cur];
   /* the status byte lives in DMA memory: read it volatile or the compiler

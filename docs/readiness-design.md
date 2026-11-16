@@ -447,6 +447,91 @@ it distinguishes "poll is wrong" from "this connection never delivered" - and th
 combined call asserts only that the ready count equals the number of descriptors
 reporting bits.
 
+## 10b-bis — capacity and the unconfirmed send
+
+Two loose ends from the socket layer, closed.
+
+**Waiter slots: four was too few.** The limit was sized for "one reader and a
+writer", which is true of one thread and false of a program that polls from a
+helper task or has two writers. Raised to eight (24 sockets x 8 x 32 B = 6 KB of
+BSS). The refusal path is unchanged and still explicit: the ninth waiter gets
+`-ENOBUFS`, `stats.overflows` counts it, and the eight existing registrations are
+left intact — the exhaustion check asserts all three, so "we have more slots" did
+not quietly become "we block forever instead of refusing".
+
+**The `-2` send outcome had a policy and no test.** It was documented as "posted
+but unconfirmed, treat as sent", and it is the one branch whose wrong answer is
+silent duplicate bytes on the wire — so it is now driven directly, with `e1000`'s
+return value injected through `e1000_test_send_outcome()` and the number of send
+attempts counted rather than assumed. The injection is one-shot on purpose: a
+sticky override makes the retry it is supposed to detect invisible.
+
+`[tcp] 6 checks, 6 ok` asserts, for `-2`: reported as sent, sequence advanced by
+exactly the bytes, and exactly one attempt. For `-1`: nothing counted, sequence
+untouched, exactly one attempt — the retry is the caller's decision, not a loop
+inside `tcp_conn_send`.
+
+## 10d — pipes
+
+The last descriptor type step 4 was missing. A pipe is a 4 KB ring with two
+counts: open read ends and open write ends. The bytes are the easy part; every
+decision that matters is about a condition that cannot clear itself.
+
+**Four outcomes, and none of them are "spin".** Empty with a writer alive waits.
+Empty with no writers is `0` — EOF, the thing that ends a pipeline, not an
+error. A write with no reader is `-EPIPE` immediately: waiting there would be
+waiting for a condition that can never change. A write into a full pipe waits,
+and once any room appears it returns a *partial* write rather than filling the
+caller's whole buffer — the same contract the socket path uses.
+
+**Readiness is part of the contract, not a nicety.** A closed write end makes the
+read end readable — `read` returns 0 at once — so `poll` reports `POLLIN |
+POLLHUP`. Without that, a poller waits for data that is never coming. A pipe
+whose reader has gone reports `POLLERR` on the write end for the same reason.
+
+**Waiting is a one-tick sleep, not a waiter table.** This is the deliberate
+compromise and it is worth naming. The socket layer has a real waiter table with
+two-sided generation checks, because a socket wait spans a transport that can
+complete out of band. Pipes do not need sub-tick latency, so they get the
+version that cannot lose a wake, cannot hold a stale task reference, and cannot
+wake into an empty buffer without noticing — it re-checks the condition after
+every sleep. The price is one wake per idle tick, and up to a tick of latency.
+If something later needs better, this becomes a waitqueue with the socket's
+generation discipline; not before.
+
+**Each open end is counted once per descriptor object, not per descriptor.** A
+`dup` shares the description, so it shares a single count: closing the original
+while the dup lives must not produce EOF, and closing the dup last must. That is
+asserted from ring 3, because it is exactly the case where a naive refcount
+passes the kernel test and fails a real program.
+
+**A slot is released only when both sides are gone**, so a writer closing cannot
+free the ring a reader still points into.
+
+### Tests
+
+`[pipe] 37/37` (kernel) covers round trip, partial reads, full-pipe refusal,
+`-EAGAIN` on deadline, EOF, `-EPIPE`, slot release, an empty-pool check, and one
+real blocked read woken by a second task. Wraparound gets its own pipe driven to
+the one position that matters: both pointers at CAP-8, then 12 bytes so the last
+four land at the start of the buffer.
+
+`[pipe3] 30/30` (ring 3, through `SYS_PIPE`) proves the parts that only exist for
+a program: two usable descriptors, `EBADF` for the wrong end, poll truthfulness
+on an empty pipe, FIFO order across a short read, EOF across a `dup`-and-close in
+both directions, `-EPIPE` with a closed reader, and `EBADF` after close.
+
+### What the suite caught
+
+Adding one boot-time program pushed the task table over `TASK_MAX`, and the
+symptom was two *descriptor* checks failing ("a thread inherits the descriptor
+table", "closing the duplicate leaves the original open") — because a slot that
+cannot be allocated fails as "thread creation failed" and then reads as an fd
+bug. Task slots are never reclaimed: an exited process keeps its entry until
+reboot, so every program spawned at boot is permanent cost. Raised 32 → 40 with
+the reason recorded where the constant lives, rather than leaving the next person
+to rediscover it from a misleading failure.
+
 ## 10c. Milestone 3: writes, and the send outcome that must not be guessed
 
 The read rule, mirrored. `fd_write_ticks` pins the description for the whole
@@ -493,11 +578,39 @@ real backend can be in:
   down. The registration belongs to the socket; a fake forgetting it models a
   transition that cannot happen.
 
+## 10d. Milestone 4: one reader at a time
+
+Two tasks could previously park a blocking read on the same socket. Level-triggered
+wake-all makes that *permitted*, which is the problem: both wake for the same bytes
+and split a byte stream in whatever order the scheduler picked. Nothing corrupts,
+but no caller can reason about which read gets which bytes, and a protocol on top of
+it would be guessing.
+
+**Decision: one blocking read per socket, refused rather than queued.** A second
+concurrent blocking read returns `-EBUSY` immediately. Queueing would need a
+fairness policy and a second waiter table for readers; refusing is a rule a caller
+can hold in its head, and a caller that genuinely wants to share a stream can `dup()`
+and coordinate, which is a decision it should be making explicitly.
+
+The mechanism is an owner field, not a flag: `read_owner` holds the task id. A bare
+boolean would leak on the one path that matters - a task killed while parked inside
+the read leaves the socket unreadable for ever, with nothing to point at. Ownership
+is therefore released in three places: every normal exit from the read loop
+(including `-EAGAIN`, EOF and errors), socket allocation, and `sock_drop_waiters()`
+- the same sweep that already withdraws a dead task's waiter registrations.
+
+Deliberately *not* excluded: a non-blocking or partial read racing a parked reader.
+`read()` reports what it took, in whatever order calls arrive; that is ordinary byte
+stream behaviour. What is excluded is two tasks sleeping on the same object and being
+woken for the same transition.
+
+Five checks: the first reader parks; a second read gets `-EBUSY` rather than parking;
+the parked reader still receives its bytes; the read side is free again once that
+read returns; and a task that acquires the read side and dies inside it releases it
+by the same sweep that clears its waiters.
+
 ## 11. Still open
 
-- **Two readers on one socket.** Level-triggered wake-all permits it; concurrent
-  `read()` calls on one connection are still nonsense at API level. Serialize with
-  a reader bit, or leave undefined?
 - **Waiter count 4** is a guess; a browser may want more (a poller plus readers).
   Cheap to raise, expensive to get wrong silently.
 - **Doorbell vs switch-path pump** — decided by test 4's evidence, not before.

@@ -18,6 +18,7 @@ enum {
   ICON_CLOSE = 10,          /* ri/close-line - window close */
   ICON_MIN = 11,            /* ri/subtract-line - window minimise */
   ICON_MAX = 12,            /* ri/fullscreen-line - window maximise */
+  ICON_FILES = 13,          /* ri/folder-line - files app */
   ICON_COUNT
 };
 

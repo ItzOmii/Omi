@@ -36,6 +36,7 @@ SET = [
     ("ICON_CLOSE",      "close-line",        "window close"),
     ("ICON_MIN",        "subtract-line",     "window minimise"),
     ("ICON_MAX",        "fullscreen-line",   "window maximise"),
+    ("ICON_FILES",      "folder-line",       "files app"),
 ]
 
 

@@ -339,6 +339,64 @@ tcp_conn_t *tcp_conn_open(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t po
   return c;
 }
 
+/* The -2 outcome ("posted, never confirmed") had a written policy and no test,
+ * which is the worst combination: it is the one branch whose wrong answer is
+ * silent duplicate bytes on the wire. This drives it directly, with the card's
+ * return value injected, and measures attempts rather than trusting the code to
+ * have skipped the retry. */
+static int put_uint(char *dst, int v) {
+  char d[8]; int k = 0, o = 0;
+  if (!v) d[k++] = '0';
+  while (v) { d[k++] = (char)('0' + v % 10); v /= 10; }
+  while (k) dst[o++] = d[--k];
+  return o;
+}
+
+void tcp_test_unconfirmed(void) {
+  static tcp_conn_t tc;             /* static: conn_seg logs c - conns, and a
+                                     * stack address would make that index
+                                     * nonsense. Nothing else reads this conn. */
+  int ok = 0, n = 0;
+  const char *msg = "hello";
+
+  memset(&tc, 0, sizeof tc);
+  tc.open = 1;
+  tc.sport = 40000;
+  tc.dport = 80;
+  tc.cfg.ip[0] = 10; tc.cfg.ip[1] = 0; tc.cfg.ip[2] = 2; tc.cfg.ip[3] = 15;
+  tc.dip[0] = 10; tc.dip[1] = 0; tc.dip[2] = 2; tc.dip[3] = 2;
+  tc.seq = 1000;
+
+  /* -2: the frame went out but the card never confirmed it. It counts. */
+  e1000_test_send_calls_reset();
+  e1000_test_send_outcome(-2);
+  int rc = tcp_conn_send(&tc, msg, 5);
+  n++; if (rc == 5) ok++;                          /* reported as sent   */
+  n++; if (tc.seq == 1005) ok++;                   /* sequence advanced  */
+  n++; if (e1000_test_send_calls() == 1) ok++;     /* not sent twice     */
+
+  /* -1: nothing was posted. It must not count, and must not be retried here -
+   * the caller owns that decision, and a retry inside this loop duplicates. */
+  e1000_test_send_calls_reset();
+  e1000_test_send_outcome(-1);
+  int rc2 = tcp_conn_send(&tc, msg, 5);
+  n++; if (rc2 == 0) ok++;                         /* nothing accepted   */
+  n++; if (tc.seq == 1005) ok++;                   /* sequence untouched */
+  n++; if (e1000_test_send_calls() == 1) ok++;     /* one attempt only   */
+
+  char m[32]; int o = 0;
+  const char *pre = "[tcp] ";
+  while (*pre) m[o++] = *pre++;
+  o += put_uint(m + o, n);
+  const char *mid = " checks, ";
+  while (*mid) m[o++] = *mid++;
+  o += put_uint(m + o, ok);
+  const char *post = " ok\n";
+  while (*post) m[o++] = *post++;
+  m[o] = 0;
+  serial_puts(m);
+}
+
 int tcp_conn_send(tcp_conn_t *c, const void *buf, int len) {
   if (!c || !c->open) return -1;
   const uint8_t *p = (const uint8_t *)buf;

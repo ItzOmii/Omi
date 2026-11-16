@@ -87,6 +87,13 @@ static uint8_t intr_interval = 10;
 static uint8_t device_slot = 0;
 static uint8_t device_address = 0;
 static uint8_t interface_num = 0;
+
+/* What the one attached device turned out to be. The controller brings up one
+ * device at a time, so this is a single set of facts rather than a device table -
+ * and the fact that matters here is whether it is a HID or a disk. */
+static int usb_is_storage = 0;
+static int usb_bulk_in = 0, usb_bulk_out = 0, usb_bulk_iface = 0;
+static int usb_bulk_in_mps = 0, usb_bulk_out_mps = 0;
 static uint8_t config_value = 1;
 
 static void usb_xhci_irq_handler(interrupt_frame_t *frame) {
@@ -252,8 +259,27 @@ static void xhci_setup_ep_ctx(void *input, uint32_t index, uint8_t ep_type,
   ep[4] = mps;
 }
 
-static void xhci_cmd_enqueue(uint64_t param, uint32_t status, uint32_t ctrl_type) {
-  uint32_t ctrl = ctrl_type << 10;
+static const char *xhci_cmd_name(uint32_t t) {
+  switch (t) {
+    case XHCI_TRB_TYPE_ENABLE_SLOT:      return "enable-slot";
+    case XHCI_TRB_TYPE_ADDRESS_DEVICE:   return "address-device";
+    case XHCI_TRB_TYPE_CONFIGURE_ENDPOINT: return "configure-ep";
+    case XHCI_TRB_TYPE_EVALUATE_CONTEXT: return "evaluate-ctx";
+    default:                             return "other";
+  }
+}
+
+/* slot goes in dword3 bits 31:24 - the TRB's Slot ID. Enable Slot is the one
+ * command that must carry 0 there; every command aimed at a device must carry
+ * its slot, and without it the controller rejects the TRB with "TRB Error"
+ * before looking at a single context. */
+static void xhci_cmd_enqueue(uint8_t slot, uint64_t param, uint32_t status, uint32_t ctrl_type) {
+  serial_puts("[xHCI] -> ");
+  serial_puts(xhci_cmd_name(ctrl_type));
+  serial_puts(" slot=");
+  serial_puthex(slot);
+  serial_puts("\n");
+  uint32_t ctrl = (ctrl_type << 10) | ((uint32_t)slot << 24);
   ctrl |= cmd_cycle;
   xhci_set_trb(&cmd_ring[cmd_ring_idx], param, status, ctrl);
   cmd_ring_idx++;
@@ -271,6 +297,19 @@ static int xhci_pop_event(xhci_trb_t *out_evt) {
   xhci_trb_t *evt = &event_ring[event_ring_idx];
   uint32_t cycle = evt->dword3 & 1U;
   if (cycle != event_cycle) {
+    /* Once per wait, say what we are looking at: this is where a consumer that
+     * has drifted one slot away from the producer hides. */
+    static int seen;
+    if (seen < 3) {
+      seen++;
+      serial_puts("[xHCI] pop mismatch idx=");
+      serial_puthex((uint32_t)event_ring_idx);
+      serial_puts(" want_cycle=");
+      serial_puthex((uint32_t)event_cycle);
+      serial_puts(" got_d3=");
+      serial_puthex((uint32_t)evt->dword3);
+      serial_puts("\n");
+    }
     return -1;
   }
   if (out_evt) {
@@ -281,8 +320,30 @@ static int xhci_pop_event(xhci_trb_t *out_evt) {
     event_ring_idx = 0;
     event_cycle ^= 1;
   }
+  /* ERDP: address of the next event to read, plus EHB (bit 3) to clear the
+   * controller's "event handler busy" latch. Bit 0 is reserved - writing it
+   * there leaves the latch set and the two sides drift out of step, which shows
+   * up as events that were queued but never seen. */
   uint64_t erdp = xhci_phys_addr(&event_ring[event_ring_idx]);
-  xhci_write64(xhci_rt_base + 0x38, erdp | 0x1);
+  xhci_write64(xhci_rt_base + 0x38, erdp | (1U << 3));
+
+  /* Every event, whole. When the driver disagrees with the controller about
+   * what just happened, the four dwords are the only witnesses. */
+  serial_puts("[xHCI] ev t=");
+  serial_puthex((evt->dword3 >> 10) & 0x3F);
+  serial_puts(" cc=");
+  serial_puthex((evt->dword2 >> 24) & 0xFF);
+  serial_puts(" slot=");
+  serial_puthex((evt->dword3 >> 24) & 0xFF);
+  serial_puts(" d0=");
+  serial_puthex((uint32_t)evt->dword0);
+  serial_puts(" d1=");
+  serial_puthex((uint32_t)evt->dword1);
+  serial_puts(" d2=");
+  serial_puthex((uint32_t)evt->dword2);
+  serial_puts(" d3=");
+  serial_puthex((uint32_t)evt->dword3);
+  serial_puts("\n");
   return 0;
 }
 
@@ -323,7 +384,7 @@ static int xhci_wait_for_transfer(uint8_t ep_id, int timeout) {
 
 static int xhci_cmd_enable_slot(void) {
   xhci_trb_t evt;
-  xhci_cmd_enqueue(0, 0, XHCI_TRB_TYPE_ENABLE_SLOT);
+  xhci_cmd_enqueue(0, 0, 0, XHCI_TRB_TYPE_ENABLE_SLOT);
   if (xhci_wait_for_cmd(&evt, 10000) != 0) {
     return -1;
   }
@@ -341,14 +402,20 @@ static int xhci_cmd_address_device(uint8_t slot, void *input) {
   xhci_trb_t evt;
   uint64_t param = xhci_phys_addr(input);
   UNUSED(slot);
-  xhci_cmd_enqueue(param, 0, XHCI_TRB_TYPE_ADDRESS_DEVICE);
+  xhci_cmd_enqueue(slot, param, 0, XHCI_TRB_TYPE_ADDRESS_DEVICE);
   if (xhci_wait_for_cmd(&evt, 20000) != 0) {
+    serial_puts("[xHCI] address: no completion\n");
     return -1;
   }
   uint32_t type = (evt.dword3 >> 10) & 0x3F;
   if (type != XHCI_TRB_TYPE_CMD_COMPLETION) {
     return -1;
   }
+  /* Say the completion code out loud. A silent -1 here cost a whole debug cycle:
+   * Enable Slot was fine and this command answered "TRB Error" all along. */
+  serial_puts("[xHCI] address cc=");
+  serial_puthex((evt.dword2 >> 24) & 0xFF);
+  serial_puts("\n");
   if (((evt.dword2 >> 24) & 0xFF) != 1) {
     return -1;
   }
@@ -360,7 +427,7 @@ static int xhci_cmd_evaluate_ctx(uint8_t slot, void *input) {
   xhci_trb_t evt;
   uint64_t param = xhci_phys_addr(input);
   UNUSED(slot);
-  xhci_cmd_enqueue(param, 0, XHCI_TRB_TYPE_EVALUATE_CONTEXT);
+  xhci_cmd_enqueue((uint8_t)slot, param, 0, XHCI_TRB_TYPE_EVALUATE_CONTEXT);
   if (xhci_wait_for_cmd(&evt, 20000) != 0) {
     return -1;
   }
@@ -378,7 +445,7 @@ static int xhci_cmd_configure_ep(uint8_t slot, void *input) {
   xhci_trb_t evt;
   uint64_t param = xhci_phys_addr(input);
   UNUSED(slot);
-  xhci_cmd_enqueue(param, 0, XHCI_TRB_TYPE_CONFIGURE_ENDPOINT);
+  xhci_cmd_enqueue((uint8_t)slot, param, 0, XHCI_TRB_TYPE_CONFIGURE_ENDPOINT);
   if (xhci_wait_for_cmd(&evt, 20000) != 0) {
     return -1;
   }
@@ -421,17 +488,23 @@ static int xhci_ctrl_transfer(uint8_t req_type, uint8_t req, uint16_t value,
                    ((uint64_t)value << 16) |
                    ((uint64_t)index << 32) |
                    ((uint64_t)len << 48);
-  uint32_t ctrl = (XHCI_TRB_TYPE_SETUP << 10) | ep0_cycle | (1U << 5);
+  /* Setup Stage: bit 6 is IDT (the 8 setup bytes are in this TRB). Bit 5 is
+   * IOC - an interrupt-on-completion flag that has no meaning on a Setup TRB;
+   * setting it produces a TRB the controller does not run, and the transfer
+   * simply never completes. */
+  uint32_t ctrl = (XHCI_TRB_TYPE_SETUP << 10) | ep0_cycle | (1U << 6);
   xhci_set_trb(trb, setup, 8, ctrl);
   ep0_idx++;
 
   if (len > 0) {
     uint64_t param = xhci_phys_addr(data);
     uint32_t status = len;
-    uint32_t ctrl_data = (XHCI_TRB_TYPE_DATA << 10) | ep0_cycle | (1U << 5);
-    if ((req_type & 0x80) == 0) {
-      ctrl_data |= (1U << 16);
-    }
+    /* TRT (bits 17:16) says which way the data stage goes: 2 = IN, 3 = OUT.
+     * 0 means "no data stage" and 1 is reserved, so a data TRB with either of
+     * those is not a transfer the controller can run - it simply never
+     * completes, which looks like a hung device rather than a bad TRB. */
+    uint32_t trt = (req_type & 0x80) ? 2U : 3U;
+    uint32_t ctrl_data = (XHCI_TRB_TYPE_DATA << 10) | ep0_cycle | (1U << 5) | (trt << 16);
     xhci_set_trb(&ep0_ring[ep0_idx], param, status, ctrl_data);
     ep0_idx++;
   }
@@ -449,6 +522,43 @@ static int xhci_ctrl_transfer(uint8_t req_type, uint8_t req, uint16_t value,
 
 static int xhci_fetch_descriptor(uint8_t type, uint8_t index, void *buf, uint16_t len) {
   return xhci_ctrl_transfer(0x80, 6, (uint16_t)((type << 8) | index), 0, buf, len);
+}
+
+/* Walk the configuration descriptor for an interface with class 8 (mass storage,
+ * subclass 6 SCSI-transparent, protocol 0x50 bulk-only) and record its two bulk
+ * endpoints. Returns 0 when found.
+ *
+ * This has to happen before the HID setup: that path calls Set_Protocol on
+ * interface 0, which a storage device answers with a STALL, and the probe then
+ * fails for a reason that has nothing to do with the real one. */
+static int xhci_scan_storage(const uint8_t *cfg, int total) {
+  int i = 0;
+  int iface = -1;
+  while (i + 2 <= total) {
+    int len = cfg[i];
+    int type = cfg[i + 1];
+    if (len < 2) break;
+    if (type == 4 && len >= 9) {                       /* interface */
+      int cls = cfg[i + 5];
+      if (cls == 0x08) {
+        iface = cfg[i + 2];
+        usb_bulk_iface = iface;
+        usb_is_storage = 1;
+      } else {
+        iface = -1;
+      }
+    } else if (type == 5 && len >= 7 && iface >= 0) {   /* endpoint */
+      int addr = cfg[i + 2];
+      int attr = cfg[i + 3] & 0x03;
+      int mps = cfg[i + 4] | (cfg[i + 5] << 8);
+      if (attr == 2) {                                  /* bulk */
+        if (addr & 0x80) { usb_bulk_in = addr; usb_bulk_in_mps = mps; }
+        else { usb_bulk_out = addr; usb_bulk_out_mps = mps; }
+      }
+    }
+    i += len;
+  }
+  return usb_is_storage ? 0 : -1;
 }
 
 static int xhci_parse_hid(uint8_t *buf, uint16_t len, uint8_t *out_ep, uint16_t *out_mps,
@@ -532,7 +642,7 @@ static int xhci_setup_keyboard(uint32_t port) {
   xhci_input_set_flags(input, 0x3, 0);
   xhci_setup_slot_ctx(input, portsc, (uint8_t)(port + 1), 1);
 
-  ep0_ring = (xhci_trb_t *)xhci_alloc_aligned(sizeof(xhci_trb_t) * 256, 16);
+  ep0_ring = (xhci_trb_t *)xhci_alloc_aligned(sizeof(xhci_trb_t) * 256, 64);
   if (!ep0_ring) {
     return -1;
   }
@@ -540,7 +650,18 @@ static int xhci_setup_keyboard(uint32_t port) {
   ep0_idx = 0;
   ep0_cycle = 1;
 
-  xhci_setup_ep_ctx(input, 2, 4, (uint64_t)(uintptr_t)ep0_ring, 8, 0);
+  /* EP0's max packet size before the device descriptor is read: 8 is the USB2
+   * convention, but a SuperSpeed device is required to run EP0 at 512 from the
+   * first SETUP. Address a USB3 device with 8 and the controller simply never
+   * completes a transfer - no event, no error, just silence. */
+  int p0_speed = xhci_get_port_speed(portsc);
+  uint16_t ep0_mps = (p0_speed >= 4) ? 512 : 8;
+  serial_puts("[xHCI] ep0 mps ");
+  serial_puthex((uint32_t)ep0_mps);
+  serial_puts(" speed ");
+  serial_puthex((uint32_t)p0_speed);
+  serial_puts("\n");
+  xhci_setup_ep_ctx(input, 2, 4, (uint64_t)(uintptr_t)ep0_ring, ep0_mps, 0);
 
   if (!dev_ctx) {
     dev_ctx = xhci_alloc_aligned((size_t)xhci_context_size * 4, 64);
@@ -551,7 +672,40 @@ static int xhci_setup_keyboard(uint32_t port) {
   }
   dcbaa[device_slot] = xhci_phys_addr(dev_ctx);
 
+  serial_puts("[xHCI] input virt ");
+  serial_puthex((uint32_t)((uint64_t)(uintptr_t)input >> 32)); serial_puts(" ");
+  serial_puthex((uint32_t)(uintptr_t)input);
+  serial_puts(" phys ");
+  serial_puthex((uint32_t)(xhci_phys_addr(input) >> 32)); serial_puts(" ");
+  serial_puthex((uint32_t)xhci_phys_addr(input));
+  serial_puts(" devctx ");
+  serial_puthex((uint32_t)xhci_phys_addr(dev_ctx));
+  serial_puts("\n");
+
+  {
+    uint32_t *ic = (uint32_t *)input;
+    uint32_t *sc0 = xhci_ctx_ptr(input, 1);
+    uint32_t *ep0 = xhci_ctx_ptr(input, 2);
+    serial_puts("[xHCI] ictl ");
+    serial_puthex(ic[0]); serial_puts(" ");
+    serial_puthex(ic[1]);
+    serial_puts(" | slot ");
+    serial_puthex(sc0[0]); serial_puts(" ");
+    serial_puthex(sc0[1]);
+    serial_puts(" | ep0 ");
+    serial_puthex(ep0[0]); serial_puts(" ");
+    serial_puthex(ep0[1]); serial_puts(" ");
+    serial_puthex(ep0[2]); serial_puts(" ");
+    serial_puthex(ep0[3]);
+    serial_puts(" | dcbaa1 ");
+    serial_puthex((uint32_t)dcbaa[device_slot]);
+    serial_puts("\n");
+  }
+
   if (xhci_cmd_address_device(device_slot, input) != 0) {
+    /* No retry loop here on purpose: once a slot owns a port, addressing that
+     * same port from another slot is rejected by the duplicate-port rule, so a
+     * loop would fail for a reason of its own making and hide the real one. */
     return -1;
   }
 
@@ -593,6 +747,35 @@ static int xhci_setup_keyboard(uint32_t port) {
   }
   if (xhci_fetch_descriptor(2, 0, cfg, total) != 0) {
     return -1;
+  }
+
+  /* Identify before configuring: a storage device is not a keyboard, and the
+   * Set_Protocol call below would stall on one. */
+  if (xhci_scan_storage(cfg, total) == 0) {
+    serial_puts("[xHCI] device is mass storage: class 8 iface ");
+    serial_puthex((uint32_t)usb_bulk_iface);
+    serial_puts(" vid ");
+    serial_puthex((uint32_t)(dev_desc[8] | (dev_desc[9] << 8)));
+    serial_puts(" pid ");
+    serial_puthex((uint32_t)(dev_desc[10] | (dev_desc[11] << 8)));
+    serial_puts("\n[xHCI] bulk in ");
+    serial_puthex((uint32_t)usb_bulk_in);
+    serial_puts(" mps ");
+    serial_puthex((uint32_t)usb_bulk_in_mps);
+    serial_puts(" out ");
+    serial_puthex((uint32_t)usb_bulk_out);
+    serial_puts(" mps ");
+    serial_puthex((uint32_t)usb_bulk_out_mps);
+    serial_puts("\n");
+
+    /* Configuration still has to be set: without it the device stays at address
+     * 0 with no interface selected and every bulk transfer fails. */
+    if (xhci_ctrl_transfer(0x00, 9, cfg[5], 0, NULL, 0) != 0) {
+      serial_puts("[xHCI] Set Configuration failed for storage\n");
+      return -1;
+    }
+    serial_puts("[xHCI] storage configured; no block driver yet\n");
+    return -2;                   /* distinct: enumerated, but not a keyboard */
   }
 
   if (xhci_parse_hid(cfg, total, &intr_ep, &intr_mps, &intr_interval, &interface_num, &config_value) != 0) {
@@ -884,7 +1067,11 @@ void usb_xhci_init(void) {
   }
   xhci_write64(xhci_op_base + 0x30, xhci_phys_addr(dcbaa));
 
-  cmd_ring = (xhci_trb_t *)xhci_alloc_aligned(sizeof(xhci_trb_t) * 256, 16);
+  /* 64-byte alignment, not 16. CRCR's low six bits are reserved and the
+   * controller masks them, so a 16-aligned ring hands the hardware a base that
+   * is not where the ring actually is: every command then goes nowhere and no
+   * completion ever arrives, which looks exactly like a broken command ring. */
+  cmd_ring = (xhci_trb_t *)xhci_alloc_aligned(sizeof(xhci_trb_t) * 256, 64);
   if (!cmd_ring) {
     return;
   }
@@ -897,7 +1084,7 @@ void usb_xhci_init(void) {
 
   xhci_write64(xhci_op_base + 0x18, cmd_ring_phys | cmd_cycle);
 
-  event_ring = (xhci_trb_t *)xhci_alloc_aligned(sizeof(xhci_trb_t) * 256, 16);
+  event_ring = (xhci_trb_t *)xhci_alloc_aligned(sizeof(xhci_trb_t) * 256, 64);
   if (!event_ring) {
     return;
   }
@@ -955,7 +1142,17 @@ void usb_xhci_init(void) {
       uint32_t portsc = xhci_read32(portsc_off);
       
       if (portsc & XHCI_PORTSC_CCS) {
-        if (xhci_setup_keyboard(port) == 0) {
+        int st = xhci_setup_keyboard(port);
+        if (st == -2) {
+          /* Enumerated and configured, but it is a disk: no keyboard ring to
+           * queue, and no block driver behind it yet. Mark it differently from a
+           * failure, because it is not one. */
+          for (int y = 0; y < 100; y++)
+            for (int x = 0; x < 100; x++)
+              debug_rect(x, 300 + y, 1, 1, 0xFF0000FF);
+          continue;
+        }
+        if (st == 0) {
           /* [3] GREEN BLOCK - keyboard enumerated */
           for (int y = 0; y < 100; y++) {
             for (int x = 0; x < 100; x++) {
