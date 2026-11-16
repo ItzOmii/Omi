@@ -52,7 +52,7 @@ swap to. Adding it belongs with SMP, not before.
 |---|---|---|
 | 0,1 | read, write | the existing handlers |
 | 2,3,8 | open, close, lseek | `open`'s mode argument ignored |
-| 9,11 | mmap, munmap | `MAP_ANONYMOUS` only |
+| 9,11 | mmap, munmap | anonymous, or file-backed `MAP_PRIVATE`; `MAP_FIXED`; `MAP_SHARED` over a file is `-ENOSYS` |
 | 10 | mprotect | closes a step-2 gap: area flags plus live PTEs |
 | 12 | brk | one lazily-populated 16 MB area, pointer moved inside it |
 | 16 | ioctl | `TCGETS`/`TIOCGWINSZ` only |
@@ -155,7 +155,9 @@ NULL, auxv`. Three auxv entries are load-bearing:
 
 `AT_PHDR` is the mapped address of the header table (image base + `e_phoff`),
 which is only correct for `ET_EXEC` - the loader refuses anything else, and a
-PIE would need the load bias added, which is step 6.
+PIE would need the load bias added, which is the `PT_INTERP`/`AT_BASE` work in
+`docs/dynamic-linking.md` (step 6c). `AT_BASE` is the other half: it names the
+interpreter, and without it `ld.so` has no idea where it was loaded.
 
 ## Threads
 
@@ -366,4 +368,6 @@ reading `%fs:0`; unknown number `-ENOSYS`.
 
 Boot: `[linux3] 27/27 ok`, `[musl] OK`, `[threads] ... OK`, `[stat] OK` and `[fork] OK`, alongside `[pipe] 37/37`,
 `[pipe3] 30/30`, `[rdy] 56/56`, `vfs 16/16`, `futex 3/3`, `[rfs] module files exposed=18 skipped=0`
-with `[modtest] OK 15/15`, no panic, no "killed user task" beyond the isolation probe that asks for it.
+with `[modtest] OK 15/15`, `[maptest] OK 17/17` (file-backed `mmap`, `MAP_FIXED` over a
+reservation, and the three refusals), no panic, no "killed user task" beyond the isolation probe that
+asks for it.

@@ -70,27 +70,41 @@ the host, byte for byte. The test also requires the file's own symbol string
 wrong contents still fails, and it opens `/hello.txt` afterwards to prove the
 seeded RAM files were not shadowed.
 
-## 6b - file-backed `MAP_PRIVATE` (next)
+## 6b - file-backed `MAP_PRIVATE` (done)
 
-`linux_mmap` currently refuses anything without `MAP_ANONYMOUS`. What `ld.so`
-needs is a mapping whose pages come from the file's bytes and become private on
-first write - which is the COW machinery already in `kernel/cow.c`, with the
-module blob as the fill source instead of the parent's frame.
+`linux_mmap` now takes the full Linux argument list and chooses between two
+kinds of region:
 
-Design constraints, so the mapping cannot become a second memory subsystem:
+```
+[maptest] OK 17/17 (file-backed MAP_PRIVATE, MAP_FIXED over a reservation, refusals)
+```
 
-- read-only PTE from the start; a write fault allocates a frame, copies one page
-  from the blob, and clears the write-protect - the same path a `fork` COW fault
-  takes;
-- the area records its file and offset, so `munmap` releases everything through
-  `cow_release` like any other area (the `sys_vm_free` bug is the precedent: a
-  frame released behind the pool's back is a leak the audit would blame on
-  someone else);
-- offset and length must be page-aligned down / rounded up, and a map past EOF
-  is `-EINVAL`, not a zero-filled tail - silently inventing bytes is how a
-  corrupt library gets loaded without a diagnostic.
+- **Pages are copied from the blob, not aliased to it.** The blob is bootloader
+  memory owned by nobody: an aliased page could never be released through the
+  refcount bank, so the audit would have needed an exception for frames it never
+  owned. Copied frames are ordinary frames and leave through `cow_release`.
+- **The area records the source, the fill happens in `vm_fault_in`.** No new
+  fault path - the anonymous one grew a branch. That also keeps `fork` correct
+  for free, since the child inherits the area and copies frames like any other.
+- **`MAP_FIXED` releases what is in the way**, then drops any area overlapping
+  the target range whole; its remainder becomes an unmapped fault, which is what
+  the `PROT_NONE` reservation was standing in for. A hint allocation steps over
+  live regions rather than colliding with a fixed mapping.
+- **Offsets are page-aligned and must start before EOF**; a length whose last
+  page runs past EOF is legal and reads zero there. The earlier plan said "map
+  past EOF is EINVAL" - that was wrong, and reading musl's `ldso` showed why:
+  it maps `(filesz + off + 4095) & -4096`, so every segment that is not a page
+  multiple maps a page past EOF. Refusing that would refuse every library.
+- **`MAP_SHARED` over a file is `-ENOSYS`** - nothing can write a frame back into
+  a boot module, and a shared mapping that is silently private is worse.
+- **`PROT_NONE` is not implemented** - reservations come back readable. `ld.so`
+  only uses them as placeholders it maps over, so nothing depends on it yet.
+  Recorded as a gap, not as a design.
 
-## 6c - `PT_INTERP` and `AT_BASE` (after that)
+The test compares the same page fetched two ways, `read()` and the mapping, and
+requires the page to be non-zero, so a zero fill of the right length fails.
+
+## 6c - `PT_INTERP` and `AT_BASE` (next)
 
 `kernel/elf.c` rejects everything that is not `ET_EXEC` today (`not a static
 executable`). It needs: `ET_DYN` loaded at a chosen base, `PT_INTERP` read from

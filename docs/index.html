@@ -192,10 +192,10 @@
       <a class="btn ghost" href="#inside">See the screens</a>
     </div>
     <div class="facts">
-      <div class="fact"><b>21,750</b><span>lines of our own</span></div>
-      <div class="fact"><b>11 MB</b><span>bootable ISO</span></div>
-      <div class="fact"><b>18</b><span>syscalls</span></div>
-      <div class="fact"><b>9</b><span>tasks on boot</span></div>
+      <div class="fact"><b>147,000</b><span>lines of our own</span></div>
+      <div class="fact"><b>12 MB</b><span>bootable ISO</span></div>
+      <div class="fact"><b>34</b><span>syscalls</span></div>
+      <div class="fact"><b>14</b><span>programs on the ISO</span></div>
     </div>
   </div>
   <div class="hero-shot">
@@ -212,14 +212,14 @@
     <span><b>dhcp</b> lease 10.0.2.15</span><span><b>dns</b> A records</span>
     <span><b>tcp</b> handshake + retries</span><span><b>http/1.1</b> client</span>
     <span><b>minimp3</b> decoder</span><span><b>hda</b> 48 khz stereo</span>
-    <span><b>tls 1.2</b> · bearssl</span><span><b>ring 3</b> · 18 syscalls</span>
+    <span><b>tls 1.2</b> · bearssl</span><span><b>ring 3</b> · 34 syscalls</span>
     <span><b>elf</b> programs from the ISO</span><span><b>pit</b> 100 hz · preempt</span>
     <span><b>shm</b> between processes</span><span><b>limine</b> timeout 0</span>
     <span>·</span><span><b>e1000</b> driver</span><span><b>arp</b> · ipv4 · icmp · udp</span>
     <span><b>dhcp</b> lease 10.0.2.15</span><span><b>dns</b> A records</span>
     <span><b>tcp</b> handshake + retries</span><span><b>http/1.1</b> client</span>
     <span><b>minimp3</b> decoder</span><span><b>hda</b> 48 khz stereo</span>
-    <span><b>tls 1.2</b> · bearssl</span><span><b>ring 3</b> · 18 syscalls</span>
+    <span><b>tls 1.2</b> · bearssl</span><span><b>ring 3</b> · 34 syscalls</span>
     <span><b>elf</b> programs from the ISO</span><span><b>pit</b> 100 hz · preempt</span>
     <span><b>shm</b> between processes</span><span><b>limine</b> timeout 0</span>
   </div>
@@ -242,7 +242,7 @@
           <p>Windows-style bottom bar: the Omi mark is the start button, running apps become buttons,
             and the clock sits right. Midnight is the boot appearance, drawn flat — no bevels, no drop
             shadows, hairline borders and one accent.</p>
-          <div class="meta"><span>kernel/gui/</span> compositor.c · icons_ri.h</div>
+          <div class="meta"><span>kernel/gui/</span> compositor.c · icons_ri.c</div>
         </div>
       </article>
 
@@ -358,8 +358,8 @@
     <div class="stack">
       <div>
         <h3>What is actually running</h3>
-        <p>The compositor is task 0. Beside it are kernel workers, three demo programs and two that
-          only exist to prove shared memory — one writes a string, the other reads it back. The
+        <p>The compositor is task 0. Beside it are kernel workers, demo programs, and the tests that prove shared memory, fork and
+          file mappings — one process writes a string, another reads it back. The
           window process sleeps in <span class="mono">blocked</span> and costs nothing until an event
           arrives; the spinner never yields at all, so its ticks and switches stay equal.</p>
         <div class="term">
@@ -377,7 +377,7 @@
         <div class="layer"><b>gdt + tss</b><span>installed by the kernel; limine's table is not guaranteed</span></div>
         <div class="layer"><b>pit</b><span>100 hz on irq0, the only clock in the system</span></div>
         <div class="layer"><b>address space</b><span>one pml4 per program, kernel mapped supervisor-only</span></div>
-        <div class="layer"><b>syscalls</b><span>int 0x80 at dpl 3, 18 calls, args in rdi/rsi/rdx/r8</span></div>
+        <div class="layer"><b>syscalls</b><span>int 0x80 at dpl 3, 34 calls, args in rdi/rsi/rdx/r8</span></div>
         <div class="layer"><b>programs</b><span>elf files on the iso, loaded and mapped by the kernel</span></div>
         <div class="layer"><b>preemption</b><span>every task is an interrupt frame; irq0 switches at cpl 3</span></div>
         <div class="layer"><b>sleep</b><span>blocked state + wake on input, no busy polling</span></div>
@@ -397,10 +397,12 @@
     <div class="holes">
       <div class="hole">
         <div class="n">01</div>
-        <h4>No demand paging, no mmap</h4>
-        <p>User memory is fixed 4 KB frames from a 1 MB pool, with a 32 KB stack behind it. There is
-          no allocator over physical memory and no way to map memory on demand, which is the next
-          blocker for anything bigger than a demo.</p>
+        <h4>Dynamic linking is half built</h4>
+        <p>A program can be a real musl binary, open a library and map it — but the loader still
+          takes static <span class="mono">ET_EXEC</span> only. <span class="mono">PT_INTERP</span> and
+          <span class="mono">AT_BASE</span> are the last pieces before musl's
+          <span class="mono">ld.so</span> can run, so nothing linked against a shared object
+          executes yet.</p>
       </div>
       <div class="hole">
         <div class="n">02</div>
@@ -411,10 +413,12 @@
       </div>
       <div class="hole">
         <div class="n">03</div>
-        <h4>The network is still kernel-only</h4>
-        <p>TCP, DNS and TLS all work, but a ring-3 process cannot open a socket — the in-kernel
-          browser is the only client. Sockets, threads and a filesystem are the gaps between this and
-          anything you would call an application platform.</p>
+        <h4>The network stops at one connection's lifetime</h4>
+        <p>A ring-3 process can open a socket, <span class="mono">poll</span> it and read from it,
+          but a connection ends with a single FIN: no <span class="mono">RST</span>, no
+          <span class="mono">TIME_WAIT</span>, no retransmission. There are no server sockets, no UDP
+          socket API, and TLS lives in the kernel — so a program gets <span class="mono">http://</span>
+          but not <span class="mono">https://</span>.</p>
       </div>
     </div>
   </div>
@@ -441,14 +445,14 @@ sudo dd if=omi.iso of=/dev/sdX bs=4M status=progress</pre>
         <dl class="kv">
           <dt>base</dt><dd>viralcode/vib-OS @ 73b6429</dd>
           <dt>target</dt><dd>x86_64, BIOS + UEFI via Limine</dd>
-          <dt>diff</dt><dd>21,750 lines of our own code, plus vendored gumbo, bearssl, stb, minimp3</dd>
-          <dt>iso</dt><dd>11 MB, boots straight to midnight</dd>
+          <dt>diff</dt><dd>147,000 lines of our own code, plus vendored gumbo, bearssl, stb, minimp3</dd>
+          <dt>iso</dt><dd>12 MB, boots straight to midnight</dd>
           <dt>media</dt><dd>generated placeholders, not licensed music</dd>
           <dt>license</dt><dd>same as upstream</dd>
         </dl>
         <p class="sub" style="font-size:15px">The screenshots on this page are unretouched
-          1280×800 captures from the ISO above, taken in QEMU with the e1000 and HDA devices
-          attached. Nothing is mocked up.</p>
+          1280×800 captures from QEMU boots of this tree with the e1000 and HDA devices attached.
+          Nothing is mocked up.</p>
       </div>
     </div>
   </div>

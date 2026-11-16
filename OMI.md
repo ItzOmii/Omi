@@ -2,14 +2,15 @@
 
 Omi is a fork of [vib-OS](https://github.com/viralcode/vib-OS) — same custom 64-bit kernel,
 same from-scratch userspace — with a different face and a few things the base tree does not
-have: networking, sound, a browser, and a flat, paper-coloured shell.
+have: networking, sound, a browser, a ring-3 process model with copy-on-write `fork`, and a flat,
+paper-coloured shell.
 
 Everything here is x86_64 and lives in [`vib-os-x86_64/`](vib-os-x86_64/). The ARM/RISC-V trees
 are untouched upstream code.
 
 ![Omi desktop](vib-os-x86_64/screenshots/omi-desktop.png)
 
-**Landing page:** [`docs/index.html`](docs/index.html) — the pitch, the stack, and six unretouched
+**Landing page:** [`docs/index.html`](docs/index.html) — the pitch, the stack, and eight unretouched
 1280×800 captures taken in QEMU. It is static HTML with no javascript; open the file directly or
 serve the folder.
 
@@ -31,7 +32,7 @@ with an HTTP/1.1 client on top (`kernel/net/`). The network widget reports link 
 of our own (`kernel/gui/omiweb.c`), with stb_truetype text, decoded images, clickable links and
 tables. HTTPS works: TLS 1.2 through BearSSL with a pinned root bundle (`kernel/net/roots.c`).
 
-**Processes.** GDT + TSS, a 100 Hz PIT, and a round-robin scheduler over twelve task slots with
+**Processes.** GDT + TSS, a 100 Hz PIT, and a round-robin scheduler over 96 task slots with
 16 KB kernel stacks (`kernel/kernel_task.c`). The task manager window lists every task with state,
 ticks, switches and a CPU-share bar, and is reachable with Ctrl+Alt+Del or from the taskbar's
 right-click menu.
@@ -42,14 +43,22 @@ gate at DPL 3. Programs are ELF files on the boot medium, loaded by `kernel/elf.
 preemptive for ring 3: every suspended task is an interrupt frame, and IRQ0 switches it away a
 hundred times a second. The compositor acts as a server — a process sends draw commands and receives
 mouse and key events — and `SYS_SHM_GET`/`SYS_SHM_ATTACH` map the same frames into two address
-spaces. The mechanics, and the four bugs that cost a boot each, are in the README.
+spaces.
+
+**Processes in ring 3.** A program is a real musl binary: libc sets itself up from the auxv, threads
+run on `clone` with futexes, `fork` copies the address space copy-on-write behind a refcounted page
+bank, and `wait4` reaps. A process opens files by path — every boot module is registered read-only
+under its boot name, so a library can be read from inside the system that loaded it — and maps one
+into its own space with a file-backed `MAP_PRIVATE` mapping. Dynamic linking is the piece still
+missing: `kernel/elf.c` loads static `ET_EXEC` only, so musl's `ld.so` cannot run yet
+(`docs/dynamic-linking.md`). The mechanics, and the four bugs that cost a boot each, are in the README.
 
 **Sound.** Intel HDA output with a streaming API (`hda_stream_start/write/free/stop`) and an MP3
 decoder (minimp3) in `kernel/media/`. The media player streams the track from disk while it plays,
 shows elapsed/total time and a progress bar, and does not stall the compositor while decoding.
 
-**Apps.** Calculator, notepad, media player, Omi Net, plus toggleable clock / weather / network
-widgets.
+**Apps.** Calculator, notepad, media player, Omi Net, Files and the task manager, plus toggleable
+clock / weather / network widgets.
 
 ## Building
 
@@ -73,10 +82,17 @@ qemu-system-x86_64 -m 512 -cdrom omi.iso -boot d -vga std \
 
 ## What does not work yet
 
-- **No TLS.** HTTPS is refused, not silently broken. A weather forecast needs TLS, so the weather
-  widget reports connectivity rather than a forecast.
+- **No dynamic linking yet.** A shared-object program cannot run: the loader takes static `ET_EXEC`,
+  and `PT_INTERP`/`AT_BASE` are the remaining work. Static musl binaries, `fork`, threads and
+  file-backed `mmap` all work.
 - **No microphone capture** on real hardware — no capture endpoint is exposed by most onboard HDA.
-- **No multi-process userspace.** Apps are kernel-resident windows, as in upstream vib-OS.
+- **The shell's apps are still kernel-resident windows**, as in upstream vib-OS. Programs run outside
+  the kernel, but Calculator, Notepad, the browser and the file manager are structs and draw functions
+  compiled in.
+- **No `exec` from a path.** A program is spawned from a hardcoded list matched by module name, so a
+  loaded module is not a runnable file.
+- **No TCP teardown, retransmission, server sockets or UDP.** One FIN ends a connection; `bind`/
+  `listen`/`accept` do not exist.
 - **Slow HTTP origins look slow.** Connect timeouts are 1.5 s → 3.5 s → 5 s across three attempts
   (fresh source port each time), so a site that takes 11 s to answer will fail rather than hang.
 
@@ -88,5 +104,5 @@ pattern), committed so the media player has something to open. Swap in your own 
 ## Upstream
 
 Forked from [viralcode/vib-OS](https://github.com/viralcode/vib-OS) at `73b6429`. Changes are
-confined to `vib-os-x86_64/` and are visible as a single commit on top of upstream — see
-`git log --stat` or the compare view against `viralcode/vib-OS:main`.
+confined to `vib-os-x86_64/` and sit as 26 commits on top of upstream — see `git log --stat` or the
+compare view against `viralcode/vib-OS:main`.
