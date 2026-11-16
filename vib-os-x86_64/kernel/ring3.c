@@ -23,6 +23,7 @@
 #include "include/kmalloc.h"
 #include "include/net.h"
 #include "include/omi_net.h"
+#include "include/socket.h"
 
 /* From the boot path. */
 extern uint64_t hhdm_offset;
@@ -185,7 +186,9 @@ void mm_on_exit(task_t *t) {
     zombie[nzombies++] = mm;
     return;
   }
+  int socks = fd_count_kind(mm->fds, FK_SOCKET);
   fdtable_free(mm->fds);
+  sock_report_after_space(socks);
   mm_free_tables(mm);          /* table full: nothing sane left to do */
   kfree(mm);
 }
@@ -196,7 +199,9 @@ void mm_reap(void) {
   uint64_t now = ring3_read_cr3();
   for (int i = 0; i < nzombies; i++) {
     if (zombie[i]->cr3 == now) continue;      /* still the live one */
+    int socks = fd_count_kind(zombie[i]->fds, FK_SOCKET);
     fdtable_free(zombie[i]->fds);
+    sock_report_after_space(socks);   /* endpoints must not outlive their space */
     mm_free_tables(zombie[i]);
     kfree(zombie[i]);
     serial_puts("[mm] address space freed\n");
@@ -1185,4 +1190,5 @@ void ring3_init(void) {
   log_hex("[ring3] user window     ", RING3_USER_BASE);
   iso_selftest();
   pt_selftest();
+  sock_selftest();
 }

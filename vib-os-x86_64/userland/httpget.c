@@ -5,7 +5,11 @@
  * on stdout. Still no libc: syscall number in rax, args in rdi/rsi/rdx, result
  * in rax, errors as -errno.
  *
- *   httpget HOST [PORT] [PATH] [dup]
+ *   httpget HOST [PORT] [PATH] [dup|noclose]
+ *
+ * `noclose` is a kernel test, not a feature: it exits with the descriptor still
+ * open so the address-space teardown has an endpoint to reclaim. A socket that
+ * outlives its process would keep receiving segments for nobody.
  */
 
 #define SYS_WRITE   1
@@ -154,7 +158,11 @@ int cmain(long argc, char **argv) {
     err("recv", n);
     break;
   }
-  sys3(SYS_CLOSE, fd, 0, 0);
+  static const char leak_msg[] =
+      "httpget: exiting with the socket still open (the kernel must reap it)\n";
+  int leak = argc > 4 && argv[4][0] == 'n' && argv[4][1] == 'o';
+  if (leak) sys3(SYS_WRITE, 1, (long)leak_msg, sizeof leak_msg - 1);
+  else      sys3(SYS_CLOSE, fd, 0, 0);
 
   char line[96];
   d = app(line, "\nhttpget: ");

@@ -7,6 +7,7 @@
 #include "../include/errno.h"
 #include "../include/kmalloc.h"
 #include "../include/omi_net.h"
+#include "../include/socket.h"
 #include "../include/net.h"
 
 extern void serial_puts(const char *s);
@@ -101,7 +102,7 @@ static void ofile_put(ofile_t *o) {
    * descriptors must not tear down the socket the other is still using. */
   if (!o || o->kind == FK_CONSOLE) return;    /* static, never freed */
   if (--o->refs > 0) return;
-  if (o->kind == FK_SOCKET && o->conn) tcp_conn_close(o->conn);
+  if (o->kind == FK_SOCKET && o->sock) sock_close(o->sock);
   zero(o, sizeof *o);
 }
 
@@ -178,27 +179,49 @@ int fd_socket(fdtable_t *t) {
   o->kind = FK_SOCKET;
   o->flags = O_RDWR;
   o->file = 0;
-  o->conn = 0;
+  o->sock = sock_new();          /* no transport until connect() */
+  if (!o->sock) { ofile_put(o); return -EMFILE; }
   int fd = fd_alloc(t, o);
   if (fd < 0) { ofile_put(o); return fd; }
   return fd;
+}
+
+/* How many descriptors of one kind a table holds. Used by teardown accounting:
+ * "did this space own network endpoints" is a question about the table, and it
+ * has to be asked before the table is freed. */
+int fd_count_kind(fdtable_t *t, int kind) {
+  int n = 0;
+  if (!t) return 0;
+  for (int i = 0; i < FD_MAX; i++)
+    if (t->fd[i] && t->fd[i]->kind == kind) n++;
+  return n;
+}
+
+/* Readiness, computed. A regular file is always ready: it cannot block. A
+ * socket answers through its backend. */
+unsigned fd_poll(fdtable_t *t, int fd) {
+  if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return OMI_POLLERR;
+  ofile_t *o = t->fd[fd];
+  if (o->kind == FK_SOCKET)  return sock_poll(o->sock);
+  if (o->kind == FK_FILE)    return OMI_POLLIN | OMI_POLLOUT;
+  if (o->kind == FK_CONSOLE) return 0;      /* no keyboard path yet */
+  return OMI_POLLERR;
 }
 
 int fd_connect(fdtable_t *t, int fd, uint32_t ip, uint16_t port) {
   if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
   ofile_t *o = t->fd[fd];
   if (o->kind != FK_SOCKET) return -ENOTSOCK;
-  if (o->conn) return -EISCONN;
+  if (!o->sock) return -EBADF;
 
   uint8_t a[4];
   a[0] = (uint8_t)(ip >> 24); a[1] = (uint8_t)(ip >> 16);
   a[2] = (uint8_t)(ip >> 8);  a[3] = (uint8_t)ip;
   const net_cfg_t *cfg = net_get();
   /* Each socket gets its own connection, so a second program connecting
-   * elsewhere no longer disturbs the first. */
-  o->conn = tcp_conn_open(cfg, a, port);
-  if (!o->conn) return -ECONNREFUSED;
-  return 0;
+   * elsewhere no longer disturbs the first. The transport is chosen by the
+   * backend behind sock_connect, not by this file. */
+  return sock_connect(o->sock, cfg, a, port);
 }
 
 int fd_close(fdtable_t *t, int fd) {
@@ -214,12 +237,7 @@ long fd_read(fdtable_t *t, int fd, void *kbuf, uint64_t n) {
   if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
   ofile_t *o = t->fd[fd];
   if ((o->flags & 3) == O_WRONLY) return -EBADF;
-  if (o->kind == FK_SOCKET) {
-    if (!o->conn) return -ENOTCONN;
-    int r = tcp_conn_recv(o->conn, kbuf, (int)n, 5000);
-    if (r > 0) return r;
-    return r == 0 ? -EAGAIN : 0;      /* timeout, or the peer closed: EOF */
-  }
+  if (o->kind == FK_SOCKET) return sock_recv(o->sock, kbuf, n, 5000);
   if (o->kind == FK_CONSOLE) return 0;        /* no keyboard path yet: EOF */
   rfile_t *f = o->file;
   if (!f || !f->used) return -EBADF;
@@ -237,11 +255,7 @@ long fd_write(fdtable_t *t, int fd, const void *kbuf, uint64_t n) {
   ofile_t *o = t->fd[fd];
   if ((o->flags & 3) == O_RDONLY) return -EBADF;
 
-  if (o->kind == FK_SOCKET) {
-    if (!o->conn) return -ENOTCONN;
-    int w = tcp_conn_send(o->conn, kbuf, (int)n);
-    return w < 0 ? -EPIPE : (long)w;
-  }
+  if (o->kind == FK_SOCKET) return sock_send(o->sock, kbuf, n);
 
   if (o->kind == FK_CONSOLE) {
     /* Write all of it. The first version capped every call at 256 bytes and

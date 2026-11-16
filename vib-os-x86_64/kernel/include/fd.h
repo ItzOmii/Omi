@@ -20,6 +20,7 @@
 #define OMI_FD_H
 
 #include <stdint.h>
+#include "readiness.h"
 
 #define FD_MAX      16
 #define OFILE_MAX   64
@@ -42,7 +43,9 @@
 /* A socket is a fourth kind of descriptor, not a parallel mechanism: the whole
  * point of the ofile layer is that read/write/close on a socket go down the same
  * path as on a file, and the caller cannot tell the difference at the syscall. */
-struct tcp_conn;
+/* A socket is an opaque endpoint object (see socket.h): this header names the
+ * pointer and nothing else, so the VFS cannot grow a dependency on a transport. */
+struct socket;
 
 enum { FK_NONE = 0, FK_CONSOLE, FK_FILE, FK_SOCKET };
 
@@ -62,7 +65,7 @@ typedef struct {
   uint64_t off;
   int      refs;
   rfile_t *file;
-  struct tcp_conn *conn;   /* FK_SOCKET: this socket's own TCP connection */
+  struct socket *sock;     /* FK_SOCKET: the endpoint, shared by every dup */
   int      used;
 } ofile_t;
 
@@ -82,6 +85,8 @@ long fd_seek(fdtable_t *t, int fd, int64_t off, int whence);
 int  fd_close(fdtable_t *t, int fd);
 int  fd_dup(fdtable_t *t, int fd);
 int  fd_socket(fdtable_t *t);
+unsigned fd_poll(fdtable_t *t, int fd);   /* OMI_POLL* bits, never blocks */
+int  fd_count_kind(fdtable_t *t, int kind);
 int  fd_connect(fdtable_t *t, int fd, uint32_t ip, uint16_t port);
 
 #endif

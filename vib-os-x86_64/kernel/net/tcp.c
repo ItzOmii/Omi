@@ -15,6 +15,7 @@
 #include "string.h"
 #include "net.h"
 #include "omi_net.h"
+#include "net_backend.h"
 #include "e1000.h"
 #include "task.h"
 
@@ -553,4 +554,55 @@ int net_dns_resolve(const net_cfg_t *cfg, const char *host, uint8_t ip_out[4]) {
   int ok = dns_resolve_once(cfg, host, ip_out);
   dns_busy = 0;
   return ok;
+}
+
+/* ---- the backend boundary ---------------------------------------------
+   fd.c calls these through socket_backend(), never by name. That is the whole
+   point: a userspace network service answering the same five calls over IPC
+   would be a different table, not a different VFS. */
+
+/* Readiness, computed from endpoint state. Never blocks and never polls the NIC:
+   bytes only reach rx[] through the existing receive path, so this answers from
+   what has already arrived. */
+unsigned tcp_conn_poll(struct tcp_conn *c) {
+  if (!c || !c->used) return OMI_POLLERR | OMI_POLLHUP;
+  unsigned r = 0;
+  if (c->rx_len > 0)      r |= OMI_POLLIN;      /* data waiting */
+  if (c->peer_closed)     r |= OMI_POLLIN | OMI_POLLHUP;  /* EOF is readable */
+  if (c->open)            r |= OMI_POLLOUT;
+  if (!c->open && !c->peer_closed) r |= OMI_POLLERR;
+  return r;
+}
+
+/* Thin adapters: the ops table speaks void*, this file speaks tcp_conn_t, and
+ * the cast happens in exactly these five lines rather than at every call site. */
+static void *op_open(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t port) {
+  return tcp_conn_open(cfg, ip, port);
+}
+static int  op_send(void *h, const void *buf, int len) {
+  return tcp_conn_send((struct tcp_conn *)h, buf, len);
+}
+static int  op_recv(void *h, void *buf, int max, int timeout_ms) {
+  return tcp_conn_recv((struct tcp_conn *)h, buf, max, timeout_ms);
+}
+static void op_close(void *h) { tcp_conn_close((struct tcp_conn *)h); }
+static unsigned op_poll(void *h) { return tcp_conn_poll((struct tcp_conn *)h); }
+
+static const struct socket_ops tcp_kernel_ops = {
+  .name  = "kernel-tcp",
+  .open  = op_open,
+  .send  = op_send,
+  .recv  = op_recv,
+  .close = op_close,
+  .poll  = op_poll,
+};
+
+/* Static, not installed by an init call: a caller must never be able to observe
+   "no backend" because it ran one line early. */
+static const struct socket_ops *backend = &tcp_kernel_ops;
+
+const struct socket_ops *socket_backend(void) { return backend; }
+
+void socket_backend_select(const struct socket_ops *ops) {
+  if (ops) backend = ops;
 }

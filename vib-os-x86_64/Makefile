@@ -101,6 +101,9 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/ring3.c \
            $(KERNEL_DIR)/elf.c \
            $(KERNEL_DIR)/fs/fd.c \
+           $(KERNEL_DIR)/fs/socket.c \
+           $(KERNEL_DIR)/fs/fd_opaque_check.c \
+           $(KERNEL_DIR)/fs/socket_selftest.c \
            $(KERNEL_DIR)/gui/webimg.c \
            $(KERNEL_DIR)/gui/icons_ri.c \
            $(KERNEL_DIR)/net/tcp.c \

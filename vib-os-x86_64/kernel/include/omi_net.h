@@ -3,14 +3,15 @@
  *
  * The stack below this file does DHCP + ARP + ICMP. Everything above a
  * browser needs streams, so this adds the smallest TCP that can honestly
- * carry an HTTP request: one connection at a time, blocking, no options
+ * carry an HTTP request: several connections at once, blocking, no options
  * beyond MSS, no window scaling, no SACK. That is enough for a GET on a
  * local network and for QEMU's slirp, and small enough to read.
  *
- * Deliberate limits: a single in-flight connection, data is ACKed as it
- * arrives but never retransmitted (the caller writes once, and if the
- * segment is lost the request times out instead of hanging forever), and
- * out-of-order segments are dropped rather than queued.
+ * Deliberate limits, all of them visible in the code that would have to fix
+ * them: data is ACKed as it arrives but never retransmitted (a lost segment
+ * turns into a timeout, not a resend), out-of-order segments are dropped
+ * rather than queued, and teardown sends a FIN without waiting for the peer's
+ * ACK or tracking TIME_WAIT.
  */
 
 #ifndef _OMI_TCP_H

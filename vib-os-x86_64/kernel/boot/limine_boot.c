@@ -493,6 +493,11 @@ void _start(void) {
   static const char *get4[] = { "httpget", "example.org", "80", "/" };
   ring3_spawn_elf_argv("httpget3", "httpget.elf", 4, get3);
   ring3_spawn_elf_argv("httpget4", "httpget.elf", 4, get4);
+  /* Exits holding the socket, so the address-space teardown has an endpoint to
+   * reclaim: the kernel must destroy it exactly once, or a dead process keeps
+   * receiving segments. */
+  static const char *get5[] = { "httpget", "10.0.2.2", "8899", "/c.txt", "noclose" };
+  ring3_spawn_elf_argv("httpget5", "httpget.elf", 5, get5);
 
   serial_puts("Starting main loop...\n");
 
