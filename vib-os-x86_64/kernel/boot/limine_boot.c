@@ -526,6 +526,7 @@ void _start(void) {
     /* File-backed mappings: what the linker does with the file libprobe just
      * proved it could read. */
     ring3_spawn_elf("libmap", "libmap.elf", 0);
+  ring3_spawn_elf("dyntest", "dyntest.elf", 0);
   }
 
   serial_puts("Starting main loop...\n");

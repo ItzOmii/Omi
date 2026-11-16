@@ -46,7 +46,7 @@ same test.
 ## 6a - boot modules are files (done)
 
 Every Limine module is registered in the RAM file table under the path Limine was
-given for it (`kernel/ring3.c`, `[rfs] module files exposed=18`). The entry
+given for it (`kernel/ring3.c`, `[rfs] module files exposed=21 skipped=0`). The entry
 points straight at the module blob:
 
 - **no copy** - `rfile_t.data` is the module's address, so a 16 KB library costs
@@ -104,16 +104,55 @@ kinds of region:
 The test compares the same page fetched two ways, `read()` and the mapping, and
 requires the page to be non-zero, so a zero fill of the right length fails.
 
-## 6c - `PT_INTERP` and `AT_BASE` (next)
+## 6c - `PT_INTERP` and `AT_BASE` (done)
 
-`kernel/elf.c` rejects everything that is not `ET_EXEC` today (`not a static
-executable`). It needs: `ET_DYN` loaded at a chosen base, `PT_INTERP` read from
-the file, the interpreter loaded as an image, and the auxv extended with
-`AT_BASE` (interpreter) while `AT_ENTRY` stays the program's own entry. The
-program's `AT_PHDR` must point at the program's phdrs, not the interpreter's -
-`ld.so` uses it to find the dynamic section it is about to process.
+Measured on a boot of this tree: `[dyntest] OK 14/14`, exit code 0. The program is
+a PIE linked against `libgreet.so` with three real dependencies on the loader -
+`printf` from libc, `malloc` that grows, and a call into a second file - and it
+reports where each image actually is:
 
-The honest failure to get right: a `NEEDED` library that is not on the boot
-medium must produce `ld.so`'s own "Error loading shared library" and a non-zero
-exit, not a kernel panic and not a silently loaded program that crashes three
-instructions later.
+```
+[dyntest] program text 0x8000001110, libgreet text 0x80014020f0, data 0x8000004008
+[dyntest] OK 14/14
+```
+
+`kernel/elf.c` now accepts `ET_EXEC` and `ET_DYN`. An `ET_DYN` image is loaded at
+a base the kernel chooses (`RING3_USER_BASE` for the program), and the load bias
+is `base - lowest_segment_vaddr`, which is what makes a PIE's `p_vaddr` values
+absolute. `PT_INTERP` is read from the file, the interpreter is loaded as a
+second image at `RING3_USER_BASE + 1 MB`, and both ranges are registered as
+areas so the `mmap` hint walk will not hand a library the loader's pages. The
+task starts at the interpreter's entry; `AT_ENTRY` stays the program's, `AT_BASE`
+names the interpreter, and `AT_PHDR` is the program's header table as mapped.
+
+`AT_PHDR` is computed from the segment covering the table's file range, not from
+`base + e_phoff`. The two agree only while every segment has `vaddr == offset`,
+and musl's binaries break that in their last segment.
+
+### The three bugs this exposed
+
+Each one was a real defect in earlier work, invisible until a libc ran:
+
+1. **`RFILE_MAX` was 24, and the medium now carries 24 modules plus three seeded
+   RAM files.** The three that did not fit were the last ones listed, so
+   `libgreet.so` was silently unopenable: `open` returned `-ENOSPC` and the
+   failure surfaced far away. Raised to 48 - the cap is slots, not memory.
+2. **`AT_EXECFN` was set to NULL for programs spawned with no argv.** musl tests
+   the presence bit and then `strncmp`s the pointer against `"/proc/"` without
+   checking it, so `ld.so` faulted at address 0 in `strncmp` before anything ran.
+   A name is now always written to the stack for that entry.
+3. **`MAP_FIXED` dropped whole overlapping areas instead of unmapping the range.**
+   mallocng reserves the heap with `brk` and then `MAP_FIXED`s a one-page
+   `PROT_NONE` guard over the first page of it; dropping the whole area destroyed
+   the heap, and the allocator's next write landed in a hole. Now the range is
+   unmapped exactly: areas are trimmed or split in two, file windows and all.
+
+### What is still not there
+
+- `PROT_NONE` is not implemented, so a reservation reads as readable memory.
+- The interpreter's base is a kernel constant; `dlopen` cannot choose it.
+- `execve` does not exist, so a program cannot start another program.
+- A library missing from the boot medium is the loader's error to report -
+  `ld.so` prints "Error loading shared library" and exits 127 - not the kernel's.
+  The loader does refuse cleanly, before starting anything, when the *interpreter*
+  named by `PT_INTERP` is not on the medium.

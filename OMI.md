@@ -49,9 +49,16 @@ spaces.
 run on `clone` with futexes, `fork` copies the address space copy-on-write behind a refcounted page
 bank, and `wait4` reaps. A process opens files by path — every boot module is registered read-only
 under its boot name, so a library can be read from inside the system that loaded it — and maps one
-into its own space with a file-backed `MAP_PRIVATE` mapping. Dynamic linking is the piece still
-missing: `kernel/elf.c` loads static `ET_EXEC` only, so musl's `ld.so` cannot run yet
-(`docs/dynamic-linking.md`). The mechanics, and the four bugs that cost a boot each, are in the README.
+into its own space with a file-backed `MAP_PRIVATE` mapping.
+
+**Dynamic linking.** A position-independent program that names an interpreter in `PT_INTERP` runs.
+The kernel picks the addresses: the program at the base of the user window, musl's `ld.so` at +1 MB
+in the same space, both registered so `mmap` will not hand a library those pages. The task starts at
+the interpreter's entry with `AT_ENTRY` naming the program and `AT_BASE` naming the interpreter, and
+`ld.so` does everything after that through the same `open`/`mmap` a program would use: `[dyntest] OK
+14/14` on a real boot, including a `printf` from libc, a `malloc` that grows, and a call into another
+shared object at an address `ld.so` chose. The mechanics, and the three kernel bugs it exposed, are
+in `docs/dynamic-linking.md`.
 
 **Sound.** Intel HDA output with a streaming API (`hda_stream_start/write/free/stop`) and an MP3
 decoder (minimp3) in `kernel/media/`. The media player streams the track from disk while it plays,
@@ -82,9 +89,11 @@ qemu-system-x86_64 -m 512 -cdrom omi.iso -boot d -vga std \
 
 ## What does not work yet
 
-- **No dynamic linking yet.** A shared-object program cannot run: the loader takes static `ET_EXEC`,
-  and `PT_INTERP`/`AT_BASE` are the remaining work. Static musl binaries, `fork`, threads and
-  file-backed `mmap` all work.
+- **No `exec` from a path.** Programs still start from the kernel's hardcoded spawn list, and one
+  program cannot start another: there is no `execve`, so `ld.so` can load libraries but nothing can
+  replace its own image with a new program.
+- **`PROT_NONE` and shared file mappings are missing.** A reservation comes back readable instead of
+  faulting, and `MAP_SHARED` over a file is `-ENOSYS`. Neither is on the path a loader takes.
 - **No microphone capture** on real hardware — no capture endpoint is exposed by most onboard HDA.
 - **The shell's apps are still kernel-resident windows**, as in upstream vib-OS. Programs run outside
   the kernel, but Calculator, Notepad, the browser and the file manager are structs and draw functions

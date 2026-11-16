@@ -27,6 +27,7 @@ PROGS += muslfork.elf
 PROGS += cowlives.elf
 PROGS += libprobe.elf
 PROGS += libmap.elf
+PROGS += dyntest.elf
 # Not a program: a shared object, built with musl-gcc so its relocations and its
 # NEEDED entry are real. Copied to the ISO's /lib and loaded as a boot module.
 PROGS += libgreet.so
@@ -61,6 +62,13 @@ libprobe.elf: libprobe.c
 libmap.elf: libmap.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping libmap"; exit 0; }
 	musl-gcc -static -O2 -no-pie -o $@ $<
+
+# A PIE with PT_INTERP: this one does not run until the kernel has mapped the
+# interpreter and ld.so has relocated it. Linked against libgreet.so so the
+# loader has a second file to find, map and resolve.
+dyntest.elf: dyntest.c libgreet.so
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping dyntest"; exit 0; }
+	musl-gcc -pie -O2 -o $@ $< -L. -lgreet
 
 # -fPIC and a real dynamic section: the point of this file in the ISO is that the
 # loader has to cope with relocations, not that the code does anything clever.

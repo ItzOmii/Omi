@@ -1361,12 +1361,24 @@ static long sys_poll(uint64_t fds_u, uint64_t nfds, uint64_t timeout_ms) {
   }
 }
 
+/* Defined with the mmap path below; sys_open sits above it and needs them. */
+extern int r3_dyn_trace;
+extern int r3_dyn_trace_pid;
+
 static long sys_open(uint64_t path_u, uint64_t flags) {
   fdtable_t *fds = current_fds();
   if (!fds) return -EBADF;
   char path[RFILE_NAME];
   if (user_string(path, path_u, RFILE_NAME) < 0) return -EFAULT;
-  return fd_open(fds, path, (int)flags);
+  long r = fd_open(fds, path, (int)flags);
+  if (r3_dyn_trace && task_current() == r3_dyn_trace_pid) {
+    serial_puts("[dyn] open ");
+    serial_puts(path);
+    serial_puts(" -> ");
+    serial_puthex((uint64_t)r);
+    serial_puts("\n");
+  }
+  return r;
 }
 
 static long sys_read(uint64_t fdn, uint64_t buf, uint64_t len) {
@@ -1595,6 +1607,63 @@ static long linux_brk(uint64_t want) {
   return (long)want;
 }
 
+/* Unmap [base, base+len) the way Linux does: the pages go, and an area that
+ * only partly overlaps is trimmed or split in two, never dropped whole.
+ *
+ * "Dropped whole" was the shortcut this system shipped with, and it is wrong in
+ * a way that costs a process its heap: mallocng reserves memory with brk and then
+ * MAP_FIXEDs a one-page PROT_NONE guard over the *first* page of that
+ * reservation. Under Linux the rest of the reservation survives; under a
+ * whole-area drop the reservation is gone and the allocator's next write lands in
+ * an unmapped hole. Library loaders do the same thing at library granularity, so
+ * this has to be exact rather than approximately safe. */
+static void area_drop_front(vm_area_t *a, uint64_t d) {
+  if (a->src) {
+    if (a->src_off + d < a->src_len) { a->src_len -= (uint32_t)d; a->src_off += d; }
+    else { a->src = 0; a->src_off = 0; a->src_len = 0; }
+  }
+  a->base += d;
+  a->len  -= d;
+}
+
+static void area_drop_tail(vm_area_t *a, uint64_t keep) {
+  a->len = keep;
+  if (a->src && a->src_len > keep) a->src_len = (uint32_t)keep;
+}
+
+static int vm_unmap_range(task_t *t, mm_t *mm, uint64_t base, uint64_t len) {
+  uint64_t end = base + len;
+  uint64_t kept = 0;
+  vm_release_range(t, base, len, &kept);
+
+  for (int i = 0; i < TASK_AREAS; i++) {
+    vm_area_t *a = &mm->areas[i];
+    if (!a->used) continue;
+    uint64_t ab = a->base, ae = a->base + a->len;
+    if (ae <= base || ab >= end) continue;              /* no overlap */
+
+    if (ab >= base && ae <= end) {                       /* swallowed whole */
+      a->used = 0;
+      continue;
+    }
+
+    if (ab < base && ae > end) {                         /* fixed range inside it */
+      int slot = -1;
+      for (int k = 0; k < TASK_AREAS; k++) if (!mm->areas[k].used) { slot = k; break; }
+      if (slot < 0) return -ENOMEM;                      /* caller keeps what it had */
+      vm_area_t *high = &mm->areas[slot];
+      *high = *a;
+      area_drop_front(high, end - ab);
+      area_drop_tail(a, base - ab);
+      continue;
+    }
+
+    if (ab < base) area_drop_tail(a, base - ab);          /* keep the low part */
+    else           area_drop_front(a, end - ab);          /* keep the high part */
+  }
+  return 0;
+}
+
 /* Linux mmap (9). Two kinds of region, one entry point:
  *
  *   anonymous   - pages appear zeroed on first touch (the original behaviour);
@@ -1653,17 +1722,8 @@ static long linux_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t lfla
     if (addr & 0xFFF) return -EINVAL;
     base = addr;
     if (base < RING3_MMAP_BASE || base + len > RING3_MMAP_TOP) return -ENOMEM;
-    /* The caller is taking these addresses: whatever was here goes, pages and
-     * all. An area that only partly overlaps is dropped whole, which turns its
-     * remainder into an unmapped fault - the same thing a PROT_NONE reservation
-     * is supposed to do for the part nobody mapped over. */
-    uint64_t kept = 0;
-    vm_release_range(t, base, len, &kept);
-    for (int i = 0; i < TASK_AREAS; i++) {
-      vm_area_t *a = &mm->areas[i];
-      if (!a->used) continue;
-      if (base < a->base + a->len && a->base < base + len) a->used = 0;
-    }
+    /* The caller is taking these addresses: exactly these, no more. */
+    if (vm_unmap_range(t, mm, base, len) != 0) return -ENOMEM;
   } else {
     if (!mm->mmap_hint) mm->mmap_hint = RING3_MMAP_BASE;
     base = mm->mmap_hint;
@@ -1697,6 +1757,25 @@ static long linux_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t lfla
 
 /* mprotect closes a step-2 gap: the area's flags decide what future pages get,
  * and the pages already present have their write bit rewritten here. */
+/* Temporary instrumentation for bring-up of the dynamic loader: when set, every
+ * mapping call a user process makes is logged with its arguments and result.
+ * A loader is a state machine over mmap/mprotect, so the sequence is the
+ * evidence - guessing at it from a fault address wastes runs. */
+int r3_dyn_trace = 0;
+int r3_dyn_trace_pid = -1;
+
+static void dynmap(const char *op, uint64_t a, uint64_t b, uint64_t c, uint64_t d, long r) {
+  if (!r3_dyn_trace || task_current() != r3_dyn_trace_pid) return;
+  serial_puts("[dyn] ");
+  serial_puts(op);
+  serial_puts(" "); serial_puthex(a);
+  serial_puts(" "); serial_puthex(b);
+  serial_puts(" "); serial_puthex(c);
+  if (d) { serial_puts(" fd="); serial_puthex(d); }
+  serial_puts(" -> "); serial_puthex((uint64_t)r);
+  serial_puts("\n");
+}
+
 static long linux_mprotect(uint64_t addr, uint64_t len, uint64_t prot) {
   task_t *t = task_at(task_current());
   if (!t || !t->mm || !len) return -EINVAL;
@@ -1953,9 +2032,22 @@ static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, 
     case 72:  return linux_fcntl((int)a0, (int)a1, a2);    /* fcntl */
     case 8:   fds = current_fds();                         /* lseek */
               return fds ? fd_seek(fds, (int)a0, (int64_t)a1, (int)a2) : -EBADF;
-    case 9:   return linux_mmap(a0, a1, a2, a3, (int)r3_arg4, r3_arg5);  /* mmap */
-    case 10:  return linux_mprotect(a0, a1, a2);           /* mprotect */
-    case 11:  return sys_vm_free(a0, a1);                  /* munmap */
+    case 9: { long r = linux_mmap(a0, a1, a2, a3, (int)r3_arg4, r3_arg5);
+              if (r3_dyn_trace && task_current() == r3_dyn_trace_pid) {
+                serial_puts("[dyn] mmap addr="); serial_puthex(a0);
+                serial_puts(" len="); serial_puthex(a1);
+                serial_puts(" prot="); serial_puthex(a2);
+                serial_puts(" flags="); serial_puthex(a3);
+                serial_puts(" fd="); serial_puthex(r3_arg4);
+                serial_puts(" off="); serial_puthex(r3_arg5);
+                serial_puts(" -> "); serial_puthex((uint64_t)r);
+                serial_puts("\n");
+              }
+              return r; }                                              /* mmap */
+    case 10: { long r = linux_mprotect(a0, a1, a2);
+               dynmap("mprotect", a0, a1, a2, 0, r); return r; }        /* mprotect */
+    case 11: { long r = sys_vm_free(a0, a1);
+               dynmap("munmap", a0, a1, 0, 0, r); return r; }           /* munmap */
     case 12:  return linux_brk(a0);                        /* brk */
     case 13:  return linux_rt_sigaction((int)a0, a1, a2, a3); /* rt_sigaction */
     case 14:  return linux_rt_sigprocmask((int)a0, a1, a2, a3); /* rt_sigprocmask */

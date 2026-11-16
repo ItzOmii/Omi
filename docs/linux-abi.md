@@ -52,7 +52,7 @@ swap to. Adding it belongs with SMP, not before.
 |---|---|---|
 | 0,1 | read, write | the existing handlers |
 | 2,3,8 | open, close, lseek | `open`'s mode argument ignored |
-| 9,11 | mmap, munmap | anonymous, or file-backed `MAP_PRIVATE`; `MAP_FIXED`; `MAP_SHARED` over a file is `-ENOSYS` |
+| 9,11 | mmap, munmap | anonymous, or file-backed `MAP_PRIVATE`; `MAP_FIXED` replaces exactly the range it names, splitting what it lands inside; `MAP_SHARED` over a file is `-ENOSYS` |
 | 10 | mprotect | closes a step-2 gap: area flags plus live PTEs |
 | 12 | brk | one lazily-populated 16 MB area, pointer moved inside it |
 | 16 | ioctl | `TCGETS`/`TIOCGWINSZ` only |
@@ -153,11 +153,20 @@ NULL, auxv`. Three auxv entries are load-bearing:
   trivially, so 16 bytes are derived from the tick counter instead. It is not
   real entropy and the code says so.
 
-`AT_PHDR` is the mapped address of the header table (image base + `e_phoff`),
-which is only correct for `ET_EXEC` - the loader refuses anything else, and a
-PIE would need the load bias added, which is the `PT_INTERP`/`AT_BASE` work in
-`docs/dynamic-linking.md` (step 6c). `AT_BASE` is the other half: it names the
-interpreter, and without it `ld.so` has no idea where it was loaded.
+`AT_PHDR` is the mapped address of the header table, and it is computed through
+the load bias: zero for `ET_EXEC`, and for an `ET_DYN` image the base the kernel
+picked minus the image's lowest segment. The address is derived from the segment
+that actually covers the table's file range rather than from `base + e_phoff`,
+because a linker may emit a segment whose offset and vaddr do not agree - musl's
+own binaries do exactly that in their last segment, so the naive form points a
+few kilobytes into the wrong place.
+
+`AT_BASE` is the interpreter's load bias and `AT_ENTRY` stays the program's own
+entry: the task begins at the interpreter and `ld.so` jumps to `AT_ENTRY` when
+it has finished. `AT_EXECFN` has to be a real string even for a program started
+with no argv. musl sets a presence bit for it and then compares the pointer
+without looking at it again, so a NULL there faults inside the loader before any
+of the program runs - which is exactly what the first `PT_INTERP` boot did.
 
 ## Threads
 
@@ -367,7 +376,8 @@ span; `mmap`/`munmap` writable end to end; `arch_prctl(SET_FS)` verified by
 reading `%fs:0`; unknown number `-ENOSYS`.
 
 Boot: `[linux3] 27/27 ok`, `[musl] OK`, `[threads] ... OK`, `[stat] OK` and `[fork] OK`, alongside `[pipe] 37/37`,
-`[pipe3] 30/30`, `[rdy] 56/56`, `vfs 16/16`, `futex 3/3`, `[rfs] module files exposed=18 skipped=0`
+`[pipe3] 30/30`, `[rdy] 56/56`, `vfs 16/16`, `futex 3/3`, `[rfs] module files exposed=21 skipped=0`
 with `[modtest] OK 15/15`, `[maptest] OK 17/17` (file-backed `mmap`, `MAP_FIXED` over a
-reservation, and the three refusals), no panic, no "killed user task" beyond the isolation probe that
-asks for it.
+reservation, and the three refusals), `[dyntest] OK 14/14` (a PIE run through musl's `ld.so`, with a
+library mapped out of the boot medium), no panic, no "killed user task" beyond the isolation probe
+that asks for it.

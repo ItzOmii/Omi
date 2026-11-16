@@ -237,7 +237,7 @@ $(LIMINE_DIR):
 userland/%.elf: userland/%.c
 	$(MAKE) -C userland $*.elf
 
-$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -267,10 +267,14 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	@if [ -f userland/cowlives.elf ]; then cp userland/cowlives.elf $(ISO_ROOT)/apps/cowlives.elf; else echo "no cowlives.elf: skipping"; fi
 	@if [ -f userland/libprobe.elf ]; then cp userland/libprobe.elf $(ISO_ROOT)/apps/libprobe.elf; else echo "no libprobe.elf: skipping"; fi
 	@if [ -f userland/libmap.elf ]; then cp userland/libmap.elf $(ISO_ROOT)/apps/libmap.elf; else echo "no libmap.elf: skipping"; fi
+	@if [ -f userland/dyntest.elf ]; then cp userland/dyntest.elf $(ISO_ROOT)/apps/dyntest.elf; else echo "no dyntest.elf: skipping"; fi
 	# A shared object, in a directory of its own: the loader will look it up by
 	# path, so the path it is copied to is the path that must appear in limine.conf.
 	@mkdir -p $(ISO_ROOT)/lib
 	@if [ -f userland/libgreet.so ]; then cp userland/libgreet.so $(ISO_ROOT)/lib/libgreet.so; else echo "no libgreet.so: skipping"; fi
+	@for m in /lib/ld-musl-x86_64.so.1 /usr/lib/x86_64-linux-musl/libc.so; do \
+	  if [ -f "$$m" ]; then cp "$$m" $(ISO_ROOT)/lib/ld-musl-x86_64.so.1; echo "interpreter: $$m"; break; fi; \
+	done; [ -f $(ISO_ROOT)/lib/ld-musl-x86_64.so.1 ] || echo "no musl ld.so on this host: dyntest will refuse to load"
 	cp userland/spin.elf $(ISO_ROOT)/apps/spin.elf
 
 	# Media samples, exposed to the kernel as boot modules

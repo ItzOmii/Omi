@@ -30,3 +30,8 @@ tests/
 
 # build artifacts: the ISO carries the shared object, the Makefile builds it
 *.so
+
+# The interpreter the ISO carries is copied from the build host's musl at build
+# time, not vendored: keeping a 715 KB libc in the tree would tie the repository
+# to one distribution's build of it.
+iso_root/lib/

@@ -21,8 +21,9 @@ browser, no Chrome OS userland, and no POSIX pretence where the semantics are mi
 That goal is a checklist, and the checklist is the roadmap. A browser needs an address space it can
 grow at runtime, threads with real synchronisation, file descriptors that mean one thing, sockets
 several at a time, readiness notification instead of polling, dynamic linking, and TLS from user
-mode. Omi now has all but the last two, and dynamic linking is half built: programs run as real musl
-binaries out of files, `fork` is copy-on-write, and a process can map a library into its space.
+mode. Omi now has all but the last one: programs run as real musl binaries out of files, `fork` is
+copy-on-write, `poll` reports readiness, and a position-independent program linked against a shared
+object runs under musl's own `ld.so` - the kernel loads two images and hands over.
 
 | What a browser needs | State |
 |---|---|
@@ -36,7 +37,7 @@ binaries out of files, `fork` is copy-on-write, and a process can map a library 
 | `poll`/readiness over several descriptors, blocking and non-blocking I/O | **done** |
 | `fork`, copy-on-write, `wait4`, signals | **done** |
 | Boot modules openable as files, file-backed `mmap` | **done** |
-| Dynamic linking: `ld.so`, `PT_INTERP`, `ET_DYN` | **in progress** — files and `mmap` done |
+| Dynamic linking: `ld.so`, `PT_INTERP`, `ET_DYN` | **done** |
 | TCP teardown (FIN/RST/`TIME_WAIT`), retransmission | not yet |
 | UDP sockets, `bind`/`listen`/`accept` | not yet |
 | TLS from user mode | not yet |
@@ -299,10 +300,11 @@ To boot real hardware: `sudo dd if=omi.iso of=/dev/sdX bs=4M status=progress`.
   inside the kernel, not by programs.
 - **TLS and HTTP are kernel-side.** A program can have a socket; it cannot yet get `https://`, because
   BearSSL is linked into the kernel and there is no userspace TLS library.
-- **Dynamic linking is half built.** A program may now be a real static musl binary — libc that
-  bootstraps itself from the auxv, threads, `fork` — and it can open a library and map it. What is
-  missing is the handover: `ET_DYN` loading, `PT_INTERP` and `AT_BASE`, so musl's `ld.so` cannot yet
-  run and nothing linked against a shared object can execute.
+- **Dynamic linking works, with sharp edges.** A PIE that names an interpreter runs: the kernel maps
+  the program at the base of the user window and `ld.so` at +1 MB in the same space, passes the
+  program's phdrs and entry in the auxv, and starts the interpreter. What is missing is around it —
+  `PROT_NONE` reservations come back readable, `MAP_SHARED` over a file is `-ENOSYS`, and the
+  interpreter's address is a kernel constant rather than something `dlopen` can move.
 - **The VFS is RAM only** — three files seeded at boot, 24 slots, no disk and no directories below the
   root. Boot modules are readable as files (read-only, `-EROFS` on write) and a file can be mapped,
   but there is no `exec` from a path: programs still run from the hardcoded spawn list.

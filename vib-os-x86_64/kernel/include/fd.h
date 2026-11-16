@@ -24,7 +24,12 @@
 
 #define FD_MAX      16
 #define OFILE_MAX    64
-#define RFILE_MAX    24
+/* Slots, not bytes: each one is ~56 bytes of static table. The boot medium
+ * carries 24 modules and three RAM files are seeded on top, so 24 was exactly
+ * full the day a shared library and its loader joined the ISO - and the three
+ * files that did not fit were the last ones listed, which is how a library
+ * becomes silently unopenable. */
+#define RFILE_MAX    48
 #define RFILE_NAME   32
 #define RFILE_CAP   4096
 
