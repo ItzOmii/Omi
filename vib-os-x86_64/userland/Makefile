@@ -26,6 +26,7 @@ PROGS += muslstat.elf
 PROGS += muslfork.elf
 PROGS += cowlives.elf
 PROGS += libprobe.elf
+PROGS += libmap.elf
 # Not a program: a shared object, built with musl-gcc so its relocations and its
 # NEEDED entry are real. Copied to the ISO's /lib and loaded as a boot module.
 PROGS += libgreet.so
@@ -55,6 +56,10 @@ cowlives.elf: cowlives.c
 
 libprobe.elf: libprobe.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping libprobe"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+
+libmap.elf: libmap.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping libmap"; exit 0; }
 	musl-gcc -static -O2 -no-pie -o $@ $<
 
 # -fPIC and a real dynamic section: the point of this file in the ISO is that the

@@ -101,6 +101,10 @@ int  rfs_expose(const char *path, uint8_t *blob, uint32_t size);
  * is not. */
 int  rfs_count(void);
 int  rfs_rom_count(void);
+
+/* The file behind a descriptor, or NULL when it is not a file descriptor. Used by
+ * mmap, which needs the bytes and the length rather than a read position. */
+rfile_t *fd_file(fdtable_t *t, int fd);
 fdtable_t *fdtable_new(void);
 /* Same descriptors, same open files, one more reference each: what fork() hands
  * the child. Null on exhaustion. */

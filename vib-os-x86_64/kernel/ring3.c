@@ -584,6 +584,22 @@ static int vm_fault_in(uint64_t addr) {
     vm_area_t *a = &t->mm->areas[i];
     if (!a->used) continue;
     if (page < a->base || page >= a->base + a->len) continue;
+    /* A file region's page is filled from the blob, not left zero. The last page
+     * of a mapping may start before EOF and end after it - that is how ld.so
+     * maps a segment whose size is not a page multiple, and the tail is meant to
+     * be zeros, which a fresh frame already is. */
+    if (a->src) {
+      uint64_t off = page - a->base;
+      if (off < a->src_len) {
+        uint64_t n = a->src_len - off;
+        if (n > 4096) n = 4096;
+        if (ring3_map_copy(t->cr3, page, a->src + a->src_off + off, n, a->flags) != 0) return 0;
+        return 1;
+      }
+      /* Entirely past EOF: refused at mmap time, so reaching here means the area
+       * and the blob disagree. Leave the fault real rather than invent zeros. */
+      return 0;
+    }
     void *kva = 0;
     if (ring3_map(t->cr3, page, a->flags, &kva) != 0) return 0;
     return 1;
@@ -613,8 +629,51 @@ static long sys_vm_alloc(uint64_t len, uint64_t prot) {
   mm->areas[slot].len = len;
   mm->areas[slot].flags = flags;
   mm->areas[slot].used = 1;
+  /* A reused slot may have described a file region before; anonymous means no
+   * source, and a stale pointer here would fill this heap with a library's
+   * bytes. Clear it where the area is created, not where it is read. */
+  mm->areas[slot].src = 0;
+  mm->areas[slot].src_off = 0;
+  mm->areas[slot].src_len = 0;
   mm->mmap_hint = base + len + 0x1000;     /* leave one guard page between regions */
   return (long)base;
+}
+
+/* Release the frames behind [base, base+len), one page at a time, with the same
+ * policy the exit path uses: a frame another space still maps is released to the
+ * bank, not freed to the allocator, and a PTE_SHARED frame belongs to the pool
+ * and is not ours to free at all. */
+static uint64_t vm_release_range(task_t *t, uint64_t base, uint64_t len, uint64_t *kept) {
+  uint64_t freed = 0;
+  *kept = 0;
+  /* Walk per page: one page table covers 2 MB, so a 4 MB region spans two of
+   * them. Indexing a single table across the whole range reads into whatever
+   * physical page follows it and "frees" page tables that are still in use. */
+  for (uint64_t off = 0; off < len; off += 4096) {
+    uint64_t va = base + off;
+    uint64_t *pt = walk_user(t->cr3, va);
+    if (!pt) continue;
+    int i4 = (int)((va >> 12) & 511);
+    if (!(pt[i4] & PTE_P)) continue;
+    if (!(pt[i4] & PTE_SHARED)) {
+      uint64_t phys = pt[i4] & ~0xFFFULL;
+      if (cow_release(phys)) pmm_free_page(phys);
+      else (*kept)++;
+    }
+    pt[i4] = 0;
+    freed++;
+  }
+  ring3_write_cr3(ring3_read_cr3());       /* flush the stale translations */
+  return freed;
+}
+
+static int vm_overlaps(mm_t *mm, uint64_t base, uint64_t len) {
+  for (int i = 0; i < TASK_AREAS; i++) {
+    vm_area_t *a = &mm->areas[i];
+    if (!a->used) continue;
+    if (base < a->base + a->len && a->base < base + len) return 1;
+  }
+  return 0;
 }
 
 static long sys_vm_free(uint64_t addr, uint64_t len) {
@@ -628,30 +687,8 @@ static long sys_vm_free(uint64_t addr, uint64_t len) {
     if (!a->used) continue;
     if (base < a->base || base + len > a->base + a->len) continue;
 
-    /* Walk per page: one page table covers 2 MB, so a 4 MB region spans two of
-     * them. Indexing a single table across the whole range reads into whatever
-     * physical page follows it and "frees" page tables that are still in use. */
-    uint64_t freed = 0, kept = 0;
-    for (uint64_t off = 0; off < len; off += 4096) {
-      uint64_t va = base + off;
-      uint64_t *pt = walk_user(t->cr3, va);
-      if (!pt) continue;
-      int i4 = (int)((va >> 12) & 511);
-      if (pt[i4] & PTE_P) {
-        /* A forked child may still map this frame. Freeing it here hands the
-         * child's live page back to the allocator, so a write after the parent's
-         * munmap lands in whatever the frame is given to next. Release, and only
-         * free when this space was the last holder. A shared segment is not ours
-         * to free at all: the pool owns it. */
-        if (!(pt[i4] & PTE_SHARED)) {
-          uint64_t phys = pt[i4] & ~0xFFFULL;
-          if (cow_release(phys)) pmm_free_page(phys);
-          else kept++;
-        }
-        pt[i4] = 0;
-        freed++;
-      }
-    }
+    uint64_t kept = 0;
+    uint64_t freed = vm_release_range(t, base, len, &kept);
     serial_puts("[vm] released ");
     serial_puthex(freed);
     serial_puts(" pages (");
@@ -662,7 +699,6 @@ static long sys_vm_free(uint64_t addr, uint64_t len) {
     serial_puthex(pmm_total_pages());
     serial_puts("\n");
     if (base == a->base && len >= a->len) a->used = 0;
-    ring3_write_cr3(ring3_read_cr3());       /* flush the stale translations */
     return 0;
   }
   return -EINVAL;                          /* no region covers that range */
@@ -700,6 +736,9 @@ static long sys_thread_create(uint64_t entry, uint64_t arg, uint64_t stack_bytes
   mm->areas[slot].len = stack_bytes;
   mm->areas[slot].flags = PTE_P | PTE_W | PTE_U;
   mm->areas[slot].used = 1;
+  mm->areas[slot].src = 0;             /* a stack is not a file */
+  mm->areas[slot].src_off = 0;
+  mm->areas[slot].src_len = 0;
 
   static int seq;
   char name[24];
@@ -1556,12 +1595,104 @@ static long linux_brk(uint64_t want) {
   return (long)want;
 }
 
-/* MAP_ANONYMOUS only: there is no file-backed mapping yet, and pretending would
- * hand a program zeroes where it expected a file. */
-static long linux_mmap(uint64_t len, uint64_t prot, uint64_t lflags, uint64_t fd) {
-  if (!(lflags & 0x20)) { (void)fd; return -ENOSYS; }
-  long b = sys_vm_alloc(len, prot & 2);
-  return b;
+/* Linux mmap (9). Two kinds of region, one entry point:
+ *
+ *   anonymous   - pages appear zeroed on first touch (the original behaviour);
+ *   file-backed - pages appear filled from a boot module's bytes, and the frame
+ *                 is private to this space, which is what MAP_PRIVATE means.
+ *
+ * MAP_SHARED over a file is -ENOSYS: nothing here can write a frame back into a
+ * boot module, and a "shared" mapping that silently is not shared is worse than
+ * a refusal.
+ *
+ * A mapping is refused (-EINVAL) when its offset is not page-aligned or when the
+ * offset starts at or past EOF: an area with no file behind it is a bug in the
+ * caller, not an empty file. A length whose *last* page runs past EOF is fine and
+ * its tail reads zero - ld.so maps segments that way, and Linux does the same.
+ *
+ * PROT_NONE is not implemented: a reservation is readable rather than
+ * unreadable. ld.so only uses reservations as placeholders that it MAP_FIXEDs
+ * over, so nothing depends on it yet. That is a gap, not a design decision.
+ */
+#define LINUX_MAP_SHARED     0x01
+#define LINUX_MAP_PRIVATE    0x02
+#define LINUX_MAP_FIXED      0x10
+#define LINUX_MAP_ANONYMOUS  0x20
+
+static long linux_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t lflags,
+                       int fd, uint64_t off) {
+  task_t *t = task_at(task_current());
+  if (!t || !t->mm || !len) return -EINVAL;
+  mm_t *mm = t->mm;
+  int anon = (lflags & LINUX_MAP_ANONYMOUS) != 0;
+  if (!anon && (lflags & LINUX_MAP_SHARED)) return -ENOSYS;
+
+  len = (len + 0xFFF) & ~0xFFFULL;
+  if (len > (RING3_MMAP_TOP - RING3_MMAP_BASE)) return -ENOMEM;
+
+  uint64_t pte = PTE_P | PTE_U;
+  if (prot & 2) pte |= PTE_W;
+
+  const uint8_t *src = 0;
+  uint32_t src_len = 0;
+  if (!anon) {
+    if (off & 0xFFF) return -EINVAL;
+    rfile_t *f = fd_file(mm->fds, fd);
+    if (!f) return -EBADF;
+    if (off >= f->size) return -EINVAL;
+    src = f->data + off;
+    src_len = f->size - (uint32_t)off;
+  }
+
+  int slot = -1;
+  for (int i = 0; i < TASK_AREAS; i++) if (!mm->areas[i].used) { slot = i; break; }
+  if (slot < 0) return -ENOMEM;
+
+  uint64_t base;
+  if (lflags & LINUX_MAP_FIXED) {
+    if (addr & 0xFFF) return -EINVAL;
+    base = addr;
+    if (base < RING3_MMAP_BASE || base + len > RING3_MMAP_TOP) return -ENOMEM;
+    /* The caller is taking these addresses: whatever was here goes, pages and
+     * all. An area that only partly overlaps is dropped whole, which turns its
+     * remainder into an unmapped fault - the same thing a PROT_NONE reservation
+     * is supposed to do for the part nobody mapped over. */
+    uint64_t kept = 0;
+    vm_release_range(t, base, len, &kept);
+    for (int i = 0; i < TASK_AREAS; i++) {
+      vm_area_t *a = &mm->areas[i];
+      if (!a->used) continue;
+      if (base < a->base + a->len && a->base < base + len) a->used = 0;
+    }
+  } else {
+    if (!mm->mmap_hint) mm->mmap_hint = RING3_MMAP_BASE;
+    base = mm->mmap_hint;
+    /* Skip past anything already here rather than handing out an address that a
+     * MAP_FIXED caller already owns: the overlap is growable, the loop is not. */
+    for (int guard = 0; guard < TASK_AREAS && vm_overlaps(mm, base, len); guard++) {
+      for (int i = 0; i < TASK_AREAS; i++) {
+        vm_area_t *a = &mm->areas[i];
+        if (!a->used) continue;
+        if (base < a->base + a->len && a->base < base + len) {
+          base = a->base + a->len + 0x1000;
+          break;
+        }
+      }
+    }
+    if (vm_overlaps(mm, base, len)) return -ENOMEM;
+    if (base + len > RING3_MMAP_TOP) return -ENOMEM;
+    mm->mmap_hint = base + len + 0x1000;   /* leave one guard page between regions */
+  }
+
+  vm_area_t *a = &mm->areas[slot];
+  a->base = base;
+  a->len = len;
+  a->flags = pte;
+  a->used = 1;
+  a->src = src;
+  a->src_off = 0;
+  a->src_len = src_len;
+  return (long)base;
 }
 
 /* mprotect closes a step-2 gap: the area's flags decide what future pages get,
@@ -1822,7 +1953,7 @@ static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, 
     case 72:  return linux_fcntl((int)a0, (int)a1, a2);    /* fcntl */
     case 8:   fds = current_fds();                         /* lseek */
               return fds ? fd_seek(fds, (int)a0, (int64_t)a1, (int)a2) : -EBADF;
-    case 9:   return linux_mmap(a1, a2, a3, a0 ? 0 : (uint64_t)-1);  /* mmap */
+    case 9:   return linux_mmap(a0, a1, a2, a3, (int)r3_arg4, r3_arg5);  /* mmap */
     case 10:  return linux_mprotect(a0, a1, a2);           /* mprotect */
     case 11:  return sys_vm_free(a0, a1);                  /* munmap */
     case 12:  return linux_brk(a0);                        /* brk */

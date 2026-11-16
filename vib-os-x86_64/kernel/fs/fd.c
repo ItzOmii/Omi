@@ -102,6 +102,12 @@ int rfs_rom_count(void) {
   return n;
 }
 
+rfile_t *fd_file(fdtable_t *t, int fd) {
+  ofile_t *o = fd_ofile(t, fd);
+  if (!o || o->kind != FK_FILE || !o->file || !o->file->used) return 0;
+  return o->file;
+}
+
 /* Seeded at boot so open() has something to find. Deliberately small: this is
  * a landing place for the syscalls, not a filesystem anyone should store work
  * in - it lives in kernel heap and vanishes with the machine. */

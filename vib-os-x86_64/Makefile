@@ -266,6 +266,7 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	@if [ -f userland/muslfork.elf ]; then cp userland/muslfork.elf $(ISO_ROOT)/apps/muslfork.elf; else echo "no muslfork.elf: skipping"; fi
 	@if [ -f userland/cowlives.elf ]; then cp userland/cowlives.elf $(ISO_ROOT)/apps/cowlives.elf; else echo "no cowlives.elf: skipping"; fi
 	@if [ -f userland/libprobe.elf ]; then cp userland/libprobe.elf $(ISO_ROOT)/apps/libprobe.elf; else echo "no libprobe.elf: skipping"; fi
+	@if [ -f userland/libmap.elf ]; then cp userland/libmap.elf $(ISO_ROOT)/apps/libmap.elf; else echo "no libmap.elf: skipping"; fi
 	# A shared object, in a directory of its own: the loader will look it up by
 	# path, so the path it is copied to is the path that must appear in limine.conf.
 	@mkdir -p $(ISO_ROOT)/lib

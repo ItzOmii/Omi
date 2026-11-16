@@ -523,6 +523,9 @@ void _start(void) {
     /* Boot modules as files: the read half of the dynamic linker's job. Runs
      * last so the earlier suites' output is not interleaved with a file test. */
     ring3_spawn_elf("libprobe", "libprobe.elf", 0);
+    /* File-backed mappings: what the linker does with the file libprobe just
+     * proved it could read. */
+    ring3_spawn_elf("libmap", "libmap.elf", 0);
   }
 
   serial_puts("Starting main loop...\n");
