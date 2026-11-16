@@ -346,7 +346,18 @@ int tcp_conn_send(tcp_conn_t *c, const void *buf, int len) {
   while (sent < len) {
     int chunk = len - sent;
     if (chunk > 1000) chunk = 1000;
-    if (conn_seg(c, (uint8_t)(TCP_ACK | TCP_PSH), p + sent, chunk) != 0) {
+    int rc = conn_seg(c, (uint8_t)(TCP_ACK | TCP_PSH), p + sent, chunk);
+    if (rc == -2) {
+      /* Posted but never confirmed. Count it and move on: the only alternative is
+       * resending bytes that probably arrived, and TCP would carry both copies to
+       * the application. One log line, because this should be rare and silent
+       * data expansion is not something to discover later. */
+      serial_puts("[tcp] tx unconfirmed, treated as sent\n");
+      c->seq += (uint32_t)chunk;
+      sent += chunk;
+      continue;
+    }
+    if (rc != 0) {
       char m[44]; int o = 0;
       const char *pre = "[tcp] short write, got ";
       while (*pre) m[o++] = *pre++;

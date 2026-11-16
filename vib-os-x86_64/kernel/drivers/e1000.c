@@ -309,7 +309,7 @@ int e1000_send(const void *frame, uint16_t len) {
   for (int i = 0; i < 100000; i++) {
     if (*dstat & 0x1) break;
   }
-  if (!(*dstat & 0x1)) return -1; /* ring stuck */
+  if (!(*dstat & 0x1)) return -1; /* ring stuck: nothing was posted */
 
   const uint8_t *src = (const uint8_t *)frame;
   uint8_t *dst = tx_bufs + (uint64_t)tx_cur * TXBUF;
@@ -324,11 +324,17 @@ int e1000_send(const void *frame, uint16_t len) {
   __sync_synchronize(); /* mfence: DMA order, not just compiler order */
   R(REG_TDT) = (tx_cur + 1) % NTX;
 
-  for (int i = 0; i < 2000000; i++) {
-    __sync_synchronize();
-    if (*dstat & 0x1) break;
-  }
-  int ok = (*dstat & 0x1) ? 0 : -1;
+  for (int i = 0; i < 2000000 && !(*dstat & 0x1); i++) __sync_synchronize();
+
+  /* Three outcomes, because the caller cannot retry what it cannot identify.
+   *  0  the descriptor came back: it is on the wire.
+   * -1  the ring was stuck before anything was posted: definitely not sent, and
+   *     retrying is safe.
+   * -2  posted, but the completion bit never appeared. The frame may well have
+   *     gone out, so the caller must count it as sent: a retry here duplicates
+   *     bytes on the far side, which is worse than a hole it will never know
+   *     about. Collapsing -2 into -1 is how a "clean" retry corrupts a stream. */
+  int ok = (*dstat & 0x1) ? 0 : -2;
   tx_cur = (tx_cur + 1) % NTX;
   return ok;
 }

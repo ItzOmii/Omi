@@ -305,6 +305,35 @@ static long sock_read_wait(ofile_t *o, void *kbuf, uint64_t n, uint64_t ticks) {
   return r;
 }
 
+/* The write side of the same rule. A send that accepts nothing is not an error,
+ * it is a full pipe: wait for POLLOUT, look again, and keep the pin across all of
+ * it for exactly the reason reads keep it. Partial acceptance returns at once -
+ * write() reports what it took, and a caller that wants the rest calls again. */
+static long sock_write_wait(ofile_t *o, const void *kbuf, uint64_t n, uint64_t ticks) {
+  if (o->closing) return -EBADF;
+  uint64_t end = task_total_ticks() + ticks;
+  long r = 0;
+
+  ofile_pin(o);
+  for (;;) {
+    r = sock_send(o->sock, kbuf, n);
+    if (r != 0) break;                    /* bytes accepted, or a hard error */
+
+    uint64_t now = task_total_ticks();
+    if (now >= end) { r = -EAGAIN; break; }
+
+    int w = sock_wait(o->sock, OMI_POLLOUT | OMI_POLLERR | OMI_POLLHUP, end - now);
+    if (w < 0) { r = w; break; }
+    if (w & OMI_POLLERR) { r = -EPIPE; break; }
+    /* Hangup with nothing accepted means the peer is gone: waiting for room in a
+     * connection that no longer exists would just burn the deadline. */
+    if (w & OMI_POLLHUP) { r = -EPIPE; break; }
+    /* POLLOUT, or a wake with nothing in it: level-triggered, so look again. */
+  }
+  ofile_unpin(o);
+  return r;
+}
+
 long fd_read_ticks(fdtable_t *t, int fd, void *kbuf, uint64_t n, uint64_t ticks) {
   if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
   ofile_t *o = t->fd[fd];
@@ -322,17 +351,21 @@ long fd_read_ticks(fdtable_t *t, int fd, void *kbuf, uint64_t n, uint64_t ticks)
   return (long)took;
 }
 
-/* The default patience keeps the old 5 s behaviour of a blocking socket read. */
+/* The default patience keeps the old 5 s behaviour of a blocking socket call. */
 long fd_read(fdtable_t *t, int fd, void *kbuf, uint64_t n) {
   return fd_read_ticks(t, fd, kbuf, n, 500);
 }
 
 long fd_write(fdtable_t *t, int fd, const void *kbuf, uint64_t n) {
+  return fd_write_ticks(t, fd, kbuf, n, 500);
+}
+
+long fd_write_ticks(fdtable_t *t, int fd, const void *kbuf, uint64_t n, uint64_t ticks) {
   if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
   ofile_t *o = t->fd[fd];
   if ((o->flags & 3) == O_RDONLY) return -EBADF;
 
-  if (o->kind == FK_SOCKET) return sock_send(o->sock, kbuf, n);
+  if (o->kind == FK_SOCKET) return sock_write_wait(o, kbuf, n, ticks);
 
   if (o->kind == FK_CONSOLE) {
     /* Write all of it. The first version capped every call at 256 bytes and

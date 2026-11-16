@@ -447,6 +447,52 @@ it distinguishes "poll is wrong" from "this connection never delivered" - and th
 combined call asserts only that the ready count equals the number of descriptors
 reporting bits.
 
+## 10c. Milestone 3: writes, and the send outcome that must not be guessed
+
+The read rule, mirrored. `fd_write_ticks` pins the description for the whole
+operation; `sock_write_wait` sends once, and only a send that accepts **nothing**
+enters `sock_wait(POLLOUT)`. Bytes accepted return immediately, even when fewer
+than asked: `write()` reports what it took and the caller decides whether to
+continue. A hangup or error ends the call rather than being waited out - no amount
+of patience makes room in a connection that is gone. Default patience is 500 ticks,
+same as reads.
+
+**The part that had to change first: `e1000_send` was lying by omission.** It
+returned `-1` for two unrelated situations - the ring was stuck before anything was
+posted, and the frame was posted but its completion bit never came back. Only the
+first is safe to retry; retrying the second duplicates bytes on the far side, and
+TCP will happily deliver both copies to an application. It now has three outcomes:
+
+- `0` - completion seen, the frame is on the wire
+- `-1` - nothing was posted, retrying is safe
+- `-2` - posted, unconfirmed: **treat as sent**
+
+`tcp_conn_send` counts a `-2` chunk as accepted, advances `seq`, logs
+`tx unconfirmed`, and never resends it. A hole it cannot detect is better than a
+duplication it cannot undo.
+
+**What is tested:** partial write returns at once without waiting; a full pipe
+parks the writer exactly once and wakes on `POLLOUT` through the bound backend
+callback; an expired deadline reports `-EAGAIN`; a hangup turns a blocked write into
+`-EPIPE` instead of a wait. Six checks, `[rdy] 51/51` overall.
+
+**What is not tested, and is marked so here:** the `-2` path. Producing it means
+making a NIC fail to post a completion bit, which needs fault injection below
+`e1000_send`; there is no seam for that today, and pretending a fake backend can
+reach it would test the wrong layer. The policy is written down and the code path
+is three lines, but it has not been executed, and no test claims otherwise.
+
+Two fake-backend defects surfaced while writing these checks, both the same
+mistake as the earlier `open = 0` one - a fake that does not model a state the
+real backend can be in:
+
+- `fk_poll` reported `POLLOUT` unconditionally, so a full pipe looked writable and
+  the writer never parked. `POLLOUT` means "a 1-byte send would make progress".
+- `fake_reset()` cleared the bound readiness callback while the socket was still
+  bound to it, so the test's next report jumped to address 0 and took the kernel
+  down. The registration belongs to the socket; a fake forgetting it models a
+  transition that cannot happen.
+
 ## 11. Still open
 
 - **Two readers on one socket.** Level-triggered wake-all permits it; concurrent
@@ -455,6 +501,6 @@ reporting bits.
 - **Waiter count 4** is a guess; a browser may want more (a poller plus readers).
   Cheap to raise, expensive to get wrong silently.
 - **Doorbell vs switch-path pump** — decided by test 4's evidence, not before.
-- **`e1000_send` tri-state** (`-2` posted-but-unconfirmed) is a prerequisite for
-  any caller that retries a short write, not just for readiness. Worth doing in
-  whichever milestone first retries.
+- **`e1000_send` tri-state** is implemented (§10c), but its `-2` outcome is
+  unexercised: it needs fault injection below the NIC driver. Until then the policy
+  is a decision recorded in code, not a behaviour observed under test.

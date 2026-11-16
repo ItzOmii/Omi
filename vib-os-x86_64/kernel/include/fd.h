@@ -85,6 +85,7 @@ long fd_read(fdtable_t *t, int fd, void *kbuf, uint64_t n);
 /* Same, with an explicit patience in ticks (100 ticks ~= 1 s). */
 long fd_read_ticks(fdtable_t *t, int fd, void *kbuf, uint64_t n, uint64_t ticks);
 long fd_write(fdtable_t *t, int fd, const void *kbuf, uint64_t n);
+long fd_write_ticks(fdtable_t *t, int fd, const void *kbuf, uint64_t n, uint64_t ticks);
 long fd_seek(fdtable_t *t, int fd, int64_t off, int whence);
 int  fd_close(fdtable_t *t, int fd);
 int  fd_dup(fdtable_t *t, int fd);

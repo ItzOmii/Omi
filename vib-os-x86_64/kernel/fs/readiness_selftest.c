@@ -30,6 +30,8 @@ typedef struct {
   int  calls;             /* poll() invocations, for "becomes ready on call N" */
   int  ready_after;       /* 0 = never; else poll() reports POLLIN from call N */
   int  eof;               /* the stream ended: recv reports the close */
+  int  tx_room;           /* bytes a send will accept right now */
+  int  hup;               /* the peer is gone: readiness reports the hangup */
   void (*cb)(void *, unsigned);   /* what the socket bound us to */
   void *ctx;
   int  binds;
@@ -43,7 +45,15 @@ static void *fk_open(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t port) {
   fk.open = 1;
   return &fk;
 }
-static int fk_send(void *h, const void *buf, int len) { (void)h; (void)buf; return len; }
+/* Send room is a variable, not a constant: "accepted nothing" is the state a
+ * blocking write exists to wait out, and a fake that always accepts cannot
+ * produce it. */
+static int fk_send(void *h, const void *buf, int len) {
+  (void)h; (void)buf;
+  int room = fk.tx_room;
+  if (room < 0) room = 0;
+  return len < room ? len : room;
+}
 /* The three outcomes the socket layer distinguishes, kept distinct here: bytes,
  * 0 for "nothing now, ask again" (would block), and -1 for the peer closing. A
  * fake that conflates the last two cannot test a read that waits. */
@@ -61,9 +71,13 @@ static void fk_close(void *h) { (void)h; fk.destroyed++; fk.open = 0; }
 static unsigned fk_poll(void *h) {
   (void)h;
   fk.calls++;
-  unsigned r = OMI_POLLOUT;
+  /* POLLOUT means "a 1-byte send would make progress", not "the connection is
+   * open": set unconditionally, every full pipe looks writable, a blocking write
+   * never parks, and the test that says it does proves nothing. */
+  unsigned r = (fk.open && fk.tx_room > 0) ? OMI_POLLOUT : 0;
   if (fk.ready_after && fk.calls >= fk.ready_after) r |= OMI_POLLIN;
   if (fk.rd_len > 0) r |= OMI_POLLIN;
+  if (fk.hup) r |= OMI_POLLHUP;
   if (!fk.open) r |= OMI_POLLERR;
   return r;
 }
@@ -86,7 +100,7 @@ static const struct socket_ops fk_ops = {
 
 /* ---- one worker, driven by commands -------------------------------------- */
 
-enum { C_IDLE = 0, C_WAIT, C_REGISTER_THEN_DIE, C_READ };
+enum { C_IDLE = 0, C_WAIT, C_REGISTER_THEN_DIE, C_READ, C_WRITE };
 
 static volatile int  w_cmd, w_done, w_bits, w_bytes, w_timed_out;
 static struct socket *w_sock;
@@ -117,6 +131,9 @@ static void rd_worker(void) {
     } else if (c == C_READ) {
       w_timed_out = 0;
       w_bits = (int)fd_read_ticks(wt, wfd, wbuf, wlen, 40);
+    } else if (c == C_WRITE) {
+      w_timed_out = 0;
+      w_bits = (int)fd_write_ticks(wt, wfd, wbuf, wlen, 40);
     } else if (c == C_REGISTER_THEN_DIE) {
       /* Register, then die without clearing: the exit path must unlink it. */
       sock_waiter_add(w_sock);
@@ -185,7 +202,12 @@ static void fake_reset(void) {
   /* open: the transport exists, so POLLOUT and no POLLERR. Tests that need the
    * connection gone drive it through shutdown, not by lying about the backend. */
   fk.open = 1; fk.rd_len = 0; fk.destroyed = 0; fk.calls = 0; fk.ready_after = 0;
-  fk.eof = 0; fk.cb = 0; fk.ctx = 0; fk.binds = 0;
+  fk.eof = 0; fk.tx_room = 4096; fk.hup = 0;
+  /* cb/ctx deliberately survive: the registration belongs to the socket, not to
+   * the backend, and a fake that forgets it models a transition that cannot
+   * happen - calling it then jumps to address 0 and takes the machine with it.
+   * The counter is per-scenario bookkeeping, so that one does reset. */
+  fk.binds = 0;
 }
 
 void sock_readiness_selftest(void) {
@@ -389,6 +411,47 @@ void sock_readiness_selftest(void) {
   run_worker(C_READ);
   chk("a read that runs out of patience says EAGAIN", w_bits == -EAGAIN);
 
+  /* 10. the write path, same rule mirrored: what fits is taken now, a full pipe
+   *     waits for POLLOUT, and a hangup is an error rather than a wait. */
+  fake_reset();
+  wlen = 8;
+  fk.tx_room = 3;
+  s0 = sock_stats_get();
+  run_worker(C_WRITE);
+  s1 = sock_stats_get();
+  chk("a partial write reports what it took", w_bits == 3);
+  chk("and does not wait for the rest", s1.blocks - s0.blocks == 0);
+
+  fk.tx_room = 0;
+  s0 = sock_stats_get();
+  w_done = 0; w_bits = -999; w_cmd = C_WRITE;
+  wait_ticks(2);
+  chk("a full pipe parks the writer", sock_waiters_live(r) == 1);
+  fk.tx_room = 6;
+  fk.cb(fk.ctx, OMI_POLLOUT);          /* through the bound backend, as before */
+  wait_done();
+  s1 = sock_stats_get();
+  chk("the writer woke on POLLOUT and sent", w_bits == 6);
+  chk("and it waited exactly once", s1.blocks - s0.blocks == 1);
+
+  fk.tx_room = 0;
+  run_worker(C_WRITE);
+  chk("a write that runs out of patience says EAGAIN", w_bits == -EAGAIN);
+
+  /* A hangup must not be waited out: no amount of patience makes room in a
+   * connection that is gone. */
+  fk.tx_room = 0;
+  w_done = 0; w_bits = -999; w_cmd = C_WRITE;
+  wait_ticks(2);
+  /* State first, then the report: a notify is a hint, and the recheck has to
+   * find the hangup or the writer is right to keep waiting. */
+  fk.hup = 1;
+  sock_notify(r, OMI_POLLHUP);
+  wait_done();
+  chk("hup turns a blocked write into an error", w_bits == -EPIPE);
+
+  fk.tx_room = 4096;
+  wlen = sizeof wbuf;
   fd_close(t, rfd);
 
   /* Clean up: release everything the test created. */
