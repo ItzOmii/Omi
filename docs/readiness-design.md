@@ -350,16 +350,17 @@ Stated so they can be tested individually rather than assumed collectively:
 1. No backend operation can outlive its pin.
 2. Shutdown is idempotent — repeated `ofile_shutdown` changes nothing.
 3. Destruction occurs exactly once, and only at `refs == 0 && pins == 0`.
-4. No waiter can wake a recycled task: socket `gen`, task `tgen`, `wait_obj` and
-   `TASK_BLOCKED` must all agree.
+4. No waiter can wake a task that is no longer the one that registered: socket
+   `gen`, task `tgen`, `wait_obj` and `TASK_BLOCKED` must all agree.
 5. No task retains a stale socket registration after exit.
 6. Every readiness change increments `seq` **before** waking anyone.
 7. `poll()` never sleeps after observing a changed `seq`.
 8. Network progress cannot depend on a ring-3 application making syscalls.
 
 Each maps to a test in §9 except 5 and 8, which needed their own: a task killed
-while parked (assert the socket's slot is clear and no wake lands on the recycled
-id), and the all-blocked progress test. Both now exist; invariant 8's test is in
+while parked (assert the socket's slot is clear, and that a wake cannot land on an
+exited task or on a subsequently reused task slot), and the all-blocked progress
+test. Both now exist; invariant 8's test is in
 `kernel/fs/preempt_selftest.c` and is described in §10b.
 
 ## 10b. Milestone 2: the syscall side, and two bugs it found
