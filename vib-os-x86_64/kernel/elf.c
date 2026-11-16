@@ -57,7 +57,7 @@ static void log_hex(const char *label, uint64_t v) {
   serial_puts("\n");
 }
 
-int elf_load(const char *path_suffix, uint64_t *entry_out, uint64_t *cr3_out) {
+int elf_load(const char *path_suffix, uint64_t *entry_out, mm_t **mm_out) {
   void *blob = 0;
   uint64_t len = 0;
   if (!meep_module_find(path_suffix, &blob, &len) || !blob || len < sizeof(elf64_ehdr_t)) {
@@ -83,7 +83,9 @@ int elf_load(const char *path_suffix, uint64_t *entry_out, uint64_t *cr3_out) {
     return -1;
   }
 
-  uint64_t cr3 = ring3_new_space();
+  mm_t *mm = ring3_new_mm();
+  if (!mm) { serial_puts("[elf] no address space\n"); return -1; }
+  uint64_t cr3 = mm->cr3;
   if (!cr3) { serial_puts("[elf] out of page-table frames\n"); return -1; }
 
   int loaded = 0;
@@ -133,16 +135,77 @@ int elf_load(const char *path_suffix, uint64_t *entry_out, uint64_t *cr3_out) {
   serial_puts("\n");
 
   *entry_out = eh->entry;
-  *cr3_out = cr3;
+  *mm_out = mm;
   return 0;
+}
+
+/* Lay out the SysV initial stack: the strings at the top, then argc, argv[],
+ * a NULL, and an empty envp, with rsp 16-byte aligned. This is the whole of the
+ * process-entry ABI - a program that reads argc from (%rsp) and argv from 8(%rsp)
+ * needs nothing else from the kernel to start. */
+#define ARG_MAX 16
+#define ARG_BLK 2048
+
+static uint64_t build_initial_stack(uint64_t cr3, int argc, const char *const *argv) {
+  static char blk[ARG_BLK];
+  static uint64_t argp[ARG_MAX];
+  for (int i = 0; i < ARG_BLK; i++) blk[i] = 0;
+  if (argc > ARG_MAX) argc = ARG_MAX;
+
+  uint64_t base = RING3_LIMIT - ARG_BLK;
+  uint64_t off = ARG_BLK;
+  for (int i = argc - 1; i >= 0; i--) {
+    uint64_t n = 1;
+    while (argv[i][n - 1]) n++;
+    if (n > off) return 0;
+    off -= n;
+    for (uint64_t k = 0; k < n; k++) blk[off + k] = argv[i][k];
+    argp[i] = base + off;
+  }
+
+  uint64_t table = (uint64_t)(argc + 3) * 8;      /* argc, argv[], NULL, envp NULL */
+  uint64_t sp = (base + off - table) & ~15ULL;
+  uint64_t p = sp - base;
+  uint64_t *t = (uint64_t *)(void *)(blk + p);
+  t[0] = (uint64_t)argc;
+  for (int i = 0; i < argc; i++) t[1 + i] = argp[i];
+  t[1 + argc] = 0;
+  t[2 + argc] = 0;
+
+  if (ring3_copy_to_mm(cr3, base, blk, ARG_BLK) != 0) return 0;
+  return sp;
+}
+
+/* Load `path` and start it with a real argv. */
+int ring3_spawn_elf_argv(const char *name, const char *path, int argc, const char *const *argv) {
+  uint64_t entry = 0;
+  mm_t *mm = 0;
+  if (elf_load(path, &entry, &mm) != 0) return -1;
+  uint64_t sp = build_initial_stack(mm->cr3, argc, argv);
+  if (!sp) {
+    /* Two causes, one symptom: argv bigger than the block, or the stack page
+     * could not be written. Say which, and which program. */
+    serial_puts("[elf] ");
+    serial_puts(name);
+    serial_puts(": user stack allocation failed (argv too large or page refused)\n");
+    return -1;
+  }
+  int id = task_spawn_user_mm(name, entry, sp, mm, (uint64_t)argc);
+  if (id < 0) {
+    serial_puts("[elf] no task slot for ");
+    serial_puts(name);
+    serial_puts("\n");
+  }
+  return id;
 }
 
 /* Load `path` into a brand new address space and start it. `arg` arrives in the
  * program's rdi, which is how one binary can play two roles in the demo. */
 int ring3_spawn_elf(const char *name, const char *path, uint64_t arg) {
-  uint64_t entry = 0, cr3 = 0;
-  if (elf_load(path, &entry, &cr3) != 0) return -1;
-  int id = task_spawn_user(name, entry, RING3_LIMIT - 16, cr3, arg);
+  uint64_t entry = 0;
+  mm_t *mm = 0;
+  if (elf_load(path, &entry, &mm) != 0) return -1;
+  int id = task_spawn_user_mm(name, entry, RING3_LIMIT - 16, mm, arg);
   if (id < 0) {
     serial_puts("[elf] no task slot for ");
     serial_puts(name);

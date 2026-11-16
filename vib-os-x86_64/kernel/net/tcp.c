@@ -1,5 +1,14 @@
 /*
  * Omi - TCP client + DNS resolver (see include/omi_net.h)
+ *
+ * One connection in globals was the limit: a second socket could only exist by
+ * tearing down the first. State now lives in tcp_conn_t, one per connection,
+ * and every inbound segment is demultiplexed by 4-tuple into the connection
+ * that owns it. A socket that is not currently polling still collects its
+ * bytes, because whoever holds the NIC hands each frame to the right owner.
+ *
+ * What is still global: the interface config and the single e1000 receive
+ * queue. That is honest - one NIC, one poller at a time (rx_busy).
  */
 
 #include "types.h"
@@ -7,10 +16,14 @@
 #include "net.h"
 #include "omi_net.h"
 #include "e1000.h"
+#include "task.h"
+
+extern void serial_puts(const char *s);
 
 #define ETH_IPV4 0x0800
 #define ETH_LEN 14
 #define IP_PROTO_TCP 6
+#define IP_PROTO_UDP 17
 
 #define TCP_FIN 0x01
 #define TCP_SYN 0x02
@@ -18,19 +31,33 @@
 #define TCP_PSH 0x08
 #define TCP_ACK 0x10
 
-static net_cfg_t s_cfg;
-static uint8_t s_dip[4];
-static uint8_t s_dmac[6];
-static uint16_t s_sport, s_dport;
-static uint32_t s_seq, s_ack;
-static int s_open;
-static uint32_t s_port_seed = 0x5A17;
+/* Eight concurrent connections is enough to prove the design and to run a
+ * couple of programs at once; the receive buffer is what costs memory. */
+#define TCP_MAX_CONN 8
+#define TCP_RX_MAX   4096
+
+typedef struct tcp_conn {
+  net_cfg_t cfg;
+  uint8_t  dip[4];
+  uint8_t  dmac[6];
+  uint16_t sport, dport;      /* our port, theirs */
+  uint32_t seq, ack;
+  int      open;              /* handshake completed */
+  int      peer_closed;       /* FIN or RST seen */
+  int      used;
+  uint8_t  rx[TCP_RX_MAX];
+  int      rx_len;
+} tcp_conn_t;
+
+static tcp_conn_t conns[TCP_MAX_CONN];
+static uint32_t port_seed = 0x5A17;
 
 /* ---- pacer ------------------------------------------------------------
-   The stack has no timer subsystem, so timeouts are measured straight off
-   the PIT's channel-0 counter (1.193182 MHz, ~0.838 us per tick). Without
-   this, "spin N times" is a handful of milliseconds and every request
-   gives up before the reply can land. */
+   Timeouts are measured off the PIT's channel-0 counter. The accumulator used
+   to be a pair of globals, which two tasks waiting at once would reset under
+   each other - so it lives on the waiter's stack now. */
+typedef struct pacer { uint16_t last; uint32_t ticks; } pacer_t;
+
 static inline void io_w(uint16_t port, uint8_t v) {
   __asm__ volatile("outb %0, %1" ::"a"(v), "Nd"(port));
 }
@@ -45,24 +72,21 @@ static uint16_t pit_read(void) {
   uint8_t hi = io_r(0x40);
   return (uint16_t)(((uint16_t)hi << 8) | lo);
 }
-static uint16_t s_pit_last;
-static uint32_t s_ticks;
-static void pace_init(void) {
-  s_pit_last = pit_read();
-  s_ticks = 0;
+static void pace_begin(pacer_t *p) {
+  p->last = pit_read();
+  p->ticks = 0;
 }
 /* Accumulate raw PIT ticks and divide the total. Dividing each delta loses
    1 ms to truncation on every call, and this is polled thousands of times a
    second, so a "2 second" timeout never expired and connects hung forever. */
-static uint32_t pace_ms(void) {
+static uint32_t pace_ms(pacer_t *p) {
   uint16_t n = pit_read();
-  s_ticks += (uint16_t)(s_pit_last - n);
-  s_pit_last = n;
-  return s_ticks / 1193u;
+  p->ticks += (uint16_t)(p->last - n);
+  p->last = n;
+  return p->ticks / 1193u;
 }
 static void pace_yield(void) {
-  for (volatile int i = 0; i < 50; i++) {
-  }
+  task_yield();          /* let the other programs make progress too */
 }
 
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
@@ -76,10 +100,10 @@ static uint32_t get32(const uint8_t *p) {
          ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
-static uint16_t tcp_csum(const uint8_t *seg, int len) {
+static uint16_t tcp_csum(const tcp_conn_t *c, const uint8_t *seg, int len) {
   uint32_t sum = 0;
-  for (int i = 0; i < 4; i += 2) sum += get16(s_cfg.ip + i);
-  for (int i = 0; i < 4; i += 2) sum += get16(s_dip + i);
+  for (int i = 0; i < 4; i += 2) sum += get16(c->cfg.ip + i);
+  for (int i = 0; i < 4; i += 2) sum += get16(c->dip + i);
   sum += IP_PROTO_TCP;
   sum += (uint32_t)len;
   int i = 0;
@@ -87,58 +111,6 @@ static uint16_t tcp_csum(const uint8_t *seg, int len) {
   if (i < len) sum += ((uint32_t)seg[i] << 8);
   while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
   return (uint16_t)~sum;
-}
-
-static int tcp_seg(uint8_t flags, const uint8_t *data, int dlen) {
-  uint8_t f[1600];
-  uint8_t me[6];
-  if (dlen > 1200) return -1;
-  e1000_mac(me);
-  for (int i = 0; i < 6; i++) f[i] = s_dmac[i];
-  for (int i = 0; i < 6; i++) f[6 + i] = me[i];
-  put16(f + 12, ETH_IPV4);
-
-  uint8_t *ip = f + ETH_LEN;
-  int iplen = 40 + dlen;
-  ip[0] = 0x45; ip[1] = 0;
-  put16(ip + 2, (uint16_t)iplen);
-  put16(ip + 4, 0);
-  put16(ip + 6, 0x4000);
-  ip[8] = 64; ip[9] = IP_PROTO_TCP;
-  put16(ip + 10, 0);
-  memcpy(ip + 12, s_cfg.ip, 4);
-  memcpy(ip + 16, s_dip, 4);
-  put16(ip + 10, net_csum(ip, 20));
-
-  uint8_t *t = ip + 20;
-  put16(t, s_sport);
-  put16(t + 2, s_dport);
-  put32(t + 4, s_seq);
-  put32(t + 8, s_ack);
-  t[12] = 0x50;
-  t[13] = flags;
-  put16(t + 14, 4096);
-  put16(t + 16, 0);
-  put16(t + 18, 0);
-  if (dlen && data) memcpy(t + 20, data, (size_t)dlen);
-  put16(t + 16, tcp_csum(t, 20 + dlen));
-  return e1000_send(f, (uint16_t)(ETH_LEN + iplen));
-}
-
-/* Returns the offset of the TCP header for an inbound segment we care about,
-   or -1 when the frame is not ours. */
-static int tcp_match(const uint8_t *f, int n) {
-  if (n < ETH_LEN + 40) return -1;
-  if (get16(f + 12) != ETH_IPV4) return -1;
-  const uint8_t *ip = f + ETH_LEN;
-  if ((ip[0] >> 4) != 4) return -1;
-  if (ip[9] != IP_PROTO_TCP) return -1;
-  int ihl = (ip[0] & 0x0F) * 4;
-  const uint8_t *t = ip + ihl;
-  if (n < ETH_LEN + ihl + 20) return -1;
-  if (get16(t + 2) != s_sport) return -1;
-  if (get16(t) != s_dport) return -1;
-  return ETH_LEN + ihl;
 }
 
 static void pick_route(const net_cfg_t *cfg, const uint8_t ip[4], uint8_t mac[6]) {
@@ -151,165 +123,297 @@ static void pick_route(const net_cfg_t *cfg, const uint8_t ip[4], uint8_t mac[6]
   memcpy(mac, cfg->gw_mac, 6);
 }
 
-static void tcp_pend_clear(void);   /* defined with the receive path */
+/* One segment on one connection. Nothing here reads another connection's
+ * state, which is the whole point of the refactor. */
+static int conn_seg(tcp_conn_t *c, uint8_t flags, const uint8_t *data, int dlen) {
+  uint8_t f[1600];
+  uint8_t me[6];
+  if (dlen > 1200) return -1;
+  e1000_mac(me);
+  for (int i = 0; i < 6; i++) f[i] = c->dmac[i];
+  for (int i = 0; i < 6; i++) f[6 + i] = me[i];
+  put16(f + 12, ETH_IPV4);
 
-int tcp_connect(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t port) {
-  if (!cfg || !cfg->valid) return 0;
-  s_cfg = *cfg;
-  memcpy(s_dip, ip, 4);
-  s_dport = port;
-  s_port_seed = s_port_seed * 1103515245u + 12345u;
-  s_sport = (uint16_t)(49152u + ((s_port_seed >> 16) % 14000u));
-  pick_route(cfg, ip, s_dmac);
+  uint8_t *ip = f + ETH_LEN;
+  int iplen = 40 + dlen;
+  ip[0] = 0x45; ip[1] = 0;
+  put16(ip + 2, (uint16_t)iplen);
+  put16(ip + 4, 0);
+  put16(ip + 6, 0x4000);
+  ip[8] = 64; ip[9] = IP_PROTO_TCP;
+  put16(ip + 10, 0);
+  memcpy(ip + 12, c->cfg.ip, 4);
+  memcpy(ip + 16, c->dip, 4);
+  put16(ip + 10, net_csum(ip, 20));
 
-  s_seq = s_port_seed ^ 0x9E3779B9u;
-  s_ack = 0;
-  s_open = 0;
+  uint8_t *t = ip + 20;
+  put16(t, c->sport);
+  put16(t + 2, c->dport);
+  put32(t + 4, c->seq);
+  put32(t + 8, c->ack);
+  t[12] = 0x50;
+  t[13] = flags;
+  put16(t + 14, (uint16_t)TCP_RX_MAX);
+  put16(t + 16, 0);
+  put16(t + 18, 0);
+  if (dlen && data) memcpy(t + 20, data, (size_t)dlen);
+  put16(t + 16, tcp_csum(c, t, 20 + dlen));
+  int rc = e1000_send(f, (uint16_t)(ETH_LEN + iplen));
+  if (rc != 0) {
+    char m[40]; int o = 0;
+    const char *pre = "[tcp] seg tx failed ";
+    while (*pre) m[o++] = *pre++;
+    m[o++] = (char)('0' + (int)(c - conns));
+    m[o++] = '\n'; m[o] = 0;
+    serial_puts(m);
+  }
+  return rc;
+}
 
-  for (int attempt = 0; attempt < 3 && !s_open; attempt++) {
-    if (tcp_seg(TCP_SYN, 0, 0) != 0) return 0;
-    uint8_t r[1600];
-    /* First try short, then give slow hosts real time (neverssl waits seconds). */
-    const uint32_t budget = attempt == 0 ? 1500u : (attempt == 1 ? 3500u : 5000u);
-    if (attempt) {
-      /* A fresh 5-tuple per retry: a retried SYN on the same port is often
-         dropped by the middlebox that ate the first one, and some hosts
-         (neverssl among them) take seconds to answer at all. */
-      s_port_seed = s_port_seed * 1103515245u + 12345u;
-      s_sport = (uint16_t)(49152u + ((s_port_seed >> 16) % 14000u));
-      s_seq = s_port_seed ^ 0x9E3779B9u;
-      s_ack = 0;
-    }
-    pace_init();
-    while (pace_ms() < budget) {
-      int n = e1000_poll_recv(r, sizeof r);
-      if (n > 0) {
-        int to = tcp_match(r, n);
-        if (to > 0) {
-          const uint8_t *t = r + to;
-          uint8_t flags = t[13];
-          if (flags & TCP_RST) return 0;
-          if ((flags & TCP_SYN) && (flags & TCP_ACK)) {
-            s_ack = get32(t + 4) + 1;
-            s_seq += 1;                 /* our SYN consumed one sequence number */
-            tcp_seg(TCP_ACK, 0, 0);
-            s_open = 1;
-            tcp_pend_clear();
-            return 1;
-          }
-        }
-      }
-      pace_yield();
-    }
+static tcp_conn_t *find_conn(uint16_t our_port, uint16_t their_port, const uint8_t *their_ip) {
+  for (int i = 0; i < TCP_MAX_CONN; i++) {
+    tcp_conn_t *c = &conns[i];
+    if (!c->used || c->sport != our_port || c->dport != their_port) continue;
+    if (memcmp(c->dip, their_ip, 4) == 0) return c;
   }
   return 0;
 }
 
-int tcp_send(const void *buf, int len) {
-  if (!s_open) return -1;
+/* Every inbound TCP frame goes through here, whoever polled for it. Handing it
+ * to the owning connection instead of dropping it is what makes two clients at
+ * once possible. */
+static void tcp_dispatch(const uint8_t *f, int n) {
+  if (n < ETH_LEN + 40) return;
+  if (get16(f + 12) != ETH_IPV4) return;
+  const uint8_t *ip = f + ETH_LEN;
+  if ((ip[0] >> 4) != 4 || ip[9] != IP_PROTO_TCP) return;
+  int ihl = (ip[0] & 0x0F) * 4;
+  const uint8_t *t = ip + ihl;
+  if (n < ETH_LEN + ihl + 20) return;
+  int payload = get16(ip + 2) - ihl - ((t[12] >> 4) * 4);
+  if (payload < 0) return;
+
+  tcp_conn_t *c = find_conn(get16(t + 2), get16(t), ip + 12);
+  if (!c) return;
+
+  uint8_t flags = t[13];
+  uint32_t seq = get32(t + 4);
+
+  if (flags & TCP_RST) { c->open = 0; c->peer_closed = 1; return; }
+
+  if ((flags & TCP_SYN) && (flags & TCP_ACK) && !c->open) {
+    c->ack = seq + 1;
+    c->seq += 1;                 /* our SYN consumed one sequence number */
+    c->open = 1;
+    conn_seg(c, TCP_ACK, 0, 0);
+    return;
+  }
+
+  if (payload > 0) {
+    if (seq != c->ack) { conn_seg(c, TCP_ACK, 0, 0); return; }   /* duplicate or out of order */
+    int room = TCP_RX_MAX - c->rx_len;
+    if (payload > room) { conn_seg(c, TCP_ACK, 0, 0); return; }  /* no room: do not ACK, peer retries */
+    memcpy(c->rx + c->rx_len, t + ((t[12] >> 4) * 4), (size_t)payload);
+    c->rx_len += payload;
+    c->ack += (uint32_t)payload;
+    conn_seg(c, TCP_ACK, 0, 0);
+  }
+
+  if (flags & TCP_FIN) {
+    c->ack = seq + (uint32_t)(payload > 0 ? payload : 0) + 1;
+    conn_seg(c, TCP_ACK, 0, 0);
+    c->peer_closed = 1;
+  }
+}
+
+static void conn_log(const char *what, tcp_conn_t *c) {
+  char msg[56];
+  int o = 0;
+  const char *pre = "[tcp] conn ";
+  while (*pre) msg[o++] = *pre++;
+  while (*what) msg[o++] = *what++;
+  msg[o++] = ' ';
+  msg[o++] = (char)('0' + (int)(c - conns));
+  const char *mid = " port ";
+  while (*mid) msg[o++] = *mid++;
+  char d[8]; int k = 0; uint16_t v = c->sport;
+  if (!v) d[k++] = '0';
+  while (v) { d[k++] = (char)('0' + v % 10); v /= 10; }
+  while (k) msg[o++] = d[--k];
+  /* destination too: "who connected where" is the first question asked of a
+     log line like this, and the answer is never derivable afterwards. */
+  msg[o++] = ' '; msg[o++] = '-'; msg[o++] = '>'; msg[o++] = ' ';
+  for (int a = 0; a < 4; a++) {
+    char db[4]; int dk = 0; uint8_t b = c->dip[a];
+    if (!b) db[dk++] = '0';
+    while (b) { db[dk++] = (char)('0' + b % 10); b /= 10; }
+    while (dk) msg[o++] = db[--dk];
+    msg[o++] = a == 3 ? ':' : '.';
+  }
+  k = 0; v = c->dport;
+  if (!v) d[k++] = '0';
+  while (v) { d[k++] = (char)('0' + v % 10); v /= 10; }
+  while (k) msg[o++] = d[--k];
+  msg[o++] = '\n'; msg[o] = 0;
+  serial_puts(msg);
+}
+
+void tcp_input(const uint8_t *f, int n) { tcp_dispatch(f, n); }
+
+static volatile int rx_busy;
+
+/* One frame, then get out. If another task is already inside the NIC we do
+ * nothing: its pump dispatches our frames for us. */
+static void tcp_pump(void) {
+  if (rx_busy) return;
+  rx_busy = 1;
+  uint8_t r[1600];
+  int n = e1000_poll_recv(r, sizeof r);
+  if (n > 0 && n < (int)sizeof r) tcp_dispatch(r, n);
+  rx_busy = 0;
+}
+
+/* ---- the connection API ------------------------------------------------ */
+
+tcp_conn_t *tcp_conn_open(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t port) {
+  if (!cfg || !cfg->valid) return 0;
+  tcp_conn_t *c = 0;
+  for (int i = 0; i < TCP_MAX_CONN; i++) if (!conns[i].used) { c = &conns[i]; break; }
+  if (!c) return 0;
+
+  memset(c, 0, sizeof *c);
+  c->used = 1;
+  c->cfg = *cfg;
+  memcpy(c->dip, ip, 4);
+  c->dport = port;
+
+  for (int attempt = 0; attempt < 3 && !c->open; attempt++) {
+    /* A fresh 5-tuple per retry: a retried SYN on the same port is often
+       dropped by the middlebox that ate the first one, and some hosts
+       (neverssl among them) take seconds to answer at all. */
+    port_seed = port_seed * 1103515245u + 12345u;
+    c->sport = (uint16_t)(49152u + ((port_seed >> 16) % 14000u));
+    pick_route(cfg, ip, c->dmac);
+    c->seq = port_seed ^ 0x9E3779B9u;
+    c->ack = 0;
+
+    if (conn_seg(c, TCP_SYN, 0, 0) != 0) break;
+
+    pacer_t p;
+    const uint32_t budget = attempt == 0 ? 1500u : (attempt == 1 ? 3500u : 5000u);
+    pace_begin(&p);
+    while (pace_ms(&p) < budget && !c->open) {
+      tcp_pump();
+      if (!c->open) pace_yield();
+    }
+  }
+
+  if (!c->open) { c->used = 0; return 0; }
+
+  /* One line per connection, annotated with the slot: with several in flight
+   * the log has to say which connection is which, or a mixed-up stream is
+   * unfindable. Slot numbers also make "how many at once" checkable. */
+  conn_log("up", c);
+  return c;
+}
+
+int tcp_conn_send(tcp_conn_t *c, const void *buf, int len) {
+  if (!c || !c->open) return -1;
   const uint8_t *p = (const uint8_t *)buf;
   int sent = 0;
   while (sent < len) {
     int chunk = len - sent;
     if (chunk > 1000) chunk = 1000;
-    if (tcp_seg((uint8_t)(TCP_ACK | TCP_PSH), p + sent, chunk) != 0) return sent;
-    s_seq += (uint32_t)chunk;
+    if (conn_seg(c, (uint8_t)(TCP_ACK | TCP_PSH), p + sent, chunk) != 0) {
+      char m[44]; int o = 0;
+      const char *pre = "[tcp] short write, got ";
+      while (*pre) m[o++] = *pre++;
+      char d[8]; int k = 0; int v = sent;
+      if (!v) d[k++] = '0';
+      while (v) { d[k++] = (char)('0' + v % 10); v /= 10; }
+      while (k) m[o++] = d[--k];
+      m[o++] = '\n'; m[o] = 0;
+      serial_puts(m);
+      return sent;
+    }
+    c->seq += (uint32_t)chunk;
     sent += chunk;
   }
   return sent;
 }
 
-/* Bytes that arrived inside a segment but did not fit the caller's buffer.
- * Without this, a short read (TLS asks for the 5-byte record header first)
- * ACKed the whole segment and threw the rest away, which corrupted every
- * handshake. One segment at a time is all we ever need. */
-#define TCP_PEND_MAX 2048
-static uint8_t s_pend[TCP_PEND_MAX];
-static int s_pend_off = 0;
-static int s_pend_len = 0;
-
-static void tcp_pend_clear(void) { s_pend_off = 0; s_pend_len = 0; }
-
-static int tcp_pend_take(void *buf, int max) {
-  int n = s_pend_len - s_pend_off;
-  if (n > max) n = max;
-  if (n > 0) memcpy(buf, s_pend + s_pend_off, (size_t)n);
-  s_pend_off += n;
-  if (s_pend_off >= s_pend_len) tcp_pend_clear();
+static int rx_take(tcp_conn_t *c, void *buf, int max) {
+  int n = c->rx_len < max ? c->rx_len : max;
+  if (n > 0) memcpy(buf, c->rx, (size_t)n);
+  if (n < c->rx_len) memmove(c->rx, c->rx + n, (size_t)(c->rx_len - n));
+  c->rx_len -= n;
   return n;
 }
 
-int tcp_recv(void *buf, int max, int timeout_ms) {
-  if (!s_open) return -1;
-  uint8_t r[1600];
-  uint8_t *out = (uint8_t *)buf;
+int tcp_conn_recv(tcp_conn_t *c, void *buf, int max, int timeout_ms) {
+  if (!c || !c->used) return -1;
   if (max <= 0) return 0;
-  if (s_pend_off < s_pend_len) return tcp_pend_take(out, max);
-  pace_init();
-  while (pace_ms() < (uint32_t)timeout_ms) {
-    int n = e1000_poll_recv(r, sizeof r);
-    if (n <= 0) {
-      pace_yield();
-      continue;
-    }
-    int to = tcp_match(r, n);
-    if (to <= 0) continue;
-    const uint8_t *t = r + to;
-    int ihl = (t[12] >> 4) * 4;
-    int iplen = get16(r + ETH_LEN + 2);
-    int payload = iplen - (to - ETH_LEN) - ihl;
-    uint8_t flags = t[13];
-    uint32_t seq = get32(t + 4);
+  if (c->rx_len > 0) return rx_take(c, buf, max);
+  if (c->peer_closed) return -1;
 
-    if (payload > 0) {
-      int take = payload;
-      if (take > max) take = max;
-      if (seq == s_ack) {
-        /* ACK for everything we accepted, and keep what does not fit. */
-        s_ack += (uint32_t)payload;
-        if (payload <= TCP_PEND_MAX) {
-          memcpy(s_pend, t + ihl, (size_t)payload);
-          s_pend_len = payload;
-          s_pend_off = take;
-          if (take > 0) memcpy(out, s_pend, (size_t)take);
-        } else {
-          /* Cannot happen with a 1500-byte MTU, but do not lie if it does. */
-          tcp_pend_clear();
-          memcpy(out, t + ihl, (size_t)take);
-          s_ack = seq + (uint32_t)take;
-        }
-        tcp_seg(TCP_ACK, 0, 0);
-        if (flags & TCP_FIN) { s_ack += 1; tcp_seg(TCP_ACK, 0, 0); s_open = 0; }
-        return take;
-      }
-      /* duplicate or out of order: ACK what we have and move on */
-      tcp_seg(TCP_ACK, 0, 0);
-      continue;
-    }
-    if (flags & TCP_FIN) {
-      s_ack = seq + 1;
-      tcp_seg(TCP_ACK, 0, 0);
-      s_open = 0;
-      return -1;
-    }
-    if (flags & TCP_RST) {
-      s_open = 0;
-      return -1;
-    }
+  pacer_t p;
+  pace_begin(&p);
+  while (pace_ms(&p) < (uint32_t)timeout_ms) {
+    tcp_pump();
+    if (c->rx_len > 0) return rx_take(c, buf, max);
+    if (c->peer_closed || !c->open) return -1;
+    pace_yield();
   }
   return 0;
 }
 
-void tcp_close(void) {
-  tcp_pend_clear();
-  if (s_open) {
-    s_seq += 1;
-    tcp_seg((uint8_t)(TCP_FIN | TCP_ACK), 0, 0);
+void tcp_conn_close(tcp_conn_t *c) {
+  /* A second close on the same connection would mean the reference count and
+   * the connection lifetime have come apart: say so instead of returning
+   * quietly, because silence here looks like "cleanup happened once". */
+  if (!c) return;
+  if (!c->used) { conn_log("DOUBLE-CLOSE", c); return; }
+  if (c->open) {
+    c->seq += 1;
+    conn_seg(c, (uint8_t)(TCP_FIN | TCP_ACK), 0, 0);
   }
-  s_open = 0;
+  conn_log("down", c);
+  c->used = 0;
+  c->rx_len = 0;
 }
 
-int tcp_is_open(void) { return s_open; }
+int tcp_conn_used(int n) {
+  int k = 0;
+  for (int i = 0; i < TCP_MAX_CONN && i < n; i++) if (conns[i].used) k++;
+  return k;
+}
+
+/* ---- the single-connection API the in-kernel browser still uses ---------
+   http.c and tls.c were written against one global connection. Keeping the
+   old names on top of one dedicated tcp_conn_t means the browser keeps working
+   unchanged while sockets get real per-connection state. */
+
+static tcp_conn_t *legacy;
+
+int tcp_connect(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t port) {
+  if (legacy) { tcp_conn_close(legacy); legacy = 0; }
+  legacy = tcp_conn_open(cfg, ip, port);
+  return legacy ? 1 : 0;
+}
+
+int tcp_send(const void *buf, int len) { return legacy ? tcp_conn_send(legacy, buf, len) : -1; }
+
+int tcp_recv(void *buf, int max, int timeout_ms) {
+  return legacy ? tcp_conn_recv(legacy, buf, max, timeout_ms) : -1;
+}
+
+void tcp_close(void) {
+  if (legacy) { tcp_conn_close(legacy); legacy = 0; }
+}
+
+int tcp_is_open(void) { return legacy && legacy->open; }
+
+int tcp_conn_count(void) { return tcp_conn_used(TCP_MAX_CONN); }
 
 /* ---- DNS ------------------------------------------------------------- */
 
@@ -369,7 +473,7 @@ static int dns_parse(const uint8_t *p, int len, uint16_t id, uint8_t out[4]) {
   return 0;
 }
 
-int net_dns_resolve(const net_cfg_t *cfg, const char *host, uint8_t ip_out[4]) {
+static int dns_resolve_once(const net_cfg_t *cfg, const char *host, uint8_t ip_out[4]) {
   uint8_t q[300];
   uint8_t r[1600];
   static uint16_t dns_id = 0x3301;
@@ -401,13 +505,17 @@ int net_dns_resolve(const net_cfg_t *cfg, const char *host, uint8_t ip_out[4]) {
     if (qlen <= 0) return 0;
     if (!net_udp_send(cfg, server, 5353, 53, q, qlen)) return 0;
 
-    pace_init();
-    while (pace_ms() < 2500) {
+    pacer_t p;
+    pace_begin(&p);
+    while (pace_ms(&p) < 2500) {
+      if (rx_busy) { pace_yield(); continue; }
+      rx_busy = 1;
       int n = e1000_poll_recv(r, sizeof r);
+      rx_busy = 0;
       if (n > ETH_LEN + 28) {
         const uint8_t *ip = r + ETH_LEN;
         int ihl = (ip[0] & 0x0F) * 4;
-        if (get16(r + 12) == ETH_IPV4 && ip[9] == 17) {
+        if (get16(r + 12) == ETH_IPV4 && ip[9] == IP_PROTO_UDP) {
           const uint8_t *udp = ip + ihl;
           if (get16(udp + 2) == 5353 && get16(udp) == 53) {
             int plen = get16(udp + 4) - 8;
@@ -417,11 +525,32 @@ int net_dns_resolve(const net_cfg_t *cfg, const char *host, uint8_t ip_out[4]) {
               return 1;
             }
           }
+        } else {
+          /* A resolution must not swallow another connection's segments. */
+          tcp_dispatch(r, n);
         }
       }
-      for (volatile int i = 0; i < 200; i++) {
-      }
+      pace_yield();
     }
   }
   return 0;
+}
+
+/* Every query leaves from the same source port, so two resolutions in flight
+ * would read and discard each other's replies: each would see the other's ID,
+ * reject it, and both would sit out their timeout. Resolving one at a time is
+ * the honest fix while there is a single UDP path - and it is invisible except
+ * as a few milliseconds of queueing. Chromium-style parallel lookups need
+ * per-query ports and a real UDP receive queue first. */
+static volatile int dns_busy;
+
+int net_dns_resolve(const net_cfg_t *cfg, const char *host, uint8_t ip_out[4]) {
+  pacer_t spin;
+  pace_begin(&spin);
+  while (dns_busy && pace_ms(&spin) < 20000u) pace_yield();
+  if (dns_busy) return 0;                     /* waited 20 s: say no rather than corrupt */
+  dns_busy = 1;
+  int ok = dns_resolve_once(cfg, host, ip_out);
+  dns_busy = 0;
+  return ok;
 }

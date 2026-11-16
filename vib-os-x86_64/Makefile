@@ -74,6 +74,7 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/lib/builtins_shim.c \
            $(KERNEL_DIR)/mm/kmalloc.c \
            $(KERNEL_DIR)/mm/mmio.c \
+           $(KERNEL_DIR)/mm/pmm.c \
            $(KERNEL_DIR)/fs/vfs.c \
            $(KERNEL_DIR)/drivers/framebuffer.c \
            $(KERNEL_DIR)/drivers/idt.c \
@@ -99,6 +100,7 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/gdt.c \
            $(KERNEL_DIR)/ring3.c \
            $(KERNEL_DIR)/elf.c \
+           $(KERNEL_DIR)/fs/fd.c \
            $(KERNEL_DIR)/gui/webimg.c \
            $(KERNEL_DIR)/gui/icons_ri.c \
            $(KERNEL_DIR)/net/tcp.c \
@@ -190,8 +192,13 @@ $(USER_ELF): $(USER_SRC) $(USER_LD) | $(BUILD_DIR)
 	      -o $@ $(BUILD_DIR)/user_init.o
 	@echo "user elf: $$(stat -c %s $@) bytes"
 
+# Every header is a dependency of every object. Crude, but a stale constant in
+# an unrebuilt object cost an afternoon once: ring3.h changed the user window and
+# elf.o kept spawning tasks onto the old stack address.
+KHEADERS := $(wildcard $(KERNEL_DIR)/include/*.h) $(wildcard $(KERNEL_DIR)/include/*/*.h)
+
 # Compile C files
-$(BUILD_DIR)/%.o: $(KERNEL_DIR)/%.c | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: $(KERNEL_DIR)/%.c $(KHEADERS) | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -214,7 +221,10 @@ $(LIMINE_DIR):
 	cd $(LIMINE_DIR) && ./configure --enable-uefi-x86-64 && make
 
 # Create ISO
-$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR)
+# limine.conf is a prerequisite: its module list is part of the ISO's contents,
+# and a stale copy on the image looks exactly like a kernel that cannot find a
+# module that is sitting right there on the disk.
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -227,6 +237,13 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR)
 	# User programs, exposed to the kernel as boot modules
 	mkdir -p $(ISO_ROOT)/apps
 	cp $(USER_ELF) $(ISO_ROOT)/apps/init.elf
+
+	# Standalone userspace programs: built by their own Makefile with their own
+	# flags and linker script, then copied on. Nothing here is linked into the
+	# kernel, and nothing there includes a kernel header.
+	$(MAKE) -C userland
+	cp userland/cat.elf $(ISO_ROOT)/apps/cat.elf
+	cp userland/httpget.elf $(ISO_ROOT)/apps/httpget.elf
 
 	# Media samples, exposed to the kernel as boot modules
 	mkdir -p $(ISO_ROOT)/media

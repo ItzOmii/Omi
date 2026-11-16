@@ -20,11 +20,17 @@
 #define RING3_H
 
 #include <stdint.h>
+#include "task.h"
 
 /* Virtual base of a user address space (PML4 slot 1) and the end of the window
  * that a program is allowed to occupy. */
 #define RING3_USER_BASE   0x0000008000000000ULL
-#define RING3_LIMIT       0x0000008000100000ULL   /* 1 MB window */
+/* The window a process may occupy: 256 MB. Segments land near the base, the
+ * stack at the top, and SYS_VM_ALLOC hands out ranges in between. Page tables
+ * for it are built on demand, so an empty window costs nothing. */
+#define RING3_LIMIT       0x0000008010000000ULL
+#define RING3_MMAP_BASE   0x0000008000100000ULL   /* SYS_VM_ALLOC starts here */
+#define RING3_MMAP_TOP    0x000000800FF00000ULL   /* below the stack */
 /* Shared segments are mapped here in every process that attaches them: the
  * same physical frames, so a write in one process is visible in the other. */
 #define RING3_SHM_BASE    (RING3_USER_BASE + 0x00080000ULL)
@@ -54,6 +60,20 @@
 #define SYS_SHM_ATTACH  16    /* (slot) -> user base address, or -1          */
 #define SYS_CLIP_SET    17    /* (char*, len) -> len stored                  */
 #define SYS_CLIP_GET    18    /* (char*, max) -> len copied                  */
+#define SYS_VM_ALLOC    19    /* (len, prot) -> user address, pages on fault */
+#define SYS_VM_FREE     20    /* (addr, len) -> 0                             */
+#define SYS_THREAD_CREATE 21  /* (entry, arg, stack, 0) -> tid                */
+#define SYS_FUTEX       22    /* (addr, FUTEX_WAIT|WAKE, val, ticks)           */
+#define SYS_OPEN        23    /* (path, flags) -> fd | -ENOENT | -EMFILE       */
+#define SYS_READ        24    /* (fd, buf, len) -> bytes                       */
+#define SYS_LSEEK       25    /* (fd, off, whence) -> new offset               */
+#define SYS_CLOSE       26    /* (fd) -> 0 | -EBADF                            */
+#define SYS_DUP        27   /* (fd) -> new fd sharing the same open file description */
+#define SYS_SOCKET     28   /* (AF_INET, SOCK_STREAM) -> fd | -EAFNOSUPPORT */
+#define SYS_CONNECT    29   /* (fd, ipv4 as u32, port) -> 0 | -ECONNREFUSED | -EISCONN */
+#define SYS_SEND       30   /* (fd, buf, len) -> bytes | -EPIPE */
+#define SYS_RECV       31   /* (fd, buf, len) -> bytes | -EAGAIN (timeout) | 0 (EOF) */
+#define SYS_RESOLVE    32   /* (host, ip_out[4]) -> 0 | -ENOENT            */
 
 /* the switch, the gates and the fault handler */
 void     ring3_init(void);
@@ -62,10 +82,12 @@ void     ring3_fault(uint64_t *frame);   /* from the #PF / #GP stubs */
 
 /* address spaces */
 uint64_t ring3_new_space(void);
+mm_t    *ring3_new_mm(void);
 int      ring3_map(uint64_t cr3, uint64_t vaddr, uint64_t flags, void **kva);
 int      ring3_map_copy(uint64_t cr3, uint64_t vaddr, const uint8_t *src,
                         uint64_t len, uint64_t flags);
 int      ring3_make_stack(uint64_t cr3);
+int      ring3_copy_to_mm(uint64_t cr3, uint64_t vaddr, const void *src, uint64_t n);
 int      ring3_map_existing(uint64_t cr3, uint64_t vaddr, uint64_t phys, uint64_t flags);
 
 /* the kernel's own CR3, and raw access for the scheduler */

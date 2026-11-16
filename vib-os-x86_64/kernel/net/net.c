@@ -9,6 +9,7 @@
 
 #include "net.h"
 #include "omi_http.h"
+#include "omi_net.h"
 #include "e1000.h"
 #include "types.h"
 
@@ -174,6 +175,7 @@ int net_arp_resolve(const net_cfg_t *cfg, const uint8_t ip[4], uint8_t mac_out[6
         return 1;
       }
     }
+    if (n > 0) tcp_input(r, n);   /* somebody else's frame, not ours to drop */
     for (volatile int i = 0; i < 20000; i++) {
     }
   }
@@ -243,6 +245,7 @@ int net_ping(const net_cfg_t *cfg, const uint8_t dst_ip[4], uint16_t seq) {
         r[ETH_LEN + 20] == 0 && get16(r + ETH_LEN + 26) == seq) {
       return 1;
     }
+    if (n > 0) tcp_input(r, n);   /* a ping must not swallow a download */
     for (volatile int i = 0; i < 50000; i++) {
     }
   }
@@ -352,6 +355,7 @@ static int dhcp_exchange(uint8_t msg_out, const uint8_t *requested_ip,
       int got = dhcp_parse(r + ETH_LEN + 28, n - ETH_LEN - 28, yiaddr, cfg);
       if (got == msg_in) return 1;
     }
+    if (n > 0) tcp_input(r, n);
     for (volatile int i = 0; i < 50000; i++) {
     }
   }

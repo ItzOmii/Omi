@@ -11,6 +11,53 @@ and a ring-3 process model added here.
 
 ![A ring-3 process's window next to the task manager, with the process asleep in the blocked state](docs/assets/ring3-tasks.png)
 
+## The goal
+
+Not "an operating system that can display a web page" — **an operating system a real browser could
+eventually run on natively**. The target is Chromium's own processes: renderer, network service,
+compositor, utility processes, thousands of threads, its own allocator, its own IPC. No bundled
+browser, no Chrome OS userland, and no POSIX pretence where the semantics are missing.
+
+That goal is a checklist, and the checklist is the roadmap. A browser needs an address space it can
+grow at runtime, threads with real synchronisation, file descriptors that mean one thing, sockets
+several at a time, readiness notification instead of polling, dynamic linking, and TLS from user
+mode. Omi now has the first four; the rest are named at the bottom rather than pretended away.
+
+| What a browser needs | State |
+|---|---|
+| Physical page allocator, demand paging, `vm_alloc`/`vm_free` | **done** |
+| One address space per process, ring-3 isolation, `int 0x80` | **done** |
+| Preemptive CPL-3 scheduling, per-task FPU state | **done** |
+| Threads + futexes over refcounted address spaces | **done** |
+| Descriptors: `fd → ofile → rfile`, `dup`, shared offsets | **done** |
+| Files: RAM-backed VFS, programs as ELF on the ISO | **done** |
+| Sockets as descriptors, several connections at once | **done** |
+| `poll`/readiness, blocking and non-blocking I/O | not yet |
+| TCP teardown (FIN/RST/`TIME_WAIT`), retransmission | not yet |
+| UDP sockets, `bind`/`listen`/`accept` | not yet |
+| TLS from user mode, dynamic linking, musl | not yet |
+
+## How it got here
+
+Every step was proven by running it, and each one is now a permanent boot test.
+
+- **The shell** — a compositor, a taskbar and widgets, drawn by the kernel, booting instantly under
+  Limine. This is what made the machine usable enough to test anything else on.
+- **The network** — e1000, ARP, IPv4/ICMP, DHCP, UDP, DNS, TCP, HTTP/1.1 and TLS 1.2, then a CSS
+  engine and Omi Net on top of it. The in-kernel browser proves the stack end to end.
+- **User mode** — one PML4 per process, a DPL-3 `int 0x80` gate, ELF programs loaded from the ISO,
+  and IRQ0 preempting ring 3. A fault kills one process instead of the desktop.
+- **Memory** — a physical page allocator and demand paging, so a process can ask for pages with
+  `vm_alloc` instead of being handed a fixed window.
+- **Threads and descriptors** — shared address spaces with futex wait/wake, and a three-layer
+  descriptor table whose `open`-file description is what `dup` shares and `close` reference-counts.
+- **An independent userspace build** — `userland/` compiles its own ELFs with its own linker script
+  and its own syscall numbers, sharing no header with the kernel. On its first run it found two
+  kernel bugs that no in-kernel demo could: a page-table lookup that returned the table instead of
+  the entry, and `open()` returning `-EFAULT` for a path near the top of the user window.
+- **Sockets as descriptors** — `socket`/`connect`/`send`/`recv`/`resolve` on the same descriptor
+  path as files, and then per-connection TCP state so two programs can be online at once.
+
 **Landing page:** https://itzomii.github.io/Omi/ · **Bootable ISO:** [v0.2.0 release](https://github.com/ItzOmii/Omi/releases/tag/v0.2.0) — newer builds are on `main`.
 
 ## The shell
@@ -47,9 +94,10 @@ simulation.
   direct map stay reachable at CPL 0, supervisor-only) and one slot is rebuilt for the program: its
   segments, a 32 KB stack, and nothing else. The framebuffer, the heap and the kernel text are all
   mapped — and all untouchable from ring 3.
-- **`int 0x80` through a DPL-3 gate**, landing on the TSS `rsp0` stack. 18 syscalls: write, exit,
-  yield, ticks, getpid, five for windows, one blocking wait, two for geometry, two for shared
-  memory, two for the clipboard.
+- **`int 0x80` through a DPL-3 gate**, landing on the TSS `rsp0` stack. 32 syscalls: console and
+  process control, the window protocol, shared memory and clipboard, `vm_alloc`/`vm_free`, threads
+  and futexes, the descriptor calls (`open`/`read`/`lseek`/`close`/`dup`), and five for sockets.
+  Numbers and semantics live in `kernel/include/ring3.h`; `userland/` carries its own copy.
 - **Programs are ELF files on the ISO**, not blobs in the kernel. `kernel/elf.c` validates and maps
   the `PT_LOAD` segments, gives `.bss` its zero pages, and `kernel/user/init.c` is built freestanding
   against its own linker script.
@@ -91,21 +139,24 @@ reader: clipboard says "written by the writer process"
 
 - **GDT + TSS** installed by the kernel (Limine's descriptor table is not guaranteed to survive).
 - **PIT at 100 Hz** drives IRQ0, which accrues per-task ticks and is the preemption timer.
-- **Round-robin over 12 tasks** with 16 KB kernel stacks each, per-task CR3 and `rsp0`.
+- **Round-robin over 32 task slots** with 16 KB kernel stacks each, per-task CR3 and `rsp0`. A full
+  table says `[task] no free slot (TASK_MAX) for <name>` rather than failing silently, because a
+  failed spawn impersonating a broken futex cost a debugging session once already.
 - **A task manager** that lists every task with state, ticks, switches and a CPU-share bar, plus a
   footer naming the scheduler and its tick rate.
 
 ## Networking
 
 e1000 driver, ARP, IPv4/ICMP, UDP, DHCP, DNS, TCP, an HTTP/1.1 client and TLS 1.2, all in
-`vib-os-x86_64/kernel/net/`. No lwIP, no vendored network stack, no POSIX sockets.
+`vib-os-x86_64/kernel/net/`. No lwIP, no vendored stack, no POSIX socket library — the descriptor
+semantics are ours as well.
 
 - **DNS** asks `8.8.8.8` first, falls back to the DHCP-provided resolver, then `8.8.4.4`.
 - **TLS** is real, not a banner: BearSSL with a pinned root bundle (`net/roots.c`), which is why
   `https://` pages load and the serial log can say `tls=yes`.
 - **Redirects are followed**, and the status strip reports the code it actually got.
-- The stack is still **in the kernel**: a ring-3 process cannot open a socket yet, so the browser is
-  the only thing that uses the network today.
+- **DNS and TCP are reachable from user mode** — `SYS_RESOLVE`, then `socket`/`connect`/`send`/
+  `recv` on ordinary descriptors.
 
 ```
 [net] dhcp discover
@@ -113,6 +164,73 @@ e1000 driver, ARP, IPv4/ICMP, UDP, DHCP, DNS, TCP, an HTTP/1.1 client and TLS 1.
 [dns] via 8.8.8.8
 [net] http 200 len=577 tls=yes title="Example Domain"
 ```
+
+### Sockets are descriptors
+
+`socket()` returns a fourth kind of `ofile_t` rather than a parallel mechanism, so `read`/`write`/
+`close` on a socket take the same path as on a file and a program cannot tell the difference at the
+syscall:
+
+```
+process fd table → ofile_t → rfile_t    (file: offset, RAM pages)
+                          → tcp_conn_t  (socket: one connection)
+                          → console
+```
+
+The connection belongs to the open file description, so `dup()` shares it, closing one descriptor
+leaves it alive, and only the final close tears it down. `close()` on an already-closed connection
+logs `DOUBLE-CLOSE` instead of happening twice quietly.
+
+### Connections are objects, not globals
+
+`tcp_conn_t` carries one connection's ports, sequence numbers, state and receive buffer. Eight of
+them live in `tcp.c`, and every inbound segment is demultiplexed by 4-tuple to the connection that
+owns it — so a socket that is not currently reading still collects its bytes. What is still global is
+stated honestly: the interface configuration and the single e1000 receive queue, one poller at a time.
+
+The proof is two independently compiled programs online at once, plus two real hostnames:
+
+```
+[tcp] conn up 0 port 52576 -> 10.0.2.2:8899
+[tcp] conn up 1 port 61431 -> 10.0.2.2:8899      ← both open at the same time
+httpget: using dup fd 4
+httpget: 428 bytes   ALPHA ALPHA …               exit 0
+httpget: 428 bytes   BRAVO BRAVO …               exit 0
+httpget: example.com is 172.66.147.243           892 bytes   exit 0
+httpget: example.org is 104.20.26.136            921 bytes   exit 0
+```
+
+Four clients run at every boot: two against a local server, one of which duplicates its socket and
+closes the original before finishing the transfer (the lifetime rule), and two that resolve different
+hostnames and fetch different pages with no mixing.
+
+Two lessons from getting that green, both now guarded:
+
+- **A ping must not lose a download.** The boot-time ICMP loop polled the NIC and discarded every
+  frame that was not its own reply, including another connection's response — the server logged
+  `SENT`, the client logged `recv: timed out`. Anything that does not own a frame now hands it to
+  `tcp_input()`.
+- **One poller at a time.** `rx_busy` serialises the receive path; the loser does nothing, because
+  the winner dispatches for everybody.
+
+Honest limits: `recv()` returns `-EAGAIN` after a 5 s wait, which is a placeholder for real
+readiness, not the permanent I/O model. There is no `poll()`, no `bind`/`listen`/`accept`, no UDP
+socket API and no retransmission or `TIME_WAIT`. DNS resolves one query at a time on purpose: every
+query leaves from the same local port, so two in flight would read each other's replies and both
+would time out. Per-query ports and a UDP receive queue come with UDP sockets.
+
+## Files and descriptors
+
+- **Three layers.** The process descriptor table (16 entries) points at `ofile_t` (64, reference
+  counted, carries the flags and the socket's connection), which points at an `rfile_t` (offset plus
+  RAM pages). Threads share their process's table, so two threads see the same descriptors; `dup`
+  shares the offset by design, and a second `open` does not.
+- **A RAM-backed VFS.** Eight 4 KB files seeded at boot, with `open`, `read`, `write`, `lseek`,
+  `close`, `dup` and real error codes: `-ENOENT`, `-ENOTDIR`, `-EMFILE`, `-EBADF`. A 16-check suite
+  runs at every boot, including one that reads into a freshly allocated page.
+- **Programs are still Limine modules**, matched by name. Reading them out of the VFS is the next
+  step; `userland/` builds them independently, with its own linker script and its own syscall
+  numbers, and shares no header with the kernel.
 
 ## The renderer
 
@@ -161,13 +279,20 @@ To boot real hardware: `sudo dd if=omi.iso of=/dev/sdX bs=4M status=progress`.
 
 ## What does not work
 
-- **No demand paging and no `mmap`.** A process's window is 1 MB, its stack 32 KB, and memory is
-  handed out as fixed 4 KB frames from a static pool — there is no allocator over physical memory
-  yet, which is what surfaces and any real application work need next.
-- **No threads.** One task is one address space is one thread of control; `clone` does not exist.
-- **No filesystem.** Programs are Limine boot modules matched by name, not files read from a disk.
-- **The network is still kernel-only.** A ring-3 process cannot open a socket, so nothing but the
-  in-kernel browser uses it.
+- **No readiness notification.** `recv()` waits up to 5 s and returns `-EAGAIN`; there is no
+  `poll()`, no blocking read contract and no way for one thread to wait on several descriptors. This
+  is the next piece of networking, and until it exists the timeout is a placeholder.
+- **No TCP teardown or retransmission.** A connection ends with a single FIN and nothing handles
+  `RST`, `TIME_WAIT` or a lost segment; a dropped packet is a dropped response.
+- **No server sockets.** No `bind`, `listen` or `accept`, and no UDP socket interface — DNS is used
+  inside the kernel, not by programs.
+- **TLS and HTTP are kernel-side.** A program can have a socket; it cannot yet get `https://`, because
+  BearSSL is linked into the kernel and there is no userspace TLS library.
+- **No dynamic linking and no libc.** Programs are static ELFs with raw syscalls. musl and a
+  dynamic loader are prerequisites for anything like Chromium and are not started.
+- **The VFS is RAM only** — eight files seeded at boot, no disk, no directories below the root, and
+  programs are still Limine modules rather than files. No file `mmap` either; `vm_alloc` hands out
+  anonymous pages.
 - **One window per process**, six ring-3 windows at a time, 48 draw commands and 128 bytes of text
   per command. The wait has no timeout — only input or a close wakes a process.
 - **No forecast.** The network widget reports link state honestly (`tcp, http and tls are up`) because
@@ -184,7 +309,7 @@ Forked from [viralcode/vib-OS](https://github.com/viralcode/vib-OS). Changes are
 [compare view](https://github.com/viralcode/vib-OS/compare/main...ItzOmii:main). Upstream's own
 README is preserved as [UPSTREAM-README.md](UPSTREAM-README.md).
 
-About 21,750 lines of the diff are ours; the rest is vendored Gumbo (HTML5 parsing), BearSSL (TLS),
+About 28,000 lines of the diff are ours the rest is vendored Gumbo (HTML5 parsing), BearSSL (TLS),
 stb_truetype, stb_image and minimp3, each kept in `kernel/lib/` or beside the code that uses it.
 Sample media in `assets/` are generated placeholders (sine tones and a test pattern), not licensed
 music. The license is upstream's; check their repository before reusing this commercially.

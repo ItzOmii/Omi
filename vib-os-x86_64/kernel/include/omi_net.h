@@ -22,6 +22,21 @@
 /* Opens a connection. Returns 1 on ESTABLISHED, 0 on timeout/refusal. */
 int tcp_connect(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t port);
 
+/* Per-connection API: each socket owns one of these, so several programs can
+ * be talking to different servers at the same time. */
+struct tcp_conn;
+struct tcp_conn *tcp_conn_open(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t port);
+int  tcp_conn_send(struct tcp_conn *c, const void *buf, int len);
+int  tcp_conn_recv(struct tcp_conn *c, void *buf, int max, int timeout_ms);
+void tcp_conn_close(struct tcp_conn *c);
+int  tcp_conn_count(void);
+
+/* Hand an inbound frame to whichever connection owns it. Every place that
+ * polls the NIC but does not own a frame must call this instead of dropping
+ * it: the driver has one receive queue, so a raw waiter can otherwise eat
+ * another program's data. */
+void tcp_input(const uint8_t *f, int n);
+
 /* Sends the whole buffer. Returns bytes accepted, or -1. */
 int tcp_send(const void *buf, int len);
 

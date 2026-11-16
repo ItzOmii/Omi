@@ -184,6 +184,98 @@ static void ui_demo(void) {
   }
 }
 
+
+/* Threads: two of them in *this* address space, sharing globals, plus a futex
+ * so the starter can sleep instead of spinning. The counter is deliberately not
+ * atomic: on one CPU with preemption every 10 ms the increments interleave, and
+ * the total lands below 2*n. That number is the interesting part. */
+static long thr_done;
+static long thr_counter;
+
+static void thread_body(long n) {
+  for (long i = 0; i < n; i++) thr_counter++;
+  thr_done++;
+  sys4(22, (long)&thr_done, 1, 1, 0);           /* FUTEX_WAKE, one waiter */
+  sys3(2, 0, 0, 0);                              /* exit this thread */
+}
+
+static void thread_demo(void) {
+  long n = 5000000;   /* long enough to cross several 10 ms ticks */
+  thr_done = 0;
+  thr_counter = 0;
+
+  long t1 = sys4(21, (long)thread_body, n, 65536, 0);  /* THREAD_CREATE */
+  long t2 = sys4(21, (long)thread_body, n, 65536, 0);
+
+  char buf[80];
+  int k = 0;
+  k = put_str(buf, k = 0, "threads: started ");
+  k = put_uint(buf, k, t1);
+  k = put_str(buf, k, " and ");
+  k = put_uint(buf, k, t2);
+  buf[k] = 0;
+  say(buf);
+  say("\n");
+
+  long guard = 0;
+  while (thr_done < 2 && guard < 3000) {
+    /* 20-tick deadline: a wake that arrives before we actually sleep costs one
+     * tick, not a hang. */
+    sys4(22, (long)&thr_done, 0, thr_done, 20);  /* FUTEX_WAIT */
+    guard++;
+  }
+
+  k = 0;
+  k = put_str(buf, k, "threads: done=");
+  k = put_uint(buf, k, thr_done);
+  k = put_str(buf, k, " counter=");
+  k = put_uint(buf, k, thr_counter);
+  k = put_str(buf, k, " of ");
+  k = put_uint(buf, k, n * 2);
+  buf[k] = 0;
+  say(buf);
+  say("\n");
+
+  sys3(2, thr_done == 2 ? 0 : 1, 0, 0);
+}
+
+/* Demand paging: ask for 4 MB, touch one page every 64 KB, prove the pages only
+ * appear where they are touched, then hand the range back. */
+static void vm_demo(void) {
+  unsigned long len = 4 * 1024 * 1024;
+  char *p = (char *)sys3(19, (long)len, 2, 0);      /* PROT_READ|PROT_WRITE */
+  if ((long)p < 0) {
+    say("vm: alloc refused\n");
+    sys3(2, 1, 0, 0);
+  }
+
+  int touched = 0;
+  for (unsigned long off = 0; off < len; off += 65536) {
+    p[off] = (char)(1 + (off & 0x7F));              /* first touch faults it in */
+    touched++;
+  }
+
+  /* read them back: a lazily-mapped page must keep what was written */
+  int good = 0;
+  for (unsigned long off = 0; off < len; off += 65536) {
+    if (p[off] == (char)(1 + (off & 0x7F))) good++;
+  }
+
+  char buf[64];
+  int n = 0;
+  n = put_str(buf, n = 0, "vm: touched ");
+  n = put_uint(buf, n, touched);
+  n = put_str(buf, n, " pages, read back ");
+  n = put_uint(buf, n, good);
+  buf[n] = 0;
+  say(buf);
+  say("\n");
+
+  sys3(20, (long)p, (long)len, 0);                  /* munmap */
+  say("vm: range released\n");
+  sys3(2, good == touched ? 0 : 1, 0, 0);
+}
+
 /* Two processes, one segment: this one writes, the reader below reads it. */
 static void shm_writer(void) {
   sys3(15, 0, 1, 0);
@@ -227,10 +319,263 @@ static void shm_reader(void) {
   sys3(2, 0, 0, 0);
 }
 
+
+/* ---------------------------------------------------------------- futexes */
+
+#define F_WAIT 0
+#define F_WAKE 1
+
+static long fx_word;
+static long fx_done_word;
+/* One slot per waiter: a shared counter would need atomics to be trustworthy,
+ * and a test that can lose an update is a test that lies. */
+static long fx_result[2];
+static long fx_ready[2];
+
+static void fx_waiter(long idx) {
+  /* Announce before blocking, so the test can inject its wake instead of
+   * guessing how long it takes to get to the futex call. */
+  fx_ready[idx] = 1;
+  /* Expect 0, give up after 300 ticks (3 s) so a lost wake cannot wedge
+   * the boot: it fails with -ETIMEDOUT instead of hanging. */
+  long r = sys4(22, (long)&fx_word, F_WAIT, 0, 300);
+  fx_result[idx] = r;
+  fx_done_word++;
+  sys4(22, (long)&fx_done_word, F_WAKE, 1, 0);
+  sys3(2, 0, 0, 0);
+}
+
+static void futex_demo(void) {
+  int pass = 0;
+
+  /* 1. The value already moved on: a wait taken with a stale expectation must
+   *    return -EAGAIN immediately rather than block forever. */
+  fx_word = 5;
+  long r = sys4(22, (long)&fx_word, F_WAIT, 0, 0);
+  if (r == -11) { pass++; say("[futex] value already moved: -EAGAIN\n"); }
+  else { say("[futex] value already moved: FAIL\n"); }
+
+  /* 2. A pointer outside the user window is rejected, not dereferenced. */
+  r = sys4(22, 0x1000, F_WAIT, 0, 0);
+  if (r == -14) { pass++; say("[futex] bad address: -EFAULT\n"); }
+  else { say("[futex] bad address: FAIL\n"); }
+
+  /* 3. Two sleepers, one wake: exactly one comes back with 0, the other runs
+   *    to its deadline and reports -ETIMEDOUT. That covers wake-after-block,
+   *    selective wake, and timeout expiry in one go. */
+  fx_word = 0;
+  fx_done_word = 0;
+  fx_result[0] = 1;
+  fx_result[1] = 1;
+  fx_ready[0] = 0;
+  fx_ready[1] = 0;
+
+  long t1 = sys4(21, (long)fx_waiter, 0, 65536, 0);
+  long t2 = sys4(21, (long)fx_waiter, 1, 65536, 0);
+
+  /* Wait until both have announced, then let their futex calls actually run.
+   * A yield hands the cpu to one task for one slice, so a handful is enough -
+   * and a fixed yield count is not, because the loop itself costs ticks. */
+  for (int guard = 0; guard < 400 && !(fx_ready[0] && fx_ready[1]); guard++)
+    sys3(3, 0, 0, 0);
+  for (int i = 0; i < 12; i++) sys3(3, 0, 0, 0);
+
+  fx_word = 1;
+  long woke = sys4(22, (long)&fx_word, F_WAKE, 1, 0);
+
+  /* Wait for both to report, with a deadline on every wait so a lost wake
+   * costs a timeout rather than the boot. */
+  for (int guard = 0; guard < 25; guard++) {
+    if (fx_result[0] != 1 && fx_result[1] != 1) break;
+    sys4(22, (long)&fx_done_word, F_WAIT, fx_done_word, 300);
+  }
+
+  int zeros = 0, timeouts = 0;
+  for (int i = 0; i < 2; i++) {
+    if (fx_result[i] == 0) zeros++;
+    if (fx_result[i] == -110) timeouts++;
+  }
+  if (woke == 1 && zeros == 1 && timeouts == 1) {
+    pass++;
+    say("[futex] one waiter woke, the other timed out\n");
+  } else {
+    say("[futex] selective wake: FAIL\n");
+  }
+
+  char buf[64];
+  int k = 0;
+  k = put_str(buf, k, "futex: ");
+  k = put_uint(buf, k, (u64)pass);
+  k = put_str(buf, k, " of 3 checks ok");
+  buf[k] = 0;
+  say(buf);
+  say("\n");
+
+  (void)t1; (void)t2;
+  sys3(2, pass == 3 ? 0 : 1, 0, 0);
+}
+
+
+/* ------------------------------------------------------------------- vfs */
+
+#define SYS_OPEN   23
+#define SYS_READ   24
+#define SYS_LSEEK  25
+#define SYS_CLOSE  26
+#define SYS_DUP    27
+#define SYS_VM_ALLOC_ 19
+
+#define F_RDWR    2
+#define F_CREAT   0100
+#define S_SET     0
+#define S_END     2
+
+static char vbuf[256];
+static char vbuf2[256];
+static int vpass, vtotal;
+
+static void vcheck(const char *what, int ok) {
+  vtotal++;
+  if (ok) vpass++;
+  say("[vfs] ");
+  say(ok ? "ok   " : "FAIL ");
+  say(what);
+  say("\n");
+}
+
+static int veq(const char *a, const char *b, int n) {
+  for (int i = 0; i < n; i++) if (a[i] != b[i]) return 0;
+  return 1;
+}
+
+/* A thread does not get a copy of the descriptor table: it shares the
+ * process's, so a descriptor opened in main is the same open file here - and
+ * because the offset lives in the open-file description, the two see one
+ * cursor. This is the test that protects moving the table into mm_t. */
+static long vt_flag;
+static int vt_ok, vt_closed;
+
+static void vt_body(long arg) {
+  int d = (int)sys3(SYS_DUP, arg, 0, 0);
+  char t[8];
+  long r = d >= 3 ? sys3(SYS_READ, d, (long)t, 3) : -1;
+  vt_ok = (d >= 3) && (r == 3) && veq(t, "hel", 3);
+  if (d >= 3) sys3(SYS_CLOSE, d, 0, 0);      /* close the duplicate... */
+  vt_closed = 1;
+  vt_flag = 1;
+  sys4(22, (long)&vt_flag, 1, 1, 0);         /* ...then wake main */
+  sys3(2, 0, 0, 0);
+}
+
+static void vfs_demo(void) {
+  const char *hello = "hello from omi's ram fs\n";
+  int hlen = (int)slen(hello);
+
+  int fd = sys3(SYS_OPEN, (long)"/hello.txt", 0, 0);
+  vcheck("open a seeded file", fd == 3);
+
+  long r = sys3(SYS_READ, fd, (long)vbuf, 5);
+  vcheck("read returns bytes, not a copy of the whole file", r == 5 && veq(vbuf, "hello", 5));
+
+  vcheck("lseek back to the start", sys3(SYS_LSEEK, fd, 0, S_SET) == 0);
+
+  r = sys3(SYS_READ, fd, (long)vbuf, sizeof vbuf);
+  vcheck("read the whole file", r == hlen && veq(vbuf, hello, hlen));
+
+  vcheck("read at EOF is 0, not an error", sys3(SYS_READ, fd, (long)vbuf, 16) == 0);
+  vcheck("SEEK_END lands on the size", sys3(SYS_LSEEK, fd, 0, S_END) == hlen);
+
+  vcheck("a missing file is -ENOENT", sys3(SYS_OPEN, (long)"/nope", 0, 0) == -2);
+
+  /* write, close, reopen: the bytes have to survive the descriptor */
+  int wfd = sys3(SYS_OPEN, (long)"/log.txt", F_RDWR | F_CREAT, 0);
+  long w = sys3(1, wfd, (long)"omi was here\n", 13);
+  sys3(SYS_CLOSE, wfd, 0, 0);
+  int rfd = sys3(SYS_OPEN, (long)"/log.txt", 0, 0);
+  r = sys3(SYS_READ, rfd, (long)vbuf, sizeof vbuf);
+  vcheck("write then read back through a new descriptor",
+         w == 13 && r == 13 && veq(vbuf, "omi was here\n", 13));
+  sys3(SYS_CLOSE, rfd, 0, 0);
+
+  /* two opens of one file are two independent cursors */
+  int a = sys3(SYS_OPEN, (long)"/hello.txt", 0, 0);
+  int b = sys3(SYS_OPEN, (long)"/hello.txt", 0, 0);
+  sys3(SYS_READ, a, (long)vbuf, 2);
+  sys3(SYS_READ, b, (long)vbuf2, 2);
+  vcheck("two opens have independent offsets", veq(vbuf, "he", 2) && veq(vbuf2, "he", 2));
+
+  /* dup is not a second cursor: it shares the one it came from */
+  int d = sys3(SYS_DUP, a, 0, 0);
+  sys3(SYS_READ, a, (long)vbuf, 3);         /* cursor 2 -> 5 */
+  r = sys3(SYS_READ, d, (long)vbuf2, 3);    /* same cursor: 5 -> 8 */
+  vcheck("dup shares the offset with its source", d >= 3 && veq(vbuf, "llo", 3) && veq(vbuf2, " fr", 3));
+  sys3(SYS_CLOSE, d, 0, 0);
+  sys3(SYS_CLOSE, a, 0, 0);
+  sys3(SYS_CLOSE, b, 0, 0);
+
+  /* read into memory that has never been touched: the kernel must fault it in
+   * rather than panic on a not-present page */
+  long page = sys3(SYS_VM_ALLOC_, 4096, 2, 0);
+  int vf = sys3(SYS_OPEN, (long)"/motd", 0, 0);
+  r = sys3(SYS_READ, vf, page, 16);
+  vcheck("read into a fresh vm_alloc page",
+         page > 0 && r == 15 && veq((const char *)page, "welcome, human\n", 15));
+  sys3(SYS_CLOSE, vf, 0, 0);
+
+  /* a thread shares the table, and a dup is one open file, not two */
+  int tf = sys3(SYS_OPEN, (long)"/hello.txt", 0, 0);
+  vt_ok = 0; vt_closed = 0; vt_flag = 0;
+  long vtid = sys4(21, (long)vt_body, tf, 65536, 0);
+  if (vtid < 0) say("[vfs] thread creation failed: no free task slot\n");
+  for (int g = 0; g < 20 && !vt_flag; g++)
+    sys4(22, (long)&vt_flag, 0, 0, 300);
+  vcheck("a thread inherits the descriptor table and its offsets", vt_ok);
+  long after = sys3(SYS_READ, tf, (long)vbuf, 3);
+  vcheck("closing the duplicate leaves the original open at the same cursor",
+         vt_closed && after == 3 && veq(vbuf, "lo ", 3));
+  sys3(SYS_CLOSE, tf, 0, 0);
+
+  /* the table has to end somewhere, and say so in Linux's word. Everything
+   * above has to be closed first, or the count is 16 minus whatever leaked -
+   * which is how the first run of this test failed. */
+  sys3(SYS_CLOSE, fd, 0, 0);
+  int opened = 0;
+  long last = 0;
+  for (int i = 0; i < 40; i++) {
+    last = sys3(SYS_OPEN, (long)"/motd", 0, 0);
+    if (last >= 0) opened++;
+    else break;
+  }
+  vcheck("descriptors run out with -EMFILE", last == -24 && opened == 13);
+  for (int i = 3; i < 16; i++) sys3(SYS_CLOSE, i, 0, 0);
+
+  vcheck("close of a bad descriptor is -EBADF", sys3(SYS_CLOSE, 99, 0, 0) == -9);
+  int c = sys3(SYS_OPEN, (long)"/motd", 0, 0);
+  sys3(SYS_CLOSE, c, 0, 0);
+  vcheck("a closed descriptor cannot be read", sys3(SYS_READ, c, (long)vbuf, 4) == -9);
+
+  char buf[48];
+  int k = 0;
+  k = put_str(buf, k, "vfs: ");
+  k = put_uint(buf, k, (u64)vpass);
+  k = put_str(buf, k, " of ");
+  k = put_uint(buf, k, (u64)vtotal);
+  k = put_str(buf, k, " checks ok");
+  buf[k] = 0;
+  say(buf);
+  say("\n");
+
+  sys3(2, vpass == vtotal ? 0 : 1, 0, 0);
+}
+
 void _start(long mode) {
   if (mode == 3) ui_demo();
   if (mode == 4) shm_writer();
   if (mode == 5) shm_reader();
+  if (mode == 6) vm_demo();
+  if (mode == 7) thread_demo();
+  if (mode == 8) futex_demo();
+  if (mode == 9) vfs_demo();
 
   if (mode == 2) {
     /* Spin forever without a single syscall: only a preemptive scheduler can

@@ -9,13 +9,38 @@
 #define TASK_H
 
 #include <stdint.h>
+#include "fd.h"
 
-#define TASK_MAX    12
+/* 20 was enough while the boot ran four demo processes; the standalone apps and
+ * the thread tests together ran past it, and the failure looked like a broken
+ * futex rather than a full table. Headroom is cheap: 16 KB of kernel stack each. */
+#define TASK_MAX 32
 #define TASK_STACK  16384
 
 /* BLOCKED is a task waiting for something (an event, in practice): the
  * scheduler skips it until something calls task_wake(). */
 enum { TASK_FREE = 0, TASK_READY = 1, TASK_RUN = 2, TASK_DEAD = 3, TASK_BLOCKED = 4 };
+
+/* A lazily-populated region of a process's address space: SYS_VM_ALLOC records
+ * the range, and the first touch of each page fills it in. */
+#define TASK_AREAS 8
+typedef struct {
+  uint64_t base, len;   /* byte range, page-aligned */
+  uint64_t flags;       /* PTE flags for the pages that appear */
+  int      used;
+} vm_area_t;
+
+/* An address space. Threads share one: a page-table root, the lazily-mapped
+ * regions, and the allocation hints. Refcounted, so the last thread out frees
+ * the tables instead of the first one to exit. */
+typedef struct {
+  uint64_t  cr3;
+  uint64_t  mmap_hint;    /* SYS_VM_ALLOC grows up from RING3_MMAP_BASE */
+  uint64_t  stack_hint;   /* new thread stacks grow down from RING3_MMAP_TOP */
+  vm_area_t areas[TASK_AREAS];
+  fdtable_t *fds;         /* descriptors belong to the process, not the thread */
+  int       refcount;
+} mm_t;
 
 typedef struct {
   int id;
@@ -36,19 +61,30 @@ typedef struct {
    * The kernel is built with SSE enabled and uses xmm freely, so user state has
    * to be saved around every entry into the kernel and restored on the way out. */
   uint8_t  fpu[512] __attribute__((aligned(16)));
+  mm_t    *mm;          /* shared address space, 0 for kernel tasks */
+  uint64_t wait_addr;   /* futex word this thread sleeps on, 0 = not waiting */
+  mm_t    *wait_mm;
+  uint64_t wake_at;     /* tick at which a timed sleep gives up, 0 = never */
+  int      timed_out;
 } task_t;
 
 void task_init(void);
 int  task_spawn(const char *name, void (*fn)(void));
 int  task_spawn_user(const char *name, uint64_t entry, uint64_t user_sp,
                      uint64_t cr3, uint64_t arg);
+/* A new thread in an existing address space: same mm, fresh stack, refcount++. */
+int  task_spawn_user_mm(const char *name, uint64_t entry, uint64_t user_sp,
+                        mm_t *mm, uint64_t arg);
+void task_sleep_ticks(uint64_t ticks);   /* block until the tick passes */
+void mm_on_exit(task_t *t);              /* ring3.c: drop the mm reference */
+void mm_reap(void);                      /* ring3.c: free dead spaces */
 void task_kill_current(uint64_t code);   /* does not return */
 void task_block_current(void);           /* sleep until task_wake() */
 void task_wake(int id);
 uint64_t task_total_ticks(void);
 const char *task_name(int i);
 void task_yield(void);
-void task_tick(void);
+/* the timer wakes expired deadlines itself; there is no task_tick() hook */
 int  task_count(void);
 task_t *task_at(int i);
 int  task_current(void);

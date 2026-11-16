@@ -17,6 +17,7 @@
 #include "../include/net.h"
 #include "../include/hda.h"
 #include "../include/ring3.h"
+#include "../include/pmm.h"
 #include "../include/elf.h"
 
 /* ========== Limine Requests ========== */
@@ -356,6 +357,11 @@ void _start(void) {
     serial_puts("\n");
   }
 
+  /* Bring the physical page allocator up now that the map, the direct map, the
+   * kernel base and the boot modules are all known. */
+  pmm_init(memmap_request.response, (void *)module_request.response);
+  pmm_report();
+
   /* Get framebuffer */
   if (framebuffer_request.response == NULL) {
     serial_puts("ERROR: No framebuffer response!\n");
@@ -458,6 +464,35 @@ void _start(void) {
   ring3_spawn_elf("ui",    "init.elf", 3);
   ring3_spawn_elf("shmw",  "init.elf", 4);
   ring3_spawn_elf("shmr",  "init.elf", 5);
+  ring3_spawn_elf("vm",    "init.elf", 6);
+  ring3_spawn_elf("thr",   "init.elf", 7);
+  ring3_spawn_elf("fx",    "init.elf", 8);
+  ring3_spawn_elf("vfs",   "init.elf", 9);
+
+  /* The first program that is not part of the kernel build. It gets a real
+   * argv, so this also tests the process-entry ABI rather than a mode number. */
+  static const char *cat_ok[]  = { "cat", "/hello.txt" };
+  static const char *cat_two[] = { "cat", "/nope", "/motd" };
+  ring3_spawn_elf_argv("cat",  "cat.elf", 2, cat_ok);
+  ring3_spawn_elf_argv("cat2", "cat.elf", 3, cat_two);
+
+  /* resolve -> connect -> send -> recv, all through descriptors. The address is
+   * QEMU's slirp gateway for the host, and the port is whatever the test server
+   * was started on; with nothing listening this must fail cleanly, not hang. */
+  static const char *get[] = { "httpget", "10.0.2.2", "8899", "/a.txt" };
+  /* The second loopback client also exercises the dup lifetime rule, so one
+   * boot covers overlap, duplicate-and-close, and two real hostnames. */
+  static const char *get2[] = { "httpget", "10.0.2.2", "8899", "/b.txt", "dup" };
+  ring3_spawn_elf_argv("httpget", "httpget.elf", 4, get);
+  /* Two clients at once: separate connections, separate receive buffers. If
+   * the two bodies ever appear in each other's output, this is where it shows. */
+  ring3_spawn_elf_argv("httpget2", "httpget.elf", 5, get2);
+  /* Two different names, resolved back to back and fetched at the same time:
+   * the browser's shape, not a demo's. */
+  static const char *get3[] = { "httpget", "example.com", "80", "/" };
+  static const char *get4[] = { "httpget", "example.org", "80", "/" };
+  ring3_spawn_elf_argv("httpget3", "httpget.elf", 4, get3);
+  ring3_spawn_elf_argv("httpget4", "httpget.elf", 4, get4);
 
   serial_puts("Starting main loop...\n");
 

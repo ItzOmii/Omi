@@ -209,6 +209,7 @@ static void switch_to(int next, ctx_t *frame) {
   if (tasks[next].kstack_top) gdt_set_kernel_stack(tasks[next].kstack_top);
   uint64_t want = tasks[next].cr3 ? tasks[next].cr3 : ring3_kernel_cr3();
   if (ring3_read_cr3() != want) ring3_write_cr3(want);
+  mm_reap();        /* a space whose last thread died is safe to free now */
 }
 
 /* Called from the int 0x81 stub. Returns the frame to iretq into. */
@@ -223,11 +224,14 @@ ctx_t *sched_pick(ctx_t *frame) {
   return (ctx_t *)(uintptr_t)tasks[next].rsp;
 }
 
+static void wake_deadlines(void);
+
 /* Called from the IRQ0 stub. Ticks, acks the PIC, and preempts ring 3 only. */
 ctx_t *sched_tick(ctx_t *frame) {
   total_ticks++;
   if (cur >= 0 && cur < ntasks) tasks[cur].ticks++;
   outb(0x20, 0x20);                        /* EOI: PIC1, IRQ0 */
+  wake_deadlines();                        /* futex deadlines fire here */
 
   if (cur < 0) return frame;
   if ((frame->cs & 3) != 3) {              /* kernel task: no preemption */
@@ -249,15 +253,38 @@ void task_yield(void) {
   __asm__ volatile("int $0x81" ::: "memory");
 }
 
-void task_tick(void) {
-  total_ticks++;
-  if (cur >= 0 && cur < ntasks) tasks[cur].ticks++;
+/* Wake anything whose deadline the tick has passed. This used to live in
+ * task_tick(), which nothing ever called - the real timer path is sched_tick(),
+ * so a futex timeout was decoration and a wake that raced its block hung the
+ * thread for good. It runs from the timer now, once per tick. */
+static void wake_deadlines(void) {
+  /* A blocked thread with a deadline wakes itself when the tick passes. Doing
+   * it here, on the timer, is what keeps a missed futex wake from hanging a
+   * thread forever. */
+  for (int i = 1; i < ntasks; i++) {
+    if (tasks[i].state != TASK_BLOCKED) continue;
+    if (!tasks[i].wake_at) continue;
+    if (total_ticks < tasks[i].wake_at) continue;
+    tasks[i].wake_at = 0;
+    tasks[i].timed_out = 1;
+    tasks[i].state = TASK_READY;
+  }
+}
+
+void task_sleep_ticks(uint64_t ticks) {
+  if (cur <= 0 || cur >= ntasks) return;
+  tasks[cur].timed_out = 0;
+  tasks[cur].wake_at = total_ticks + ticks;
+  tasks[cur].state = TASK_BLOCKED;
+  task_yield();
+  tasks[cur].wake_at = 0;
 }
 
 /* Park the current task forever. No iretq ever comes back here: the frame this
  * saves belongs to a task that the scheduler will not pick again. */
 void task_kill_current(uint64_t code) {
   if (cur > 0 && cur < ntasks) {
+    mm_on_exit(&tasks[cur]);       /* last thread out frees the address space */
     tasks[cur].state = TASK_DEAD;
     tasks[cur].work = code;
   } else {
@@ -287,11 +314,24 @@ void task_block(int blocked) {
 
 /* ------------------------------------------------------------- task tables */
 
+static void task_alloc_fail(const char *why, const char *name) {
+  serial_puts("[task] ");
+  serial_puts(why);
+  serial_puts(" for ");
+  serial_puts(name);
+  serial_puts("\n");
+}
+
+/* The two ways this can fail mean completely different things - a full table is
+ * a policy limit, a failed kmalloc is memory pressure - and they used to be the
+ * same silent 0. A failed spawn left a test waiting on a flag that could never
+ * change, which reads as a broken synchronisation primitive rather than a full
+ * table. Name the resource. */
 static task_t *task_alloc(const char *name) {
-  if (ntasks >= TASK_MAX) return 0;
+  if (ntasks >= TASK_MAX) { task_alloc_fail("no free slot (TASK_MAX)", name); return 0; }
   task_t *t = &tasks[ntasks];
   uint8_t *mem = (uint8_t *)kmalloc(TASK_STACK);
-  if (!mem) return 0;
+  if (!mem) { task_alloc_fail("kernel stack allocation failed", name); return 0; }
   uintptr_t top = ((uintptr_t)mem + TASK_STACK) & ~(uintptr_t)15;
   for (int i = 0; i < TASK_STACK; i += 8) *(uint64_t *)(mem + i) = 0;
 
@@ -306,6 +346,11 @@ static task_t *task_alloc(const char *name) {
   t->user_sp = 0;
   t->user_arg = 0;
   t->fn = 0;
+  t->mm = 0;
+  t->wait_addr = 0;
+  t->wait_mm = 0;
+  t->wake_at = 0;
+  t->timed_out = 0;
   int i = 0;
   while (name[i] && i < 23) { t->name[i] = name[i]; i++; }
   t->name[i] = 0;
@@ -354,6 +399,21 @@ int task_spawn_user(const char *name, uint64_t entry, uint64_t user_sp,
   t->user_sp = user_sp;
   t->user_arg = arg;
   t->cr3 = cr3;
+  prime(t, entry, 0x23, arg, user_sp, 0x1B, 1);
+  t->state = TASK_READY;
+  return t->id;
+}
+
+int task_spawn_user_mm(const char *name, uint64_t entry, uint64_t user_sp,
+                       mm_t *mm, uint64_t arg) {
+  task_t *t = task_alloc(name);
+  if (!t) return -1;
+  t->user_entry = entry;
+  t->user_sp = user_sp;
+  t->user_arg = arg;
+  t->cr3 = mm->cr3;
+  t->mm = mm;
+  mm->refcount++;
   prime(t, entry, 0x23, arg, user_sp, 0x1B, 1);
   t->state = TASK_READY;
   return t->id;

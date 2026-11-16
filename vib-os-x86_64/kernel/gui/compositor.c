@@ -2718,7 +2718,9 @@ static void draw_tasks(void) {
   }
   if (!total) total = 1;
 
+  int drawn = 0;
   for (int i = 0; i < nt && y0 + lh < a->y + a->h - UI_SCALE_VAL(10); i++) {
+    drawn++;
     task_t *t = task_at(i);
     if (!t) break;
     uint32_t ink = (t->state == TASK_RUN) ? MEEP_INK : MEEP_INK_SOFT;
@@ -2767,6 +2769,20 @@ static void draw_tasks(void) {
     fb_fill_rect(x0, by, bw, 2, MEEP_LINE_SOFT);
     if (filled > 0) fb_fill_rect(x0, by, filled, 2, MEEP_ACCENT);
     y0 += lh + UI_SCALE_VAL(8);
+  }
+
+  /* Never let the window imply it is showing everything. */
+  if (drawn < nt) {
+    char more[24];
+    int mp = 0;
+    more[mp++] = '+';
+    char num[12];
+    u64s((uint64_t)(nt - drawn), num);
+    for (int q = 0; num[q] && mp < 20; q++) more[mp++] = num[q];
+    const char *tail2 = " more";
+    for (int q = 0; tail2[q] && mp < 22; q++) more[mp++] = tail2[q];
+    more[mp] = 0;
+    meep_text(&meep_m100, cx_sw, a->y + a->h - UI_SCALE_VAL(18), more, MEEP_INK_SOFT);
   }
 
   meep_text(&meep_m100, x0, a->y + a->h - UI_SCALE_VAL(18),
