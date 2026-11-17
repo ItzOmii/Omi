@@ -31,6 +31,7 @@
 #define SYS_WIN_CLOSE    10
 #define SYS_SURF_CREATE  35
 #define SYS_SURF_PRESENT 36
+#define SYS_WIN_WAIT     12
 
 #define SURF_W 320
 #define SURF_H 200
@@ -80,6 +81,17 @@ static void box(int x0, int y0, int w, int h, uint32_t c) {
     uint32_t *row = px + (size_t)y * SURF_W;
     for (int x = x0; x < x0 + w; x++) row[x] = c;
   }
+}
+
+/* Holding the window open is the point: a framebuffer check from outside the OS
+ * can only see what is still on screen. Block instead of spinning - SYS_WIN_WAIT
+ * costs nothing until input arrives. */
+typedef struct { int kind, x, y, code; } win_ev_user_t;
+
+static void park(long win) {
+  win_ev_user_t ev;
+  while (sys3(SYS_WIN_WAIT, win, (long)&ev, 0) >= 0)
+    sys3(SYS_SURF_PRESENT, win, 0, ((long)SURF_W << 16) | SURF_H);   /* repaint if asked */
 }
 
 int main(void) {
@@ -151,7 +163,8 @@ int main(void) {
   long closed = sys3(SYS_WIN_CLOSE, other, 0, 0);
   check(closed == 0, "the extra window closes", closed, 0);
 
-  for (int i = 0; i < 400; i++) sys3(SYS_YIELD, 0, 0, 0);
   printf("[surf] %d/%d\n", checks - fails, checks);
-  return fails ? 1 : 0;
+  if (fails) return 1;     /* a failed run must not sit on the screen looking fine */
+  park(win);
+  return 0;
 }

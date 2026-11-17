@@ -4606,6 +4606,7 @@ typedef struct {
  * a damage-aware path would copy, against a blit that today covers the client
  * rect every frame. */
 static uint64_t surf_blit_frames, surf_dmg_rects, surf_dmg_px;
+static uint32_t surf_blit_logged;   /* one blit line per window, not per frame */
 void winipc_surface_stats(uint64_t *frames, uint64_t *rects, uint64_t *px) {
   if (frames) *frames = surf_blit_frames;
   if (rects) *rects = surf_dmg_rects;
@@ -4803,9 +4804,9 @@ void winipc_close(int id) {
     serial_puts("[surf] win=");      serial_puthex((uint64_t)id);
     serial_puts(" size=");           serial_puthex((uint64_t)sw0);
     serial_puts("x");                serial_puthex((uint64_t)sh0);
-    serial_puts(" blits=");          serial_puthex(surf_blit_frames);
-    serial_puts(" dmg_rects=");      serial_puthex(surf_dmg_rects);
-    serial_puts(" dmg_px=");         serial_puthex(surf_dmg_px);
+    serial_puts(" blits_all=");      serial_puthex(surf_blit_frames);
+    serial_puts(" dmg_rects_all=");  serial_puthex(surf_dmg_rects);
+    serial_puts(" dmg_px_all=");     serial_puthex(surf_dmg_px);
     serial_puts("\n");
   }
   surf_release_window(id);            /* the frames belong to the window */
@@ -4817,6 +4818,17 @@ void winipc_close(int id) {
   }
   f->used = 0;
   needs_redraw = 1;
+}
+
+/* A process that exits owns nothing any more. Closing its windows here is what
+ * keeps four surface slots from becoming a four-app lifetime: an app that dies
+ * without calling SYS_WIN_CLOSE - a crash, an early return, a main that just
+ * ends - used to leave its frames allocated and its last frame on screen
+ * forever, because surf_release_window only ever ran from winipc_close. */
+void winipc_close_owned(int owner) {
+  if (owner <= 0) return;              /* the kernel shell owns no windows */
+  for (int i = 0; i < WINIPC_MAX; i++)
+    if (fwin[i].used && fwin[i].owner == owner) winipc_close(fwin[i].id);
 }
 
 int winipc_clear(int id, uint32_t color) {
@@ -4887,12 +4899,19 @@ void winipc_draw_all(void) {
                src, (size_t)cols * 4);
       }
       surf_blit_frames++;
-      if (surf_blit_frames == 1 || (surf_blit_frames % 60) == 0) {
-        serial_puts("[surf] blit win=");   serial_puthex((uint64_t)f->id);
-        serial_puts(" frame=");            serial_puthex(surf_blit_frames);
-        serial_puts(" client=");           serial_puthex(surf_dmg_rects);
-        serial_puts(" dmg_rects_px=");     serial_puthex(surf_dmg_px);
-        serial_puts("\n");
+      /* Once per window, not every 60 frames: a surface that parks is blitted
+       * for as long as its process lives, and a periodic line turns the serial
+       * log into a tape measure with no numbers on it. The close line reports
+       * the totals. */
+      {
+        uint32_t bit = (f->id >= 0 && f->id < 32) ? (1u << f->id) : 0;
+        if (bit && !(surf_blit_logged & bit)) {
+          surf_blit_logged |= bit;
+          serial_puts("[surf] first blit win="); serial_puthex((uint64_t)f->id);
+          serial_puts(" size=");                 serial_puthex((uint64_t)sw);
+          serial_puts("x");                      serial_puthex((uint64_t)sh);
+          serial_puts("\n");
+        }
       }
       continue;
     }

@@ -47,6 +47,7 @@ typedef struct {
 
 int  winipc_open(const char *title, int32_t w, int32_t h);
 void winipc_close(int id);
+void winipc_close_owned(int owner);   /* a dead task's windows */
 int  winipc_clear(int id, uint32_t color);
 /* `text` is a kernel copy made by the syscall layer (already validated). */
 int  winipc_add(int id, const win_cmd_u *cmd, const char *text);

@@ -35,6 +35,7 @@ PROGS += socktest.elf
 PROGS += tlsget.elf
 PROGS += surftest.elf
 PROGS += omirender.elf
+PROGS += surfexit.elf
 PROGS += exectarget.elf
 # Not a program: a shared object, built with musl-gcc so its relocations and its
 # NEEDED entry are real. Copied to the ISO's /lib and loaded as a boot module.
@@ -117,6 +118,12 @@ omirender.elf: omirender.c glyphs.h
 
 glyphs.h: ../tools/gen_glyphs.py ../kernel/gui/font.c
 	python3 ../tools/gen_glyphs.py
+
+# A window whose process exits: proves the kernel reaps what a dead task owned.
+surfexit.elf: surfexit.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping surfexit"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
 
 socktest.elf: socktest.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping socktest"; exit 0; }

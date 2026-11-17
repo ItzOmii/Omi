@@ -29,6 +29,7 @@
 #define SYS_WIN_GEOM     14
 #define SYS_SURF_CREATE  35
 #define SYS_SURF_PRESENT 36
+#define SYS_WIN_WAIT     12
 
 #define WIN_W  380
 #define WIN_H  340
@@ -163,6 +164,17 @@ static const char *body =
   "pixels, its own clip, its own glyphs - and the kernel never learns what a "
   "character is.";
 
+/* Holding the window open is the point: a framebuffer check from outside the OS
+ * can only see what is still on screen. Block instead of spinning - SYS_WIN_WAIT
+ * costs nothing until input arrives. */
+typedef struct { int kind, x, y, code; } win_ev_user_t;
+
+static void park(long win) {
+  win_ev_user_t ev;
+  while (sys3(SYS_WIN_WAIT, win, (long)&ev, 0) >= 0)
+    sys3(SYS_SURF_PRESENT, win, 0, ((long)CW << 16) | CH);   /* repaint if asked */
+}
+
 int main(void) {
   long win = sys3(SYS_WIN_OPEN, (long)"render", WIN_W, WIN_H);
   check(win > 0, "the window opens", win, 1);
@@ -226,7 +238,8 @@ int main(void) {
   long d = sys3(SYS_SURF_PRESENT, win, 0, ((long)90 << 16) | 26);
   check(d == 0, "presenting one damaged rectangle succeeds", d, 0);
 
-  for (int i = 0; i < 600; i++) sys3(SYS_YIELD, 0, 0, 0);
   printf("[render] %d/%d\n", checks - fails, checks);
-  return fails ? 1 : 0;
+  if (fails) return 1;
+  park(win);
+  return 0;
 }

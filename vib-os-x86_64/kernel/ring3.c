@@ -2192,6 +2192,10 @@ static void r3_exit_now(uint64_t code) {
       futex_wake_addr(t->mm, t->ctid, 1);
     t->ctid = 0;
   }
+  /* The windows a dying task opened go with it, before the log line, so that a
+   * test can see both the exit and the reaping in one place. */
+  winipc_close_owned((int)task_current());
+
   serial_puts("[ring3] task ");
   serial_puts(task_name(task_current()));
   serial_puts(" exited with code ");

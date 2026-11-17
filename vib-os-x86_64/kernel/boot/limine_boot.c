@@ -536,6 +536,7 @@ void _start(void) {
   ring3_spawn_elf("tlsget", "tlsget.elf", 0);
   ring3_spawn_elf("surftest", "surftest.elf", 0);
   ring3_spawn_elf("omirender", "omirender.elf", 0);
+  ring3_spawn_elf("surfexit", "surfexit.elf", 0);
   }
 
   serial_puts("Starting main loop...\n");
