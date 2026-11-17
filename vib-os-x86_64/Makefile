@@ -76,6 +76,7 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/mm/mmio.c \
            $(KERNEL_DIR)/mm/pmm.c \
            $(KERNEL_DIR)/cow.c \
+           $(KERNEL_DIR)/walltime.c \
            $(KERNEL_DIR)/fs/vfs.c \
            $(KERNEL_DIR)/drivers/framebuffer.c \
            $(KERNEL_DIR)/drivers/idt.c \
@@ -239,7 +240,7 @@ $(LIMINE_DIR):
 userland/%.elf: userland/%.c
 	$(MAKE) -C userland $*.elf
 
-$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf userland/tlsget.elf
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -274,6 +275,7 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	@if [ -f userland/epolltest.elf ]; then cp userland/epolltest.elf $(ISO_ROOT)/apps/epolltest.elf; else echo "no epolltest.elf: skipping"; fi
 	@if [ -f userland/memfdtest.elf ]; then cp userland/memfdtest.elf $(ISO_ROOT)/apps/memfdtest.elf; else echo "no memfdtest.elf: skipping"; fi
 	@if [ -f userland/socktest.elf ]; then cp userland/socktest.elf $(ISO_ROOT)/apps/socktest.elf; else echo "no socktest.elf: skipping"; fi
+	@if [ -f userland/tlsget.elf ]; then cp userland/tlsget.elf $(ISO_ROOT)/apps/tlsget.elf; else echo "no tlsget.elf: skipping"; fi
 	@if [ -f userland/exectarget.elf ]; then cp userland/exectarget.elf $(ISO_ROOT)/apps/exectarget.elf; else echo "no exectarget.elf: skipping"; fi
 	# A shared object, in a directory of its own: the loader will look it up by
 	# path, so the path it is copied to is the path that must appear in limine.conf.

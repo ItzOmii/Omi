@@ -20,6 +20,7 @@
 #include "omi_tls.h"
 #include "omi_roots.h"
 #include "bearssl.h"
+#include "walltime.h"
 
 #define TLS_MAX_ROOTS   32
 /* Days from 0000-01-01 to 1970-01-01 in the proleptic Gregorian calendar.
@@ -40,65 +41,6 @@ static int s_ta_count = -1;          /* -1 = not loaded yet */
 static int  s_last_err = 0;
 static char s_peer_cn[96];
 
-
-/* ------------------------------------------------------------------ */
-/* port I/O: CMOS clock                                                */
-/* ------------------------------------------------------------------ */
-
-static uint8_t t_inb(uint16_t port) {
-  uint8_t v; __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(port)); return v;
-}
-static void t_outb(uint16_t port, uint8_t v) {
-  __asm__ volatile("outb %0, %1" : : "a"(v), "Nd"(port));
-}
-static uint8_t cmos(uint8_t reg) { t_outb(0x70, reg); return t_inb(0x71); }
-static int bcd(uint8_t v) { return (v & 0x0F) + ((v >> 4) * 10); }
-
-/* Days since 1970-01-01 (Howard Hinnant's civil-days algorithm).
- * BearSSL wants days since 0 AD, which is this plus BR_EPOCH_SHIFT. */
-static uint32_t days_from_civil(int y, int m, int d) {
-  y -= m <= 2;
-  int era = (y >= 0 ? y : y - 399) / 400;
-  unsigned yoe = (unsigned)(y - era * 400);
-  unsigned doy = (unsigned)((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1);
-  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return (uint32_t)(era * 146097 + (int)doe - 719468);
-}
-
-/* Fills days + seconds-since-midnight from the RTC. Returns 0 if the clock
- * looks unset (bad BCD, year outside 2020..2099), so the caller can fall
- * back instead of failing every certificate as "not yet valid". */
-static int rtc_now(uint32_t *days, uint32_t *secs) {
-  for (int i = 0; i < 100000; i++)
-    if (!(cmos(0x0A) & 0x80)) break;              /* update-in-progress */
-
-  uint8_t sec = cmos(0x00), min = cmos(0x02), hr = cmos(0x04);
-  uint8_t day = cmos(0x07), mon = cmos(0x08), yr = cmos(0x09);
-  uint8_t regb = cmos(0x0B);
-
-  int y, mo, d, h, mi, s;
-  if (regb & 0x04) {                              /* binary mode */
-    s = sec; mi = min; h = hr & 0x7F; d = day; mo = mon; y = yr;
-  } else {                                        /* BCD */
-    s = bcd(sec); mi = bcd(min); h = bcd(hr & 0x7F);
-    d = bcd(day); mo = bcd(mon); y = bcd(yr);
-  }
-  if (!(regb & 0x02)) {                           /* 12h clock */
-    int pm = (hr & 0x80) != 0;
-    if (h == 12) h = 0;
-    if (pm) h += 12;
-  }
-
-  y += 2000;                                       /* century: assume 20xx */
-  if (y < 2020 || y > 2099) return 0;
-  if (mo < 1 || mo > 12) return 0;
-  if (d < 1 || d > 31) return 0;
-  if (h > 23 || mi > 59 || s > 59) return 0;
-
-  *days = days_from_civil(y, mo, d);
-  *secs = (uint32_t)(h * 3600 + mi * 60 + s);
-  return 1;
-}
 
 /* ------------------------------------------------------------------ */
 /* entropy                                                             */
@@ -282,15 +224,13 @@ int tls_start(const char *host) {
   br_ssl_engine_set_versions(&s_cc.eng, BR_TLS12, BR_TLS12);
   br_ssl_engine_set_buffer(&s_cc.eng, s_iobuf, sizeof s_iobuf, 0);
 
-  /* Reference date for certificate validity. A machine with a dead RTC would
-   * otherwise reject every chain as not-yet-valid, so fall back to a date we
-   * know is inside the current roots' windows. */
-  uint32_t days = 0, secs = 0;
-  if (!rtc_now(&days, &secs)) {
-    days = days_from_civil(2026, 1, 1);
-    secs = 0;
-  }
-  br_x509_minimal_set_time(&s_xc, days + BR_EPOCH_SHIFT, secs);
+  /* Reference date for certificate validity, from the one clock in the kernel
+   * (walltime.c): the CMOS date read once at boot, advanced on the tick counter,
+   * with a documented fixed date if the chip never answered. Days here are
+   * counted from year 0 already, which is what the X.509 engine wants. */
+  uint32_t secs = 0;
+  int64_t days = walltime_days_since_year0(&secs);
+  br_x509_minimal_set_time(&s_xc, (uint32_t)days, secs);
 
   /* Ask the X.509 engine to hand us the leaf CN for the status strip. */
   static br_name_element cn_el[1];

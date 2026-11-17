@@ -32,6 +32,7 @@
 #include "include/fd.h"    /* rfs_expose: boot modules are openable files */
 #include "include/limine_modules.h"
 #include "include/cow.h"
+#include "include/walltime.h"
 
 /* From the boot path. */
 extern uint64_t hhdm_offset;
@@ -2122,17 +2123,26 @@ static long linux_writev(uint64_t fd, uint64_t iov, uint64_t cnt) {
   return total;
 }
 
-/* There is exactly one clock here: the PIT tick counter. CLOCK_REALTIME and
- * CLOCK_MONOTONIC both report time-since-boot, which is wrong for the former by
- * however long the machine has been up - there is no RTC driver yet. Said plainly
- * rather than papered over: programs that print a date will be wrong, programs
- * that measure intervals will be right. */
+/* Two clocks now. The PIT tick counter answers anything that means "how long
+ * since", and walltime.c answers "when" - the CMOS date read once at boot plus
+ * the ticks since. Before that, CLOCK_REALTIME reported time-since-boot, which
+ * is only right for a machine that was switched on in 1970; TLS made the
+ * difference visible, because every certificate looked not-yet-valid. */
 static long linux_clock_gettime(uint64_t clk, uint64_t ts) {
-  (void)clk;
+  /* CLOCK_REALTIME (0) and CLOCK_REALTIME_COARSE (5) are the date; every other
+   * id musl can ask for - MONOTONIC, MONOTONIC_RAW, BOOTTIME, PROCESS_CPUTIME -
+   * means "how long since something", which is what ticks answer. */
   uint64_t ticks = task_total_ticks();
   int64_t out[2];
-  out[0] = (int64_t)(ticks / TASK_TICK_HZ);
-  out[1] = (int64_t)((ticks % TASK_TICK_HZ) * (1000000000 / TASK_TICK_HZ));
+  if (clk == 0 || clk == 5) {
+    uint64_t secs = 0; uint32_t ns = 0;
+    walltime_now(&secs, &ns);
+    out[0] = (int64_t)secs;
+    out[1] = (int64_t)ns;
+  } else {
+    out[0] = (int64_t)(ticks / TASK_TICK_HZ);
+    out[1] = (int64_t)((ticks % TASK_TICK_HZ) * (1000000000 / TASK_TICK_HZ));
+  }
   return user_put(ts, out, sizeof out) ? -EFAULT : 0;
 }
 
@@ -2890,10 +2900,13 @@ static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, 
     case 39:  return (long)task_current();                 /* getpid */
     case 60:  r3_exit_now(a0); return 0;                   /* exit */
     case 96: {                                             /* gettimeofday */
-      uint64_t ticks = task_total_ticks();
+      /* Wall-clock time, not uptime: a program that asks what time it is wants
+       * the date, and only one of the two clocks here can answer that. */
+      uint64_t secs = 0; uint32_t ns = 0;
+      walltime_now(&secs, &ns);
       int64_t tv[2];
-      tv[0] = (int64_t)(ticks / TASK_TICK_HZ);
-      tv[1] = (int64_t)((ticks % TASK_TICK_HZ) * (1000000 / TASK_TICK_HZ));
+      tv[0] = (int64_t)secs;
+      tv[1] = (int64_t)(ns / 1000);
       if (user_put(a0, tv, sizeof tv) != 0) return -EFAULT;
       return 0;
     }

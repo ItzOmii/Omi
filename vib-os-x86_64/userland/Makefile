@@ -32,6 +32,7 @@ PROGS += exectest.elf
 PROGS += epolltest.elf
 PROGS += memfdtest.elf
 PROGS += socktest.elf
+PROGS += tlsget.elf
 PROGS += exectarget.elf
 # Not a program: a shared object, built with musl-gcc so its relocations and its
 # NEEDED entry are real. Copied to the ISO's /lib and loaded as a boot module.
@@ -67,6 +68,35 @@ libprobe.elf: libprobe.c
 libmap.elf: libmap.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping libmap"; exit 0; }
 	musl-gcc -static -O2 -no-pie -o $@ $<
+
+# ---- TLS, in a program ---------------------------------------------------
+# BearSSL is the kernel's TLS library; here it is compiled against musl instead,
+# so the same code runs in ring 3 with no kernel help beyond the syscalls. Built
+# as one archive because 277 files recompiled per program would dominate the
+# build, and cached because none of them change when tlsget.c does.
+BEARSSL     := ../kernel/lib/bearssl
+BEARSSL_SRC := $(wildcard $(BEARSSL)/src/*/*.c)
+BEARSSL_INC := -I$(BEARSSL)/inc -I$(BEARSSL)/src
+BEARSSL_LIB := build/bearssl_user/libbearssl.a
+
+$(BEARSSL_LIB): $(BEARSSL_SRC)
+	@mkdir -p build/bearssl_user/obj
+	@echo "compiling BearSSL for musl ($$(echo $(BEARSSL_SRC) | wc -w) files)"
+	@echo $(BEARSSL_SRC) | tr ' ' '\n' | xargs -P4 -I{} sh -c \
+	  'o=$(CURDIR)/build/bearssl_user/obj/$$(echo {} | sed "s|$(BEARSSL)/src/||; s|/|_|g; s|\\.c$$|.o|"); \
+	   musl-gcc -O2 $(BEARSSL_INC) -c {} -o $$o || exit 255' || { echo "BearSSL build failed"; rm -f $@; exit 1; }
+	@ar rcs $@ build/bearssl_user/obj/*.o
+	@echo "built $@ ($$(stat -c%s $@) bytes)"
+
+# The root store, compiled as the data file it is: kernel/net/roots.c has no
+# kernel dependency, and shim/types.h keeps its one include honest.
+roots_user.o: ../kernel/net/roots.c shim/types.h
+	@musl-gcc -O2 -Ishim -I../kernel/include -c -o $@ $<
+
+tlsget.elf: tlsget.c roots_user.o $(BEARSSL_LIB)
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping tlsget"; exit 0; }
+	@musl-gcc -O2 -static -no-pie $(BEARSSL_INC) -Ishim -o $@ tlsget.c roots_user.o $(BEARSSL_LIB) \
+	  && echo "built $@ ($$(stat -c%s $@) bytes)"
 
 socktest.elf: socktest.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping socktest"; exit 0; }
@@ -151,5 +181,6 @@ start.o: start.S
 
 clean:
 	rm -f *.o $(PROGS)
+	rm -rf build
 
 .PHONY: all clean
