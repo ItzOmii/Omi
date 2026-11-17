@@ -303,6 +303,25 @@ most desktops do not expose.
 
 To boot real hardware: `sudo dd if=omi.iso of=/dev/sdX bs=4M status=progress`.
 
+## Applications, as packages
+
+Designed, not built. Today every program is an `APP_*` id in a table in the compositor, and the
+start menu and dock are hand-written lists beside it. That is the wrong shape: adding a program
+should be a file operation, not a kernel rebuild.
+
+- An application is a **`.omi` archive** — one file, a manifest plus a payload — dropped into
+  `/applications`. The directory *is* the registry; a program's presence in it is its installation.
+- The manifest carries the title, the basic information the menu shows, whether it is an
+  **application** or a **widget**, whether it is resizable, and what a right-click on it does.
+- A **watcher** watches that directory and re-emits the installed list when it changes, so the
+  applications and widgets sections update in real time as packages appear or vanish. Rescanning
+  only when a menu opens would be cheaper and wrong: a widget that has just been installed should
+  be able to start working before anyone opens the menu.
+
+The obstacle is the filesystem: the VFS is RAM only, with no directories below the root, so
+`/applications` has to exist as something first — a boot module whose entries the archive reader can
+enumerate, or a real directory layer. The packaging work starts behind that decision.
+
 ## What does not work
 
 - **No TCP teardown or retransmission.** A connection ends with a single FIN and nothing handles
