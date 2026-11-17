@@ -55,7 +55,10 @@ scaling and no resampling, so a surface pixel is a screen pixel.
 - **Surfaces are small and few.** Four at a time, up to 620x420 each. Damage
   rectangles are tracked and counted, but the compositor rebuilds the scene from
   the wallpaper every frame, so the copy still covers the whole client rect.
-- **Omi Net is a reader, not a browser.** HTML and images; no JavaScript.
+- **Omi Net is a reader, not a browser.** HTML and images; no JavaScript, no CSS,
+  no images yet, and its text is one 8x16 ASCII font, so a page written outside
+  ASCII loses the characters that are not in the font. It scrolls with the arrow
+  keys: one line per press, clamped to the document.
 - **Drivers are device-specific.** Tested on QEMU's q35 and on one physical
   machine. A different NIC or audio codec is unsupported, not merely untested.
 
@@ -90,7 +93,7 @@ boot it in UEFI or legacy mode.
 ## What proves it
 
 Everything above is the output of a program that runs on the ISO at boot, not a
-description of intent. A stock boot prints 217 individual pass lines (`[tag] ok`
+description of intent. A stock boot prints 220 individual pass lines (`[tag] ok`
 in the serial log) and these numbered tallies:
 
 | program | result | what it covers |
@@ -98,7 +101,7 @@ in the serial log) and these numbered tallies:
 | `surftest` | 10/10 | surface mapping, present, damage, refusals |
 | `omirender` | 12/12 | glyphs, wrap, clipping and blending in a ring-3 rasteriser |
 | `surfexit` | — | a window and its surface are reaped when the process exits |
-| `ominet` | 19/19 | TLS, HTML parsing, layout and painting in a ring-3 process |
+| `ominet` | 22/22 | name resolution, TLS, HTML parsing, layout, painting, scrolling |
 | `tlsget` | 7/7 | real TLS handshakes from ring 3 |
 | `socktest` | 20/20 | musl's `socket`/`connect`/`send` over the BSD ABI |
 | `linux3` | 27/27 | Linux syscall surface |
