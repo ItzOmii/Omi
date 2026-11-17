@@ -18,6 +18,7 @@
 #include "net_backend.h"
 #include "e1000.h"
 #include "task.h"
+#include "errno.h"
 
 extern void serial_puts(const char *s);
 
@@ -45,6 +46,7 @@ typedef struct tcp_conn {
   uint32_t seq, ack;
   int      open;              /* handshake completed */
   int      peer_closed;       /* FIN or RST seen */
+  int      local_closed;      /* we sent our FIN: no more writing, still reading */
   int      used;
   uint8_t  rx[TCP_RX_MAX];
   int      rx_len;
@@ -399,6 +401,9 @@ void tcp_test_unconfirmed(void) {
 
 int tcp_conn_send(tcp_conn_t *c, const void *buf, int len) {
   if (!c || !c->open) return -1;
+  /* Our FIN is on the wire: bytes after it would carry sequence numbers past
+   * the end of the stream, which the peer reads as data it never will get. */
+  if (c->local_closed) return -EPIPE;
   const uint8_t *p = (const uint8_t *)buf;
   int sent = 0;
   while (sent < len) {
@@ -458,13 +463,27 @@ int tcp_conn_recv(tcp_conn_t *c, void *buf, int max, int timeout_ms) {
   return 0;
 }
 
+/* Half-close. The FIN goes out and the connection stays findable, so the peer's
+ * ACK and its own FIN still land here - a program that says "I am done sending"
+ * can read the answer, which is the only reason shutdown(SHUT_WR) exists. A
+ * second call is a no-op: the FIN is already on the wire, and a second one would
+ * carry a different sequence number and confuse the peer about how much data
+ * there was. */
+void tcp_conn_shutdown(tcp_conn_t *c) {
+  if (!c || !c->used || !c->open || c->local_closed) return;
+  c->seq += 1;
+  conn_seg(c, (uint8_t)(TCP_FIN | TCP_ACK), 0, 0);
+  c->local_closed = 1;
+  conn_log("half-close", c);
+}
+
 void tcp_conn_close(tcp_conn_t *c) {
   /* A second close on the same connection would mean the reference count and
    * the connection lifetime have come apart: say so instead of returning
    * quietly, because silence here looks like "cleanup happened once". */
   if (!c) return;
   if (!c->used) { conn_log("DOUBLE-CLOSE", c); return; }
-  if (c->open) {
+  if (c->open && !c->local_closed) {
     c->seq += 1;
     conn_seg(c, (uint8_t)(TCP_FIN | TCP_ACK), 0, 0);
   }
@@ -691,6 +710,7 @@ static int  op_recv(void *h, void *buf, int max, int timeout_ms) {
   return tcp_conn_recv((struct tcp_conn *)h, buf, max, timeout_ms);
 }
 static void op_close(void *h) { tcp_conn_close((struct tcp_conn *)h); }
+static void op_shutdown(void *h) { tcp_conn_shutdown((struct tcp_conn *)h); }
 static unsigned op_poll(void *h) { return tcp_conn_poll((struct tcp_conn *)h); }
 
 static const struct socket_ops tcp_kernel_ops = {
@@ -699,6 +719,7 @@ static const struct socket_ops tcp_kernel_ops = {
   .send  = op_send,
   .recv  = op_recv,
   .close = op_close,
+  .shutdown = op_shutdown,
   .poll  = op_poll,
   .bind  = op_bind,
 };

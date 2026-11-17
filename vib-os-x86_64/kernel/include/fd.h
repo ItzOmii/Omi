@@ -160,5 +160,6 @@ struct shfile *fd_shfile_of(fdtable_t *t, int fd);
 void ofile_pin(ofile_t *o);
 void ofile_unpin(ofile_t *o);
 int  fd_connect(fdtable_t *t, int fd, uint32_t ip, uint16_t port);
+long fd_shutdown(fdtable_t *t, int fd, int how);
 
 #endif

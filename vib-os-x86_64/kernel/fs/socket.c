@@ -37,6 +37,8 @@ struct socket {
   void *impl;                     /* backend-owned transport, NULL until connect */
   int   used;
   int   closing;                  /* last descriptor gone: no new work */
+  int   shut_wr;                  /* our FIN is out: reads still work */
+  int   shut_rd;                  /* the receive side was dropped: reads say EOF */
 
   /* Bumped on every readiness change, BEFORE anyone is woken. A waiter
    * snapshots this, registers, then compares: a transition that landed in
@@ -217,6 +219,23 @@ void sock_shutdown(struct socket *s) {
   sock_wake_all(s);
 }
 
+/* shutdown(SHUT_WR): the FIN goes out through the transport and the socket stays
+ * readable, so the answer to what was already sent can still be collected. */
+void sock_shutdown_wr(struct socket *s) {
+  if (!s || !s->used || s->shut_wr) return;
+  s->shut_wr = 1;
+  if (s->impl && s->ops && s->ops->shutdown) s->ops->shutdown(s->impl);
+  sock_notify(s, OMI_POLLOUT);        /* a blocked writer wakes to learn it may not write */
+}
+
+/* shutdown(SHUT_RD): the receive side is dropped, buffered bytes included - that
+ * is what the caller asked for. Reads answer end-of-file from here on. */
+void sock_shutdown_rd(struct socket *s) {
+  if (!s || !s->used || s->shut_rd) return;
+  s->shut_rd = 1;
+  sock_notify(s, OMI_POLLIN);
+}
+
 void sock_close(struct socket *s) {
   if (!s || !s->used) return;
   /* Transport teardown happens once, here, on the last reference - the backend
@@ -226,6 +245,8 @@ void sock_close(struct socket *s) {
   s->ops = 0;
   s->used = 0;
   s->closing = 0;
+  s->shut_wr = 0;
+  s->shut_rd = 0;
   for (int i = 0; i < SOCK_WAITERS; i++) s->waiters[i].used = 0;
   sock_bump_gen(s);        /* any registration still naming this gen is stale */
 }
@@ -254,6 +275,7 @@ int sock_connect(struct socket *s, const net_cfg_t *cfg, const uint8_t ip[4],
 long sock_send(struct socket *s, const void *buf, uint64_t n) {
   if (!s || !s->used) return -EBADF;
   if (s->closing) return -EBADF;
+  if (s->shut_wr) return -EPIPE;     /* the caller said it was done sending */
   if (!s->impl) return -ENOTCONN;
   int w = s->ops->send(s->impl, buf, (int)n);
   return w < 0 ? -EPIPE : (long)w;
@@ -262,6 +284,7 @@ long sock_send(struct socket *s, const void *buf, uint64_t n) {
 long sock_recv(struct socket *s, void *buf, uint64_t n, int timeout_ms) {
   if (!s || !s->used) return -EBADF;
   if (s->closing) return -EBADF;
+  if (s->shut_rd) return 0;          /* the receive side was dropped: EOF, at once */
   if (!s->impl) return -ENOTCONN;
   int r = s->ops->recv(s->impl, buf, (int)n, timeout_ms);
   if (r > 0) { s->seq++; return r; }

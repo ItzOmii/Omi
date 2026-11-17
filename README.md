@@ -41,6 +41,7 @@ object runs under musl's own `ld.so` - the kernel loads two images and hands ove
 | `execve`: a program replaces its own image, argv and descriptors intact | **done** |
 | `epoll`: a kept set of descriptors, and `nanosleep` for a program that waits | **done** |
 | `memfd` + `MAP_SHARED`: one set of bytes with several doors onto it | **done** |
+| BSD socket ABI in user mode: `sockaddr_in`, `send`/`recv`, `sendmsg`, half-close | **done** |
 | TCP teardown (FIN/RST/`TIME_WAIT`), retransmission | not yet |
 | UDP sockets, `bind`/`listen`/`accept` | not yet |
 | TLS from user mode | not yet |

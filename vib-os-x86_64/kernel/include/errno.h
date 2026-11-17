@@ -14,6 +14,9 @@
 #define ENOEXEC      8
 #define EAFNOSUPPORT 97
 #define EPROTOTYPE 91
+#define EMSGSIZE     90   /* a send that would need more than one bounce buffer */
+#define ENOPROTOOPT  92   /* an option this socket does not have */
+#define EPROTONOSUPPORT 93 /* a type this transport does not carry (SOCK_DGRAM) */
 #define EISCONN 106
 #define ENOTCONN 107
 #define ECONNREFUSED 111

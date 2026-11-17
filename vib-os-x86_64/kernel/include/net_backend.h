@@ -37,6 +37,12 @@ struct socket_ops {
   int  (*recv)(void *h, void *buf, int max, int timeout_ms);
   void (*close)(void *h);
 
+  /* Half-close: send our FIN and leave the connection able to receive. NULL
+   * means the backend has no half-close, and the socket layer then keeps the
+   * socket open but refuses further sends - the peer is told nothing, which is
+   * worse, but silently dropping bytes would be too. */
+  void (*shutdown)(void *h);
+
   /* Readiness of this endpoint, computed and returned - never blocks. This is
    * the shape poll() needs: the same call answers "is there data", "is there
    * room", "did it hang up" and "did it fail", and a backend that answers by IPC

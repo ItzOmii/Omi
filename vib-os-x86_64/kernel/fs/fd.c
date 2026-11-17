@@ -394,6 +394,22 @@ int fd_connect(fdtable_t *t, int fd, uint32_t ip, uint16_t port) {
   return sock_connect(o->sock, cfg, a, port);
 }
 
+/* shutdown(2). Two halves, two answers: SHUT_WR sends our FIN through the
+ * transport and leaves the socket readable, so the reply to what was already
+ * sent can still be collected; SHUT_RD drops the receive side, buffered bytes
+ * included. sock_shutdown() - the last-descriptor-gone path - is deliberately
+ * not used here: it closes both directions at once and would throw away the
+ * answer the caller is waiting for. */
+long fd_shutdown(fdtable_t *t, int fd, int how) {
+  if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
+  ofile_t *o = t->fd[fd];
+  if (o->kind != FK_SOCKET || !o->sock) return -ENOTSOCK;
+  if (how != 0 && how != 1 && how != 2) return -EINVAL;
+  if (how == 0 || how == 2) sock_shutdown_rd(o->sock);   /* SHUT_RD, SHUT_RDWR */
+  if (how == 1 || how == 2) sock_shutdown_wr(o->sock);   /* SHUT_WR, SHUT_RDWR */
+  return 0;
+}
+
 int fd_close(fdtable_t *t, int fd) {
   if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
   ofile_put(t->fd[fd]);

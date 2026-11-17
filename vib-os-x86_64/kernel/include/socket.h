@@ -58,6 +58,13 @@ void sock_notify(struct socket *s, unsigned mask);
  * and the transport stays alive until the last pin is released. Idempotent. */
 void sock_shutdown(struct socket *s);
 
+/* shutdown(SHUT_WR) and shutdown(SHUT_RD). sock_shutdown above is the
+ * last-descriptor-gone path and closes in both directions at once; these are the
+ * half-closes a program asks for, and they are separate because "I have finished
+ * sending" is not "I have finished". */
+void sock_shutdown_wr(struct socket *s);
+void sock_shutdown_rd(struct socket *s);
+
 /* Block until `want` bits are ready or something terminal happens. Returns the
  * readiness bits, -EAGAIN if `deadline_ticks` elapsed with nothing ready, or
  * -ENOBUFS when the waiter table is full - never a silent block. */

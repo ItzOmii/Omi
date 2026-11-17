@@ -1306,6 +1306,26 @@ static int user_page_present(uint64_t page) {
   return (pt[i4] & PTE_P) ? 1 : 0;
 }
 
+/* Copy in from a user pointer the way a syscall has to: the window check, and a
+ * demand-paged page faulted in first. The kernel-side load cannot take a fault,
+ * and a buffer handed to sendto() has no reason to have been written yet - the
+ * program may be sending an uninitialised struct, which is legal. */
+static int user_get(uint64_t uptr, void *dst, uint64_t n) {
+  if (n == 0) return 0;
+  if (uptr < RING3_USER_MIN || uptr + n > RING3_LIMIT) return -1;
+  uint8_t *d = (uint8_t *)dst;
+  const uint8_t *s = (const uint8_t *)(uintptr_t)uptr;
+  for (uint64_t i = 0; i < n; i++) {
+    uint64_t at = uptr + i;
+    if (!(at & 0xFFF)) {
+      if (!user_page_present(at) && !vm_fault_in(at, 0)) return -1;
+    }
+    d[i] = s[i];
+  }
+  return 0;
+}
+
+
 static int user_prep(uint64_t uptr, uint64_t n) {
   if (n == 0) return 0;
   if (uptr < RING3_USER_MIN || uptr + n > RING3_LIMIT) return -1;
@@ -1513,6 +1533,292 @@ static long linux_clock_nanosleep(uint64_t clk, uint64_t flags, uint64_t req_u, 
   if (want <= have) return 0;
   (void)rem_u;   /* an absolute sleep has no remainder to report */
   return sleep_ticks_for((uint64_t)(want - have));
+}
+
+/* ================================================= sockets, Linux ABI (10)
+ *
+ * Until now a socket existed only behind the native numbers, which take an
+ * address as a bare u32 and a port as a bare u16 - fine for a program written
+ * against this kernel, useless to a libc. musl's socket() is syscall 41 and its
+ * send() is sendto(44) with no address, so every real library saw -ENOSYS and
+ * there was no way to put a TLS stack in user mode at all.
+ *
+ * So these calls translate, and the translation is the interesting part: the
+ * address a program passes is bytes in network order, and it must be read as
+ * bytes. Loading sin_addr as a u32 on a little-endian machine reverses it, and
+ * a connect to 1.1.1.1 that lands on 1.1.1.1 is a coincidence of four equal
+ * octets - with 93.184.216.34 it would be 34.216.184.93, which fails slowly and
+ * looks like a network problem.
+ *
+ * What is refused is refused on purpose. There is no listener in the transport,
+ * so bind and listen are -ENOSYS rather than a socket that accepts nothing;
+ * there is no UDP, so SOCK_DGRAM is -EAFNOSUPPORT; there is no half-close, so
+ * SHUT_RD is -ENOSYS. Each of those is a feature this kernel does not have, and
+ * a program told "yes" would wait for something that never comes.
+ */
+#define SOCKADDR_IN_LEN 16
+
+/* Read a sockaddr_in the way the ABI lays it out: family as a host u16, port as
+ * two network-order bytes, address as four bytes in the order they go on the
+ * wire. */
+static int sockaddr_in_read(uint64_t uptr, uint32_t *ip, uint16_t *port) {
+  uint8_t b[8];
+  if (!uptr) return -EFAULT;
+  if (user_get(uptr, b, sizeof b) != 0) return -EFAULT;
+  uint16_t family = (uint16_t)(b[0] | (b[1] << 8));
+  if (family != 2) return -EAFNOSUPPORT;          /* AF_INET only */
+  if (port) *port = (uint16_t)(((uint16_t)b[2] << 8) | b[3]);
+  if (ip) *ip = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) |
+                ((uint32_t)b[6] << 8) | b[7];
+  return 0;
+}
+
+static long linux_socket(uint64_t domain, uint64_t type, uint64_t proto) {
+  fdtable_t *fds = current_fds();
+  if (!fds) return -EMFILE;
+  if (proto != 0) return -EPROTONOSUPPORT;
+  if (domain != 2) return -EAFNOSUPPORT;          /* no AF_INET6, no AF_UNIX */
+  /* SOCK_DGRAM is a real protocol this transport does not carry: saying
+   * EAFNOSUPPORT would be a claim about the family, and it is the type that is
+   * missing. */
+  if ((type & 0xF) == 2) return -EPROTONOSUPPORT;
+  if ((type & 0xF) != 1) return -EPROTONOSUPPORT;
+  /* SOCK_NONBLOCK and SOCK_CLOEXEC: neither exists here. Non-blocking is the
+   * one that matters - a program that asked for it and got a blocking socket
+   * hangs inside read() with no timeout, so the request is refused rather than
+   * quietly ignored. */
+  if (type & ~0xFull) return -EINVAL;
+  return fd_socket(fds);
+}
+
+static long linux_connect(uint64_t fd, uint64_t addr, uint64_t len) {
+  if (len < SOCKADDR_IN_LEN) return -EINVAL;
+  uint32_t ip; uint16_t port;
+  int r = sockaddr_in_read(addr, &ip, &port);
+  if (r != 0) return r;
+  if (!port) return -EINVAL;
+  fdtable_t *fds = current_fds();
+  if (!fds) return -EBADF;
+  return fd_connect(fds, (int)fd, ip, port);
+}
+
+/* Flags a stream send can honour: none, and MSG_NOSIGNAL because nothing here
+ * delivers SIGPIPE in the first place. DONTWAIT would need a non-blocking
+ * socket. */
+#define MSG_NOSIGNAL_FLAG 0x4000
+
+static long linux_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags,
+                         uint64_t addr, uint64_t alen) {
+  (void)addr; (void)alen;                  /* a connected stream ignores these */
+  if (flags & ~(uint64_t)MSG_NOSIGNAL_FLAG) return -EINVAL;
+  return sys_write(fd, buf, len);
+}
+
+static long linux_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags,
+                           uint64_t addr, uint64_t alen) {
+  if (flags & ~(uint64_t)MSG_NOSIGNAL_FLAG) return -EINVAL;
+  long n = sys_read(fd, buf, len);
+  /* The peer's address is not tracked by the transport, so the length comes back
+   * zero: a connected socket is allowed to return no address, and inventing one
+   * would be worse than saying nothing. */
+  if (n >= 0 && addr && alen) {
+    uint32_t zero = 0;
+    if (user_put(alen, &zero, sizeof zero) != 0) return -EFAULT;
+  }
+  return n;
+}
+
+/* sendmsg/recvmsg: the same calls with the bytes scattered across iovecs. A
+ * library that writes a header and a body separately should not have to join
+ * them itself, so they are joined here - into one kernel buffer, because the
+ * transport takes a contiguous range. */
+#define IOV_LEN 16
+/* One message is one page. The rest of the kernel moves bytes through a page-
+ * sized bounce buffer (read(2) and write(2) both cap at 4096), and a sendmsg
+ * that claimed to take more would have to loop anyway - so it loops here and
+ * says so, rather than growing a second buffer discipline nobody else uses. */
+#define MSG_MAX 4096
+
+static long linux_sendmsg(uint64_t fd, uint64_t msg_u, uint64_t flags) {
+  if (flags & ~(uint64_t)MSG_NOSIGNAL_FLAG) return -EINVAL;
+  if (!msg_u) return -EFAULT;
+  uint64_t hdr[4];                          /* msg_name, msg_namelen, msg_iov, msg_iovlen */
+  if (user_get(msg_u, hdr, sizeof hdr) != 0) return -EFAULT;
+  uint32_t iovlen = (uint32_t)hdr[3];
+  if (iovlen > IOV_LEN) return -EINVAL;
+  /* Ancillary data (SCM_RIGHTS and friends) is how one process passes a
+   * descriptor to another. Silently dropping it would break that handshake in a
+   * way that looks like a protocol bug at the far end, so it is refused. */
+  uint64_t ctl[2];
+  if (user_get(msg_u + 32, ctl, sizeof ctl) == 0 && ctl[0] && ctl[1]) return -ENOSYS;
+
+  uint64_t total = 0;
+  uint64_t iov[2 * IOV_LEN];
+  if (iovlen && user_get(hdr[2], iov, iovlen * 16) != 0) return -EFAULT;
+  /* struct iovec is {base, len}: the length is the odd slot, and summing the
+   * bases asks for a buffer the size of the address space. */
+  for (uint32_t i = 0; i < iovlen; i++) total += iov[2 * i + 1];
+  if (total > MSG_MAX) return -EMSGSIZE;
+  if (!total) return 0;
+
+  uint8_t *kbuf = kmalloc((size_t)total);
+  if (!kbuf) return -ENOMEM;
+  uint64_t at = 0;
+  for (uint32_t i = 0; i < iovlen; i++) {
+    if (!iov[2 * i]) continue;
+    if (user_get(iov[2 * i], kbuf + at, iov[2 * i + 1]) != 0) { kfree(kbuf); return -EFAULT; }
+    at += iov[2 * i];
+  }
+  /* fd_write, not sys_write: the bytes already live in a kernel buffer, and
+   * sys_write's first act is to copy from a user pointer and refuse anything
+   * outside the user window - which is exactly what a kernel address is. */
+  fdtable_t *fds = current_fds();
+  if (!fds) { kfree(kbuf); return -EBADF; }
+  uint64_t done = 0;
+  while (done < total) {
+    long w = fd_write(fds, (int)fd, kbuf + done, total - done);
+    if (w <= 0) { if (!done) { kfree(kbuf); return w; } break; }
+    done += (uint64_t)w;
+  }
+  kfree(kbuf);
+  return (long)done;
+}
+
+static long linux_recvmsg(uint64_t fd, uint64_t msg_u, uint64_t flags) {
+  if (flags & ~(uint64_t)MSG_NOSIGNAL_FLAG) return -EINVAL;
+  if (!msg_u) return -EFAULT;
+  uint64_t hdr[4];
+  if (user_get(msg_u, hdr, sizeof hdr) != 0) return -EFAULT;
+  uint32_t iovlen = (uint32_t)hdr[3];
+  if (iovlen > IOV_LEN) return -EINVAL;
+  uint64_t ctl[2];
+  if (user_get(msg_u + 32, ctl, sizeof ctl) == 0 && ctl[0] && ctl[1]) return -ENOSYS;
+
+  uint64_t total = 0;
+  uint64_t iov[2 * IOV_LEN];
+  if (iovlen && user_get(hdr[2], iov, iovlen * 16) != 0) return -EFAULT;
+  for (uint32_t i = 0; i < iovlen; i++) total += iov[2 * i + 1];
+  if (total > MSG_MAX) return -EMSGSIZE;
+  if (!total) return 0;
+
+  uint8_t *kbuf = kmalloc((size_t)total);
+  if (!kbuf) return -ENOMEM;
+  fdtable_t *fds = current_fds();
+  if (!fds) { kfree(kbuf); return -EBADF; }
+  long n = fd_read(fds, (int)fd, kbuf, total);
+  if (n > 0) {
+    uint64_t at = 0, left = (uint64_t)n;
+    for (uint32_t i = 0; i < iovlen && left; i++) {
+      uint64_t take = iov[2 * i] < left ? iov[2 * i] : left;
+      if (take && user_put(iov[2 * i], kbuf + at, take) != 0) { kfree(kbuf); return -EFAULT; }
+      at += take; left -= take;
+    }
+    /* Every byte went somewhere, or the count would be a lie. */
+    n = (long)(at);
+  }
+  kfree(kbuf);
+  return n;
+}
+
+/* setsockopt/getsockopt. The accepted options are the ones that are already
+ * true here or that only describe intent; the refused ones are the ones a
+ * program would build behaviour on. TCP_NODELAY is accepted because Nagle is
+ * not implemented - every send leaves immediately, which is what the caller
+ * asked for. */
+static long linux_setsockopt(uint64_t fd, uint64_t level, uint64_t opt,
+                             uint64_t val_u, uint64_t len) {
+  fdtable_t *fds = current_fds();
+  if (!fds || fd >= FD_MAX || !fds->fd[fd]) return -EBADF;
+  if (fds->fd[fd]->kind != FK_SOCKET) return -ENOTSOCK;
+  (void)val_u; (void)len;
+  if (level == 1) {                        /* SOL_SOCKET */
+    if (opt == 2 || opt == 9) return 0;    /* SO_REUSEADDR, SO_KEEPALIVE: no-op */
+    return -ENOPROTOOPT;
+  }
+  if (level == 6 && opt == 1) return 0;    /* TCP_NODELAY: already the behaviour */
+  return -ENOPROTOOPT;
+}
+
+static long linux_getsockopt(uint64_t fd, uint64_t level, uint64_t opt,
+                             uint64_t val_u, uint64_t len_u) {
+  fdtable_t *fds = current_fds();
+  if (!fds || fd >= FD_MAX || !fds->fd[fd]) return -EBADF;
+  if (fds->fd[fd]->kind != FK_SOCKET) return -ENOTSOCK;
+  uint32_t len = 0;
+  if (user_get(len_u, &len, sizeof len) != 0) return -EFAULT;
+  if (level == 1 && opt == 4) {            /* SO_ERROR: errors surface where they happen */
+    int32_t zero = 0;
+    if (len < 4) return -EINVAL;
+    if (user_put(val_u, &zero, sizeof zero) != 0) return -EFAULT;
+    uint32_t four = 4;
+    if (user_put(len_u, &four, sizeof four) != 0) return -EFAULT;
+    return 0;
+  }
+  if (level == 1 && opt == 3) {            /* SO_TYPE */
+    int32_t stream = 1;
+    if (len < 4) return -EINVAL;
+    if (user_put(val_u, &stream, sizeof stream) != 0) return -EFAULT;
+    uint32_t four = 4;
+    if (user_put(len_u, &four, sizeof four) != 0) return -EFAULT;
+    return 0;
+  }
+  return -ENOPROTOOPT;
+}
+
+/* getrandom(318). RDRAND where the CPU has it, and a splitmix of the timestamp
+ * counter where it does not - which includes QEMU's default model, so the
+ * fallback is the path that boots. Said plainly because it is the honest
+ * version: this is a source good enough to seed a test, and the ABI doc says it
+ * is not a guarantee to build key material on. */
+static uint64_t rng_state;
+
+static int cpu_has_rdrand(void) {
+  uint32_t a, b, c, d;
+  __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+  (void)a; (void)b; (void)d;
+  return (c >> 30) & 1;
+}
+
+/* RDRAND spelled out in bytes: the kernel is compiled without -mrdrnd, so the
+ * mnemonic and its intrinsic are both unavailable, but the instruction is just
+ * REX.W + 0F C7 /6 and the CPUID check above has already said it is there. */
+static int rdrand64(uint64_t *out) {
+  unsigned char ok;
+  __asm__ volatile(".byte 0x48, 0x0f, 0xc7, 0xf0\n\tsetc %1"
+                   : "=a"(*out), "=qm"(ok));
+  return ok;
+}
+
+static uint64_t rng_step(void) {
+  static int checked, have;
+  if (!checked) { checked = 1; have = cpu_has_rdrand(); }
+  if (have) {
+    uint64_t x = 0;
+    for (int i = 0; i < 10; i++)          /* RDRAND can fail; retry like the ISA says */
+      if (rdrand64(&x)) return x;
+  }
+  rng_state += 0x9E3779B97F4A7C15ull ^ task_total_ticks();
+  uint64_t z = rng_state;
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  return z ^ (z >> 31);
+}
+
+static long linux_getrandom(uint64_t buf, uint64_t len, uint64_t flags) {
+  if (flags) return -EINVAL;
+  if (len > 4096) len = 4096;              /* one page is plenty for a seed */
+  long wanted = (long)len;                 /* the answer is the count, as with read(2) */
+  uint8_t tmp[256];
+  while (len) {
+    uint64_t n = len < sizeof tmp ? len : sizeof tmp;
+    for (uint64_t i = 0; i < n; i += 8) {
+      uint64_t v = rng_step();
+      for (uint64_t j = 0; j < 8 && i + j < n; j++) tmp[i + j] = (uint8_t)(v >> (8 * j));
+    }
+    if (user_put(buf, tmp, n) != 0) return -EFAULT;
+    buf += n; len -= n;
+  }
+  return wanted;
 }
 
 /* ==================================================== memfd (roadmap 9)
@@ -2560,6 +2866,22 @@ static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, 
     case 35:  return linux_nanosleep(a0, a1);               /* nanosleep */
     case 77:  return linux_ftruncate(a0, a1);               /* ftruncate */
     case 319: return linux_memfd_create(a0, a1);            /* memfd_create */
+    case 318: return linux_getrandom(a0, a1, a2);            /* getrandom */
+    case 41:  return linux_socket(a0, a1, a2);               /* socket */
+    case 42:  return linux_connect(a0, a1, a2);              /* connect */
+    case 44:  return linux_sendto(a0, a1, a2, a3, r3_arg4, r3_arg5); /* sendto */
+    case 45:  return linux_recvfrom(a0, a1, a2, a3, r3_arg4, r3_arg5); /* recvfrom */
+    case 46:  return linux_sendmsg(a0, a1, a2);              /* sendmsg */
+    case 47:  return linux_recvmsg(a0, a1, a2);              /* recvmsg */
+    case 48: {                                               /* shutdown */
+      fdtable_t *f = current_fds();
+      if (!f) return -EBADF;
+      return fd_shutdown(f, (int)a0, (int)a1);
+    }
+    case 49: case 50: return -ENOSYS;                        /* bind, listen: no listener */
+    case 51: return -ENOSYS;                                 /* getsockname: no local address */
+    case 54: return linux_setsockopt(a0, a1, a2, a3, r3_arg4); /* setsockopt */
+    case 55: return linux_getsockopt(a0, a1, a2, a3, r3_arg4); /* getsockopt */
     case 230: return linux_clock_nanosleep(a0, a1, a2, a3); /* clock_nanosleep */
     case 232: return sys_epoll_wait(a0, a1, a2, a3);        /* epoll_wait */
     case 233: return sys_epoll_ctl(a0, a1, a2, a3);         /* epoll_ctl */

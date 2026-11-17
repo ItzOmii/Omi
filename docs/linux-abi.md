@@ -70,6 +70,14 @@ swap to. Adding it belongs with SMP, not before.
 | 202 | futex | Linux op numbers, timespec converted to ticks |
 | 77 | ftruncate | the length of a shared file; a read-only boot module answers `-EROFS` |
 | 319 | memfd_create | an anonymous file whose purpose is to be mapped; the name is validated and dropped; `MFD_HUGETLB` is `-EINVAL` |
+| 41 | socket | `AF_INET` + `SOCK_STREAM` only; `AF_INET6` is `-EAFNOSUPPORT` and `SOCK_DGRAM` is `-EPROTONOSUPPORT`, because the transport carries TCP and nothing else; `SOCK_NONBLOCK` is `-EINVAL`, since a program told "yes" would block in `read` with no timeout |
+| 42 | connect | takes a `sockaddr_in` read as bytes - family, then the port and address in network order; the address is not loaded as a u32, because that reverses the octets on a little-endian machine |
+| 44,45 | sendto, recvfrom | a connected stream, so a supplied address is ignored; `MSG_NOSIGNAL` accepted (nothing delivers `SIGPIPE`), anything else `-EINVAL`; `recvfrom` reports a zero-length peer address, since the peer address is not tracked |
+| 46,47 | sendmsg, recvmsg | up to 16 iovecs, one page in a message, joined into and scattered from one kernel buffer; `msg_control` is `-ENOSYS` rather than silently dropped, so descriptor passing fails loudly instead of hanging a protocol |
+| 48 | shutdown | `SHUT_WR` sends the FIN through the transport and leaves the socket readable, so the answer to what was sent can still be read; `SHUT_RD` drops the receive side, buffered bytes included; `SHUT_RDWR` does both |
+| 49,50,51 | bind, listen, getsockname | `-ENOSYS`: the transport has no listener and no local-address bookkeeping, and a socket that accepts nothing is worse than a refusal |
+| 54,55 | setsockopt, getsockopt | `SO_REUSEADDR`/`SO_KEEPALIVE`/`TCP_NODELAY` are accepted and change nothing (`Nagle` is not implemented: every send leaves at once); `SO_TYPE` and `SO_ERROR` answer; everything else `-ENOPROTOOPT` |
+| 318 | getrandom | up to a page, from `RDRAND` where the CPU has it and from a `splitmix64` of the tick counter where it does not - which includes QEMU's default CPU, so the fallback is the path that boots. Good enough to seed a test; not a guarantee to build key material on |
 | 232,233,291 | epoll_wait, epoll_ctl, epoll_create1 | a kept set of descriptors, reported level-triggered; `EPOLLONESHOT` removes the entry after it is reported; `EPOLLET` is `-EINVAL`; `EPOLL_CLOEXEC` accepted and ignored |
 
 Everything else returns `-ENOSYS` and is logged once per number. Logging once

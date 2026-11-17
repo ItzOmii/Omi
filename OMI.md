@@ -31,6 +31,9 @@ with an HTTP/1.1 client on top (`kernel/net/`). The network widget reports link 
 (`http 200 · lines · scroll`). Pages are fetched over TCP and rendered by Gumbo plus a CSS box model
 of our own (`kernel/gui/omiweb.c`), with stb_truetype text, decoded images, clickable links and
 tables. HTTPS works: TLS 1.2 through BearSSL with a pinned root bundle (`kernel/net/roots.c`).
+That TLS lives in the kernel, behind the browser window. User mode now has the socket ABI a library
+would need for its own - `socket`/`connect` over a real `sockaddr_in`, `send`/`recv`, `sendmsg`,
+half-close, `getrandom` - but no TLS library has been built against it yet.
 
 **Processes.** GDT + TSS, a 100 Hz PIT, and a round-robin scheduler over 96 task slots with
 16 KB kernel stacks (`kernel/kernel_task.c`). The task manager window lists every task with state,
@@ -113,8 +116,9 @@ qemu-system-x86_64 -m 512 -cdrom omi.iso -boot d -vga std \
   compiled in.
 - **No `exec` from a path.** A program is spawned from a hardcoded list matched by module name, so a
   loaded module is not a runnable file.
-- **No TCP teardown, retransmission, server sockets or UDP.** One FIN ends a connection; `bind`/
-  `listen`/`accept` do not exist.
+- **No TCP teardown, retransmission, server sockets or UDP.** A program can half-close with
+  `shutdown(SHUT_WR)` - the FIN goes out and the socket stays readable - but there is no `TIME_WAIT`,
+  no retransmission of a lost segment, and `bind`/`listen`/`accept` do not exist.
 - **Slow HTTP origins look slow.** Connect timeouts are 1.5 s → 3.5 s → 5 s across three attempts
   (fresh source port each time), so a site that takes 11 s to answer will fail rather than hang.
 
