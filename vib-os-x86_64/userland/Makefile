@@ -33,6 +33,7 @@ PROGS += epolltest.elf
 PROGS += memfdtest.elf
 PROGS += socktest.elf
 PROGS += tlsget.elf
+PROGS += surftest.elf
 PROGS += exectarget.elf
 # Not a program: a shared object, built with musl-gcc so its relocations and its
 # NEEDED entry are real. Copied to the ISO's /lib and loaded as a boot module.
@@ -97,6 +98,13 @@ tlsget.elf: tlsget.c roots_user.o $(BEARSSL_LIB)
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping tlsget"; exit 0; }
 	@musl-gcc -O2 -static -no-pie $(BEARSSL_INC) -Ishim -o $@ tlsget.c roots_user.o $(BEARSSL_LIB) \
 	  && echo "built $@ ($$(stat -c%s $@) bytes)"
+
+# The first program that paints its own pixels: a surface, presented whole and
+# then by damage rectangle. Plain musl, no BearSSL, so it builds in one step.
+surftest.elf: surftest.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping surftest"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
 
 socktest.elf: socktest.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping socktest"; exit 0; }

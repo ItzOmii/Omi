@@ -534,6 +534,7 @@ void _start(void) {
   ring3_spawn_elf("memfdtest", "memfdtest.elf", 0);
   ring3_spawn_elf("socktest", "socktest.elf", 0);
   ring3_spawn_elf("tlsget", "tlsget.elf", 0);
+  ring3_spawn_elf("surftest", "surftest.elf", 0);
   }
 
   serial_puts("Starting main loop...\n");

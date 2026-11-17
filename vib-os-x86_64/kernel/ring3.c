@@ -562,6 +562,149 @@ static uint64_t shm_attach(int slot) {
   return RING3_SHM_BASE;
 }
 
+/* Pixel surfaces: frames the kernel owns, mapped writable into one process,
+ * which is then responsible for what they contain. Kept apart from the shm
+ * slots because a surface is tied to a window - it dies with the window, and
+ * the compositor asks for its pixels by window id.
+ *
+ * The frames are not contiguous, so a surface is not one buffer: it is a list
+ * of pages and a width. Everything that reads pixels goes a row at a time. */
+#define SURF_PAGES ((int)(RING3_SURF_AREA / 4096))
+
+static struct {
+  int       used, win, w, h, pages;
+  void     *kva[SURF_PAGES];
+  uint64_t  presented;          /* present() calls, for the log */
+  int       has_damage;         /* dam is the union of what was presented */
+  int       dam_x, dam_y, dam_w, dam_h;
+} surf[RING3_SURF_SLOTS];
+
+/* Local rather than <string.h>: the kernel header pulls in types this file does
+ * not want, and a 4 KB zero is a loop. */
+static void surf_zero(void *p, size_t n) {
+  uint8_t *b = (uint8_t *)p;
+  for (size_t i = 0; i < n; i++) b[i] = 0;
+}
+
+static int surf_slot_for_win(int win_id) {
+  if (win_id < 0) return -1;
+  for (int i = 0; i < RING3_SURF_SLOTS; i++)
+    if (surf[i].used && surf[i].win == win_id) return i;
+  return -1;
+}
+
+uint64_t surf_create(int win_id, int w, int h) {
+  if (w < 1 || h < 1 || win_id < 0) return (uint64_t)-EINVAL;
+  if (w > SURF_MAX_W) w = SURF_MAX_W;
+  if (h > SURF_MAX_H) h = SURF_MAX_H;
+  int pages = (int)(((size_t)w * (size_t)h * 4 + 4095) / 4096);
+  if (pages > SURF_PAGES) return (uint64_t)-EINVAL;
+  if (surf_slot_for_win(win_id) >= 0) return (uint64_t)-EEXIST;
+
+  int slot = -1;
+  for (int i = 0; i < RING3_SURF_SLOTS; i++) if (!surf[i].used) { slot = i; break; }
+  if (slot < 0) return (uint64_t)-ENOSPC;
+
+  task_t *t = task_at(task_current());
+  if (!t || !t->cr3) return (uint64_t)-EINVAL;
+
+  int got = 0;
+  for (; got < pages; got++) {
+    surf[slot].kva[got] = alloc_frame();
+    if (!surf[slot].kva[got]) break;
+    surf_zero(surf[slot].kva[got], 4096);     /* defined from the first frame */
+  }
+  if (got < pages) {                          /* give back what we took */
+    for (int j = 0; j < got; j++) pmm_free_page(to_phys(surf[slot].kva[j]));
+    return (uint64_t)-ENOMEM;
+  }
+
+  uint64_t base = RING3_SURF_BASE + (uint64_t)slot * RING3_SURF_AREA;
+  for (int i = 0; i < pages; i++) {
+    if (ring3_map_existing(t->cr3, base + (uint64_t)i * 4096,
+                           to_phys(surf[slot].kva[i]),
+                           PTE_P | PTE_W | PTE_U | PTE_SHARED) != 0) {
+      for (int j = 0; j < pages; j++) pmm_free_page(to_phys(surf[slot].kva[j]));
+      return (uint64_t)-ENOMEM;
+    }
+  }
+
+  surf[slot].used = 1;
+  surf[slot].win = win_id;
+  surf[slot].w = w;
+  surf[slot].h = h;
+  surf[slot].pages = pages;
+  surf[slot].has_damage = 1;                  /* the first frame is all of it */
+  surf[slot].dam_x = 0; surf[slot].dam_y = 0;
+  surf[slot].dam_w = w; surf[slot].dam_h = h;
+  return base;
+}
+
+int surf_present(int win_id, int x, int y, int w, int h) {
+  int slot = surf_slot_for_win(win_id);
+  if (slot < 0) return -EINVAL;
+  if (x < 0) { w += x; x = 0; }
+  if (y < 0) { h += y; y = 0; }
+  if (x + w > surf[slot].w) w = surf[slot].w - x;
+  if (y + h > surf[slot].h) h = surf[slot].h - y;
+  if (w <= 0 || h <= 0) return 0;             /* outside: nothing changed */
+  surf[slot].presented++;
+
+  /* union with what is already pending */
+  if (!surf[slot].has_damage) {
+    surf[slot].dam_x = x; surf[slot].dam_y = y;
+    surf[slot].dam_w = w; surf[slot].dam_h = h;
+    surf[slot].has_damage = 1;
+    return 0;
+  }
+  int x0 = x < surf[slot].dam_x ? x : surf[slot].dam_x;
+  int y0 = y < surf[slot].dam_y ? y : surf[slot].dam_y;
+  int x1 = x + w, y1 = y + h;
+  int dx1 = surf[slot].dam_x + surf[slot].dam_w;
+  int dy1 = surf[slot].dam_y + surf[slot].dam_h;
+  if (x1 > dx1) dx1 = x1;
+  if (y1 > dy1) dy1 = y1;
+  surf[slot].dam_x = x0; surf[slot].dam_y = y0;
+  surf[slot].dam_w = dx1 - x0; surf[slot].dam_h = dy1 - y0;
+  return 0;
+}
+
+int surf_size(int win_id, int *w, int *h) {
+  int slot = surf_slot_for_win(win_id);
+  if (slot < 0) return 0;
+  if (w) *w = surf[slot].w;
+  if (h) *h = surf[slot].h;
+  return 1;
+}
+
+uint32_t *surf_row(int win_id, int y) {
+  int slot = surf_slot_for_win(win_id);
+  if (slot < 0 || y < 0 || y >= surf[slot].h) return 0;
+  size_t off = (size_t)y * (size_t)surf[slot].w * 4;
+  return (uint32_t *)((uint8_t *)surf[slot].kva[off >> 12] + (off & 4095));
+}
+
+/* Hand the compositor the rectangle that changed since the last frame, and
+ * clear it. Returns 0 when the process has not presented anything new. */
+int surf_take_damage(int win_id, int *x, int *y, int *w, int *h) {
+  int slot = surf_slot_for_win(win_id);
+  if (slot < 0 || !surf[slot].has_damage) return 0;
+  if (x) *x = surf[slot].dam_x;
+  if (y) *y = surf[slot].dam_y;
+  if (w) *w = surf[slot].dam_w;
+  if (h) *h = surf[slot].dam_h;
+  surf[slot].has_damage = 0;
+  return 1;
+}
+
+void surf_release_window(int win_id) {
+  int slot = surf_slot_for_win(win_id);
+  if (slot < 0) return;
+  for (int i = 0; i < surf[slot].pages; i++)
+    if (surf[slot].kva[i]) pmm_free_page(to_phys(surf[slot].kva[i]));
+  surf_zero(&surf[slot], sizeof surf[slot]);
+}
+
 /* A stack in the same window, just below the limit. */
 /* Copy into a user address space that is not the active one. The pages must
  * already be mapped - this is for laying out argv on a fresh stack, not for
@@ -2960,6 +3103,15 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
     case SYS_GETPID: return (long)task_current();
 
     /* ---- the compositor as a server ---------------------------------- */
+    case SYS_SURF_CREATE: {
+      uint64_t r = surf_create((int)a0, (int)a1, (int)a2);
+      return (long)r;
+    }
+    case SYS_SURF_PRESENT: {
+      int x = (int)((a1 >> 16) & 0xFFFF), y = (int)(a1 & 0xFFFF);
+      int w = (int)((a2 >> 16) & 0xFFFF), h = (int)(a2 & 0xFFFF);
+      return surf_present((int)a0, x, y, w, h);
+    }
     case SYS_WIN_OPEN: {
       char title[32];
       if (user_copy(title, a0, 31) != 0) return -EFAULT;

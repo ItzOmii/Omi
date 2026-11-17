@@ -39,11 +39,18 @@
  * for it are built on demand, so an empty window costs nothing. */
 #define RING3_LIMIT       0x0000008010000000ULL
 #define RING3_MMAP_BASE   0x0000008000100000ULL   /* SYS_VM_ALLOC starts here */
-#define RING3_MMAP_TOP    0x000000800FF00000ULL   /* below the stack */
+#define RING3_MMAP_TOP    0x000000800F000000ULL   /* below the surface region */
 /* Shared segments are mapped here in every process that attaches them: the
  * same physical frames, so a write in one process is visible in the other. */
 #define RING3_SHM_BASE    (RING3_USER_BASE + 0x00080000ULL)
 #define RING3_SHM_MAX     32                      /* pages per segment */
+/* Pixel surfaces get their own region, taken out of the top of the window and
+ * sized so a maximum window (620x420) fits in one slot with room to spare: 2 MB
+ * a slot, four slots, mapped only in the process that created them. VM_ALLOC
+ * now stops below this, so a growing heap cannot run into a surface. */
+#define RING3_SURF_BASE   (RING3_USER_BASE + 0x0F000000ULL)
+#define RING3_SURF_AREA   0x00200000ULL           /* 2 MB per slot */
+#define RING3_SURF_SLOTS  4
 
 /* PTE flags */
 #define RING3_P   0x001ULL   /* present */
@@ -85,6 +92,8 @@
 #define SYS_RESOLVE    32   /* (host, ip_out[4]) -> 0 | -ENOENT            */
 #define SYS_POLL       33   /* (fds, nfds, timeout_ms) -> ready count | -EAGAIN */
 #define SYS_PIPE       34   /* (int fds[2]) -> 0 | -EMFILE  (fds[0] read, fds[1] write) */
+#define SYS_SURF_CREATE 35  /* (win, w, h) -> user address of the pixels | -errno */
+#define SYS_SURF_PRESENT 36 /* (win, (x<<16)|y, (w<<16)|h) -> 0 | -errno         */
 
 /* the switch, the gates and the fault handler */
 void     ring3_init(void);

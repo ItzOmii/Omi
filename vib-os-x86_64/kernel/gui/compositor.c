@@ -4601,6 +4601,17 @@ typedef struct {
   int      owner;                   /* task that opened it: woken on input */
 } fwin_t;
 
+/* Surface bookkeeping: how many blits, and how much area the processes actually
+ * said they had changed. The second number is the one that matters - it is what
+ * a damage-aware path would copy, against a blit that today covers the client
+ * rect every frame. */
+static uint64_t surf_blit_frames, surf_dmg_rects, surf_dmg_px;
+void winipc_surface_stats(uint64_t *frames, uint64_t *rects, uint64_t *px) {
+  if (frames) *frames = surf_blit_frames;
+  if (rects) *rects = surf_dmg_rects;
+  if (px) *px = surf_dmg_px;
+}
+
 static fwin_t fwin[WINIPC_MAX];
 static int fwin_next_id = 1;
 static fwin_t *fwin_find(int id);      /* defined below the event queue */
@@ -4783,6 +4794,21 @@ int winipc_open(const char *title, int32_t w, int32_t h) {
 void winipc_close(int id) {
   fwin_t *f = fwin_find(id);
   if (!f) return;
+  /* Say what the surface actually did before its frames go: how many frames the
+   * compositor copied it into, and how much area the process said had changed.
+   * The second number is the one a damage-aware compositor would copy; the first
+   * is what this one copies today, the whole client rect every frame. */
+  int sw0, sh0;
+  if (surf_size(id, &sw0, &sh0)) {
+    serial_puts("[surf] win=");      serial_puthex((uint64_t)id);
+    serial_puts(" size=");           serial_puthex((uint64_t)sw0);
+    serial_puts("x");                serial_puthex((uint64_t)sh0);
+    serial_puts(" blits=");          serial_puthex(surf_blit_frames);
+    serial_puts(" dmg_rects=");      serial_puthex(surf_dmg_rects);
+    serial_puts(" dmg_px=");         serial_puthex(surf_dmg_px);
+    serial_puts("\n");
+  }
+  surf_release_window(id);            /* the frames belong to the window */
   for (int i = 0; i < WINIPC_MAX; i++) {
     if (&fwin[i] == f) {
       if (fwin_focus == i) fwin_focus = -1;
@@ -4838,6 +4864,39 @@ void winipc_draw_all(void) {
     int cx = f->x + 1, cy = f->y + APP_TITLE_H;
     int cw = f->w - 2, ch = f->h - APP_TITLE_H - 1;
     if (cw <= 0 || ch <= 0) continue;
+
+    /* A surface owns the client area. The process painted the pixels; this is a
+     * row copy out of its frames, clipped to the client rect, with no scaling
+     * and no resampling - a surface pixel is a screen pixel. The scene above is
+     * rebuilt from the wallpaper every frame, so the copy covers the whole
+     * client rect; the damage rectangle the process presented is consumed here
+     * and counted, which is what a region-based compositor would blit instead. */
+    int sw, sh;
+    if (surf_size(f->id, &sw, &sh)) {
+      int dx, dy, dw, dh;
+      if (surf_take_damage(f->id, &dx, &dy, &dw, &dh)) {
+        surf_dmg_rects++;
+        surf_dmg_px += (uint64_t)dw * (uint64_t)dh;
+      }
+      int cols = cw < sw ? cw : sw;
+      int rows = ch < sh ? ch : sh;
+      for (int y = 0; y < rows; y++) {
+        uint32_t *src = surf_row(f->id, y);
+        if (!src) break;
+        memcpy(backbuffer + (size_t)(cy + y) * (size_t)screen_width + (size_t)cx,
+               src, (size_t)cols * 4);
+      }
+      surf_blit_frames++;
+      if (surf_blit_frames == 1 || (surf_blit_frames % 60) == 0) {
+        serial_puts("[surf] blit win=");   serial_puthex((uint64_t)f->id);
+        serial_puts(" frame=");            serial_puthex(surf_blit_frames);
+        serial_puts(" client=");           serial_puthex(surf_dmg_rects);
+        serial_puts(" dmg_rects_px=");     serial_puthex(surf_dmg_px);
+        serial_puts("\n");
+      }
+      continue;
+    }
+
     fb_fill_rect(cx, cy, cw, ch, f->bg);
 
     for (int k = 0; k < f->ncmds; k++) {

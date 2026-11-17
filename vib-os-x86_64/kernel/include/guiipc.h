@@ -53,6 +53,38 @@ int  winipc_add(int id, const win_cmd_u *cmd, const char *text);
 void winipc_present(int id);
 void winipc_draw_all(void);
 
+/* ==================================================================== */
+/* Surfaces: a window a process paints into directly.                    */
+/*                                                                      */
+/* The command list above is a retained scene the kernel replays - fine  */
+/* for a form, hopeless for anything that redraws at a frame rate, since */
+/* every pixel would cross a syscall. A surface is the opposite split:    */
+/* the kernel owns the frames and the placement, the process owns the     */
+/* pixels. It maps them, writes them, and says which rectangle changed.   */
+/*                                                                      */
+/* The pixels are plain 32-bit 0x00RRGGBB, the same word the framebuffer  */
+/* uses, so compositing is a row copy - no scaling, no resampling.       */
+/* ==================================================================== */
+
+#define SURF_MAX_W      620
+#define SURF_MAX_H      420
+
+/* Bounds are clamped to the window limits. Returns the address the pixels
+ * appeared at, or -errno (-ENOSPC when every slot is taken). */
+uint64_t surf_create(int win_id, int w, int h);
+/* The rectangle the process changed, in client coordinates. */
+int      surf_present(int win_id, int x, int y, int w, int h);
+/* Kernel-side view of the pixels, for the compositor: 1 when a surface is
+ * bound to that window, plus its size. `surf_row` is the address of row `y` -
+ * the frames behind a surface are a page list, not one buffer, so a reader
+ * takes it a row at a time. */
+int       surf_size(int win_id, int *w, int *h);
+uint32_t *surf_row(int win_id, int y);
+/* The rectangle presented since the last frame (client coordinates), cleared
+ * by the read. 0 when nothing new was presented. */
+int       surf_take_damage(int win_id, int *x, int *y, int *w, int *h);
+void     surf_release_window(int win_id);
+
 /* input: called from the compositor's poll loop. Returns 1 when a foreign
  * window owns the pointer, so the built-in apps see nothing. */
 int  winipc_input(int mx, int my, int buttons, int pressed, int released);
