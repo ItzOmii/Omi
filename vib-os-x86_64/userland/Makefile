@@ -34,6 +34,7 @@ PROGS += memfdtest.elf
 PROGS += socktest.elf
 PROGS += tlsget.elf
 PROGS += surftest.elf
+PROGS += omirender.elf
 PROGS += exectarget.elf
 # Not a program: a shared object, built with musl-gcc so its relocations and its
 # NEEDED entry are real. Copied to the ISO's /lib and loaded as a boot module.
@@ -105,6 +106,17 @@ surftest.elf: surftest.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping surftest"; exit 0; }
 	musl-gcc -static -O2 -no-pie -o $@ $<
 	@echo "built $@"
+
+# The rasteriser, in ring 3: its own glyphs (generated from the kernel's table),
+# its own clip, its own word wrap. Depends on the generated header, so editing a
+# glyph in font.c rebuilds it.
+omirender.elf: omirender.c glyphs.h
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping omirender"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ omirender.c
+	@echo "built $@"
+
+glyphs.h: ../tools/gen_glyphs.py ../kernel/gui/font.c
+	python3 ../tools/gen_glyphs.py
 
 socktest.elf: socktest.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping socktest"; exit 0; }
