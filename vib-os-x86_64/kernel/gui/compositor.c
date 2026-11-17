@@ -5257,18 +5257,6 @@ static void draw_cursor(int x, int y) {
 
 /* Keyboard callback for handling input */
 static void keyboard_callback(int key) {
-  static int first_cb = 1;
-  if (first_cb) {
-    /* [7] PURPLE BLOCK - callback invoked */
-    for (int y = 0; y < 100; y++) {
-      for (int x = 0; x < 100; x++) {
-        fb_fill_rect(x, 600 + y, 1, 1, 0xFFAA00FF);
-      }
-    }
-    fb_swap_buffers();
-    first_cb = 0;
-  }
-  
   /* Any key press triggers redraw */
   needs_redraw = 1;
 

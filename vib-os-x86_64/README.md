@@ -1,120 +1,139 @@
-# UEFI Demo OS
+# Omi
 
-A bare-metal x86_64 OS that boots from UEFI and shows a graphical desktop. 
+A 64-bit operating system that boots on real hardware and runs programs in ring 3
+with a real libc. Monolithic kernel, own drivers, own compositor, no Linux
+underneath.
 
-## Current Status
+Forked from [vib-OS](https://github.com/viralcode/vib-OS) (a UEFI demo with a
+window manager); what happened since is below. This tree is the whole OS: 46,846
+lines of first-party kernel, 2,918 lines of user-mode programs, plus vendored
+BearSSL and Gumbo.
 
-**What works:**
-- Boots on real hardware and QEMU
-- Framebuffer graphics
-- GUI with windows and desktop
-- JPEG wallpapers
+![Omi desktop](screenshots/omi-desktop.png)
 
-**What doesn't work:**
-- **Keyboard input is broken** - PS/2 and USB HID drivers exist but aren't receiving input properly. IDT/interrupt handling probably needs debugging.
+## What it does
 
-## Building
+**Boots.** UEFI and legacy BIOS from one hybrid ISO, on QEMU and from a USB stick
+in a real machine. Limine hands over the framebuffer and a list of boot modules;
+the kernel brings up its own GDT/IDT, paging and heap, then starts the first
+process.
 
-### Prerequisites
+**Runs a desktop.** Compositor with double buffering, draggable and resizable
+windows, a bottom taskbar and a magnification dock, wallpapers decoded from JPEG
+at boot, midnight theme by default. Widgets: sticky note, big clock, weather.
+Apps drawn by the kernel shell: calculator, notes, media player, file manager,
+task manager (live process count), and Omi Net - a browser with its own HTML
+parsing (Gumbo) and image decoding.
 
-**macOS (Homebrew):**
-```bash
-brew install llvm xorriso qemu
-```
+**Talks to the network.** e1000 driver, ARP, IPv4, ICMP, UDP, TCP with a real state
+machine and retransmission, a DNS resolver, and an HTTP client. The compositor
+uses that stack to fetch and render remote images.
 
-**Linux (apt):**
+**Runs real programs.** An ELF loader with a 36-syscall native ABI, and enough of
+the Linux ABI on top that static musl binaries work unmodified: `mmap`, `fork`,
+`execve`, pipes, `epoll`, `memfd`, shared libraries, `clock_gettime`, futexes,
+threads. BSD sockets (41/42/44/45/46/47/48/49/50/51/54/55 and 318) are implemented
+so that a TLS stack can exist in user mode.
+
+**TLS in user space, not the kernel.** `tlsget` links BearSSL against that socket
+ABI and completes real handshakes with certificate-chain and hostname
+verification; the kernel never sees a key.
+
+**Windows whose pixels belong to the process.** A ring-3 window can map a surface,
+write `0x00RRGGBB` words straight into it, and present a damage rectangle. The
+kernel owns the frames and the placement; the compositor copies rows, with no
+scaling and no resampling, so a surface pixel is a screen pixel.
+
+**Audio.** HDA driver, and an MP3 decoder in the media player.
+
+## What it doesn't do yet
+
+- **No disk.** There is no ATA or NVMe driver and no writable filesystem. What the
+  OS can read is what the bootloader loaded into memory, presented through a VFS.
+- **One core.** No SMP: the kernel runs on the CPU the firmware started it on.
+- **No GPU.** Every pixel is composed on the CPU.
+- **Surfaces are small and few.** Four at a time, up to 620x420 each. Damage
+  rectangles are tracked and counted, but the compositor rebuilds the scene from
+  the wallpaper every frame, so the copy still covers the whole client rect.
+- **Omi Net is a reader, not a browser.** HTML and images; no JavaScript.
+- **Drivers are device-specific.** Tested on QEMU's q35 and on one physical
+  machine. A different NIC or audio codec is unsupported, not merely untested.
+
+## Build
+
+Needs clang/LLD, xorriso, and QEMU for testing. Limine 8.6.0 is downloaded on the
+first build.
+
 ```bash
 sudo apt install clang lld xorriso qemu-system-x86
+make                 # -> omi.iso
 ```
 
-### Build
-
-Using Make:
-```bash
-make
-```
-
-Or the shell script (handles Limine download):
-```bash
-./build.sh
-```
-
-This creates `uefi-demo.iso`.
-
-### First build notes
-
-First build downloads Limine 8.6.0 (~2MB). Takes a minute.
-
-## Running
-
-### QEMU (UEFI mode)
+## Run
 
 ```bash
-make run
+make run             # QEMU, UEFI
+make run-bios        # QEMU, legacy BIOS
 ```
 
-Or manually:
-```bash
-qemu-system-x86_64 -M q35 -m 512M -cdrom uefi-demo.iso \
-    -bios /opt/homebrew/share/qemu/edk2-x86_64-code.fd -serial stdio
-```
-
-Linux OVMF path is usually `/usr/share/OVMF/OVMF_CODE.fd`
-
-### QEMU (BIOS fallback)
+By hand, with the serial log in a file - how it is tested here, with no display:
 
 ```bash
-make run-bios
+qemu-system-x86_64 -M q35 -m 512M -cdrom omi.iso -boot d \
+    -display none -serial file:serial.log \
+    -netdev user,id=n0 -device e1000,netdev=n0
 ```
 
-### Real Hardware (USB)
+On a machine: write the ISO to a USB stick (`dd if=omi.iso of=/dev/sdX bs=4M`) and
+boot it in UEFI or legacy mode.
 
-**Find your USB device first** (don't nuke your main drive):
-```bash
-# macOS
-diskutil list
+## What proves it
 
-# Linux  
-lsblk
-```
+Everything above is the output of a program that runs on the ISO at boot, not a
+description of intent. A stock boot prints 186 passing assertions; the ones with
+tallies:
 
-Flash it:
-```bash
-# macOS (unmount first)
-diskutil unmountDisk /dev/diskN
-sudo dd if=uefi-demo.iso of=/dev/rdiskN bs=4m status=progress
+| program | result | what it covers |
+|---|---|---|
+| `surftest` | 10/10 | surface mapping, present, damage, refusals |
+| `tlsget` | 7/7 | real TLS handshakes from ring 3 |
+| `socktest` | 20/20 | musl's `socket`/`connect`/`send` over the BSD ABI |
+| `linux3` | 27/27 | Linux syscall surface |
+| `pipe` / `pipe3` | 37/37, 30/30 | pipes, blocking, EOF, teardown |
+| `maptest` | 24/24 | file-backed `MAP_PRIVATE`, `MAP_FIXED`, `PROT_NONE` guards |
+| `epolltest` | 24/24 | `epoll` add/mod/del/wait |
+| `memfdtest` | 23/23 | `memfd_create` and sealing |
+| `modtest` | 15/15 | loading a module from the boot medium |
+| `dyntest` | 14/14 | shared libraries and the dynamic linker |
+| `lives` | 8/8 | process lifetime and reaping |
+| `exectest` | 7/7 | `execve`, arguments, descriptor survival |
 
-# Linux
-sudo dd if=uefi-demo.iso of=/dev/sdX bs=4M status=progress
-```
+The screen is checked from outside the OS, because a program cannot see its own
+pixels: a QEMU `screendump` of the running system is parsed and the exact
+coordinates compared (`surftest` prints its geometry for this). Its colour bars
+are four pixels wide on purpose - a blit shifted by one pixel, or a downscale of
+one, does not survive that check.
 
-Boot from USB in UEFI mode. Legacy/CSM boot should work too.
-
-## Project Structure
+## Layout
 
 ```
 kernel/
-├── boot/         # Limine entry point
-├── drivers/      # framebuffer, ps2, usb, acpi, pci
-├── gui/          # window manager, compositor, font rendering
-├── media/        # jpeg decoder, wallpapers
-├── mm/           # memory allocation
-└── include/      # headers
-
-limine.conf       # bootloader config
-Makefile          # main build
-build.sh          # alternative build script
+├── boot/        Limine entry, boot modules
+├── drivers/     framebuffer, ps2, usb (ehci/xhci/hid), e1000, hda, acpi, pci
+├── fs/          VFS, descriptors, pipes, sockets, epoll
+├── gui/         compositor, shell apps, Omi Net, fonts, icons
+├── mm/          paging, heap, copy-on-write
+├── net/         TCP, DNS, HTTP
+├── ring3.c      ELF loader, native syscalls, Linux ABI, surfaces
+├── lib/         BearSSL, Gumbo, string
+└── user/        the first process
+userland/        programs that run in ring 3 (built with musl-gcc)
+limine.conf      bootloader config
+Makefile         build
 ```
 
-## Known Issues
+## Origin
 
-1. **No keyboard** - the interrupt handler isn't wired up correctly. Check `drivers/idt.c` and `drivers/ps2.c`.
-
-2. **Build requires LLVM** - cross-compilation with x86_64-elf-gcc works but Makefile prefers clang.
-
-## Cleaning
-
-```bash
-make clean      # remove build artifacts
-make distclean  # also remove downloaded Limine
-```
+Forked from `viralcode/vib-OS`, which provided the UEFI entry, framebuffer, JPEG
+wallpapers and a first window manager. Everything above concerning processes,
+networking, TLS, audio and surfaces is not from there.
