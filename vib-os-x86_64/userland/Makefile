@@ -36,6 +36,8 @@ PROGS += tlsget.elf
 PROGS += surftest.elf
 PROGS += omirender.elf
 PROGS += surfexit.elf
+# The browser's ring-3 half: TLS, Gumbo, layout, paint.
+PROGS += ominet.elf
 PROGS += exectarget.elf
 # Not a program: a shared object, built with musl-gcc so its relocations and its
 # NEEDED entry are real. Copied to the ISO's /lib and loaded as a boot module.
@@ -95,6 +97,27 @@ $(BEARSSL_LIB): $(BEARSSL_SRC)
 # kernel dependency, and shim/types.h keeps its one include honest.
 roots_user.o: ../kernel/net/roots.c shim/types.h
 	@musl-gcc -O2 -Ishim -I../kernel/include -c -o $@ $<
+
+# Gumbo, compiled for musl. This is the same parser the kernel links, from the
+# same sources: moving the renderer out of the kernel is a move, not a second
+# HTML implementation that can disagree with the first.
+GUMBO_USR  := ../kernel/lib/gumbo
+GUMBO_SRCS := $(wildcard $(GUMBO_USR)/src/*.c)
+GUMBO_LIB  := build/gumbo_user/libgumbo.a
+
+$(GUMBO_LIB): $(GUMBO_SRCS)
+	@mkdir -p build/gumbo_user/obj
+	@echo "compiling Gumbo for musl ($$(echo $(GUMBO_SRCS) | wc -w) files)"
+	@echo $(GUMBO_SRCS) | tr ' ' '\n' | xargs -P4 -I{} sh -c \
+	  'o=$(CURDIR)/build/gumbo_user/obj/$$(basename {} .c).o; \
+	   musl-gcc -O2 -I$(CURDIR)/$(GUMBO_USR)/src -c {} -o $$o || exit 255' || { echo "Gumbo build failed"; rm -f $@; exit 1; }
+	@ar rcs $@ build/gumbo_user/obj/*.o
+
+ominet.elf: ominet.c fetch.c fetch.h omitext.h glyphs.h roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB)
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping ominet"; exit 0; }
+	@musl-gcc -O2 -static -no-pie $(BEARSSL_INC) -Ishim -I$(GUMBO_USR)/src -o $@ \
+	  ominet.c fetch.c roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB) \
+	  && echo "built $@ ($$(stat -c%s $@) bytes)"
 
 tlsget.elf: tlsget.c roots_user.o $(BEARSSL_LIB)
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping tlsget"; exit 0; }

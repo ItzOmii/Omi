@@ -64,93 +64,10 @@ static long sys3(long n, long a, long b, long c) {
 
 /* ---- the rasteriser: this is the part that used to be the kernel's ---- */
 
-static void fill(int x, int y, int w, int h, unsigned c) {
-  /* Clip to the surface. A rasteriser that trusts its callers is a rasteriser
-   * that writes into whatever page follows the last row, so every write goes
-   * through this. */
-  if (x < 0) { w += x; x = 0; }
-  if (y < 0) { h += y; y = 0; }
-  if (x + w > CW) w = CW - x;
-  if (y + h > CH) h = CH - y;
-  if (w <= 0 || h <= 0) return;
-  for (int j = 0; j < h; j++) {
-    unsigned *row = pix + (y + j) * CW + x;
-    for (int i = 0; i < w; i++) row[i] = c;
-  }
-}
-
-static unsigned blend_px(unsigned dst, unsigned src, int a) {
-  /* a in 0..255. Integer, so the result is reproducible and checkable. */
-  int r = (((dst >> 16) & 0xFF) * (255 - a) + ((src >> 16) & 0xFF) * a) / 255;
-  int g = (((dst >>  8) & 0xFF) * (255 - a) + ((src >>  8) & 0xFF) * a) / 255;
-  int b = (( dst        & 0xFF) * (255 - a) + ( src        & 0xFF) * a) / 255;
-  return (unsigned)((r << 16) | (g << 8) | b);
-}
-
-static void blend(int x, int y, int w, int h, unsigned c, int a) {
-  if (x < 0) { w += x; x = 0; }
-  if (y < 0) { h += y; y = 0; }
-  if (x + w > CW) w = CW - x;
-  if (y + h > CH) h = CH - y;
-  if (w <= 0 || h <= 0) return;
-  for (int j = 0; j < h; j++) {
-    unsigned *row = pix + (y + j) * CW + x;
-    for (int i = 0; i < w; i++) row[i] = blend_px(row[i], c, a);
-  }
-}
-
-static int glyph_pixels;   /* counted, so the test can say what it actually drew */
-
-static void glyph(int x, int y, char ch, unsigned c) {
-  int idx = (unsigned char)ch - GLYPH_FIRST;
-  if (idx < 0 || idx > GLYPH_LAST - GLYPH_FIRST) return;
-  const unsigned char *rows = glyphs[idx];
-  for (int r = 0; r < GLYPH_H; r++) {
-    unsigned char bits = rows[r];
-    if (!bits) continue;
-    for (int col = 0; col < GLYPH_W; col++) {
-      if (!(bits & (0x80 >> col))) continue;
-      int px = x + col, py = y + r;
-      if (px < 0 || py < 0 || px >= CW || py >= CH) continue;   /* clip */
-      pix[py * CW + px] = c;
-      glyph_pixels++;
-    }
-  }
-}
-
-static void text(int x, int y, const char *s, unsigned c) {
-  for (; *s; s++, x += GLYPH_W) glyph(x, y, *s, c);
-}
-
-/* Greedy word wrap inside maxpx, drawing as it goes. Returns the line count and
- * leaves the widest line in *widest so the caller can assert on the wrap. */
-static int wrap_text(const char *s, int x, int y, int maxpx, int lh,
-                     unsigned c, int *widest) {
-  int lines = 0, cx = x, cw = 0, wmax = 0;
-  int chars = maxpx / GLYPH_W;
-  if (widest) *widest = 0;
-  while (*s) {
-    /* measure the next word */
-    int wl = 0;
-    while (s[wl] && s[wl] != ' ') wl++;
-    if (cw > 0 && cw + 1 + wl > chars) {      /* the word would not fit */
-      if (cw > wmax) wmax = cw;
-      lines++; y += lh; cx = x; cw = 0;
-    }
-    if (cw > 0) { cx += GLYPH_W; cw += 1; }   /* the space */
-    for (int i = 0; i < wl; i++) {
-      glyph(cx, y, s[i], c);
-      cx += GLYPH_W;
-    }
-    cw += wl;
-    s += wl;
-    while (*s == ' ') s++;
-  }
-  if (cw > wmax) wmax = cw;
-  lines++;
-  if (widest) *widest = wmax * GLYPH_W;
-  return lines;
-}
+/* The rasteriser itself lives in omitext.h: the browser needs the same fill,
+ * blend, glyph blit and wrap, and two copies is how a clipping bug survives in
+ * one of them. It works on (pix, CW, CH) as defined above. */
+#include "omitext.h"
 
 static unsigned at(int x, int y) { return pix[y * CW + x]; }
 
@@ -201,16 +118,16 @@ int main(void) {
   text(CW - MARGIN - 9 * GLYPH_W, 5, "ring 3", C_DIM);
   fill(0, 26, CW, 1, C_ACCENT);
 
-  glyph_pixels = 0;
+  text_glyph_pixels = 0;
   int widest = 0;
   int lines = wrap_text(body, MARGIN, 40, CW - 2 * MARGIN, LH, C_TEXT, &widest);
-  printf("[render] %d lines, widest %d px, %d glyph pixels\n", lines, widest, glyph_pixels);
+  printf("[render] %d lines, widest %d px, %d glyph pixels\n", lines, widest, text_glyph_pixels);
   int content_bottom = 40 + lines * LH;
   check(content_bottom <= CH, "the text fits the surface the window gave it",
         content_bottom, CH);
   check(lines >= 3, "the text wraps onto several lines", lines, 3);
   check(widest <= CW - 2 * MARGIN, "no line escapes the measure", widest, CW - 2 * MARGIN);
-  check(glyph_pixels > 400, "the glyph blitter drew something", glyph_pixels, 400);
+  check(text_glyph_pixels > 400, "the glyph blitter drew something", text_glyph_pixels, 400);
 
   /* a 50% wash of white over the page colour: the arithmetic is asserted, then
    * the screen is checked at the same coordinate from outside */
