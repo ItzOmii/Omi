@@ -90,12 +90,14 @@ boot it in UEFI or legacy mode.
 ## What proves it
 
 Everything above is the output of a program that runs on the ISO at boot, not a
-description of intent. A stock boot prints 186 passing assertions; the ones with
-tallies:
+description of intent. A stock boot prints 198 individual pass lines (`[tag] ok`
+in the serial log) and these numbered tallies:
 
 | program | result | what it covers |
 |---|---|---|
 | `surftest` | 10/10 | surface mapping, present, damage, refusals |
+| `omirender` | 12/12 | glyphs, wrap, clipping and blending in a ring-3 rasteriser |
+| `surfexit` | — | a window and its surface are reaped when the process exits |
 | `tlsget` | 7/7 | real TLS handshakes from ring 3 |
 | `socktest` | 20/20 | musl's `socket`/`connect`/`send` over the BSD ABI |
 | `linux3` | 27/27 | Linux syscall surface |
@@ -110,9 +112,14 @@ tallies:
 
 The screen is checked from outside the OS, because a program cannot see its own
 pixels: a QEMU `screendump` of the running system is parsed and the exact
-coordinates compared (`surftest` prints its geometry for this). Its colour bars
-are four pixels wide on purpose - a blit shifted by one pixel, or a downscale of
-one, does not survive that check.
+coordinates compared (`surftest` and `omirender` print their geometry for this).
+Its colour bars are four pixels wide on purpose - a blit shifted by one pixel, or
+a downscale of one, does not survive that check.
+
+The surface tests park in a blocking wait rather than exiting, so the dump is
+taken with their windows alive; `surfexit` is the opposite test, filling a window
+with a colour nothing else uses and returning from `main` immediately. Nothing of
+that colour is left on screen afterwards, which is how the reaping is checked.
 
 ## Layout
 

@@ -4607,6 +4607,12 @@ typedef struct {
  * rect every frame. */
 static uint64_t surf_blit_frames, surf_dmg_rects, surf_dmg_px;
 static uint32_t surf_blit_logged;   /* one blit line per window, not per frame */
+/* Set while a dying task's windows are closed. The exit path must not busy-wait
+ * on the serial port before the zombie is published: the timer can preempt the
+ * exiting task mid-write, and a parent that runs in that gap sees a child it
+ * cannot wait for yet (a spurious ECHILD from a WNOHANG wait). Reaping is
+ * cleanup, not news - the counts stay for a close the process asked for. */
+static int closing_quiet;
 void winipc_surface_stats(uint64_t *frames, uint64_t *rects, uint64_t *px) {
   if (frames) *frames = surf_blit_frames;
   if (rects) *rects = surf_dmg_rects;
@@ -4800,7 +4806,7 @@ void winipc_close(int id) {
    * The second number is the one a damage-aware compositor would copy; the first
    * is what this one copies today, the whole client rect every frame. */
   int sw0, sh0;
-  if (surf_size(id, &sw0, &sh0)) {
+  if (!closing_quiet && surf_size(id, &sw0, &sh0)) {
     serial_puts("[surf] win=");      serial_puthex((uint64_t)id);
     serial_puts(" size=");           serial_puthex((uint64_t)sw0);
     serial_puts("x");                serial_puthex((uint64_t)sh0);
@@ -4827,8 +4833,10 @@ void winipc_close(int id) {
  * forever, because surf_release_window only ever ran from winipc_close. */
 void winipc_close_owned(int owner) {
   if (owner <= 0) return;              /* the kernel shell owns no windows */
+  closing_quiet = 1;
   for (int i = 0; i < WINIPC_MAX; i++)
     if (fwin[i].used && fwin[i].owner == owner) winipc_close(fwin[i].id);
+  closing_quiet = 0;
 }
 
 int winipc_clear(int id, uint32_t color) {
