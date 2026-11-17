@@ -280,6 +280,23 @@ it a real engine rather than a tag stripper:
 - **The taskbar shows windows, not processes.** The `omi net` entry exists exactly as long as one of
   its windows does, and closing the window ends the process behind it; a process that outlived its
   window is ended on the next launch instead of leaving a button that raises nothing.
+- **A window you can put away and bring back.** The title bar's `−` hides the window and leaves the
+  taskbar entry; clicking the entry restores that window rather than starting a second copy. Closing
+  the window still ends its process, and reopening it starts clean — the event ring belongs to the
+  window, so a new window never inherits the close that ended the last one.
+- **The active app is the window that holds the keyboard.** The taskbar marks it with an accent rule.
+  For a built-in app that is the app table's focus; for a ring-3 window it is whichever window the
+  keyboard is going to, which is why the browser's entry lights up while you are reading it.
+- **Pages get their own paper.** The window's chrome is dark so the window reads as a window; the page
+  is whatever colour the document says, white if it says nothing, and the default ink follows that
+  paper's luminance. A dark-themed page gets light text instead of black on black.
+- **Lookups go to the network you are on.** The DHCP resolver is asked first, answers are cached for
+  the boot, and a query is re-sent every 300 ms — asking 8.8.8.8 first and waiting out its timeout
+  cost 2 seconds of every first load.
+- **Maximise and the corner grip are deliberately inert for now.** The window and its surface resize
+  and the client reflows, but the paint after the reflow comes back empty below the first screenful;
+  `WIN_EV_RESIZE`, `SYS_SURF_RESIZE` and the geometry plumbing are all in place, so the remaining work
+  is in the painter. A button that empties a readable page is worse than one that does nothing.
 
 ## The screens
 
