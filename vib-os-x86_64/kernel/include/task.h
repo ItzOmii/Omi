@@ -39,7 +39,12 @@ enum { TASK_FREE = 0, TASK_READY = 1, TASK_RUN = 2, TASK_DEAD = 3, TASK_BLOCKED 
 /* 8 areas was the whole map when the only caller was SYS_VM_ALLOC. A Linux-shaped
  * process spends one on its heap and one per mapping, so the table became the
  * binding constraint rather than memory. 24 bytes a slot. */
-#define TASK_AREAS 16
+/* A process's address-space descriptors. 16 was chosen when every ring-3 client
+ * was one ELF and a stack; the browser ended the assumption: musl's mallocng
+ * maps a meta area and a group per size class, so an 11 KB page parse exhausted
+ * the table, mmap answered ENOMEM, malloc handed back NULL and Gumbo wrote to it.
+ * 128 x 72 bytes is ~9 KB per address space, which is the right order for this. */
+#define TASK_AREAS 128
 typedef struct {
   uint64_t base, len;   /* byte range, page-aligned */
   uint64_t flags;       /* PTE flags for the pages that appear */

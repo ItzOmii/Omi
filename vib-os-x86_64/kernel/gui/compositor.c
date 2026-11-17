@@ -4725,7 +4725,6 @@ int winipc_input(int mx, int my, int buttons, int pressed, int released) {
       if (app_wctl_hit(mx, my, f->x, f->y, f->w) == 3) {   /* close */
         fwin_push(f, WIN_EV_CLOSE, 0, 0, 0);
         winipc_close(f->id);
-        if (fwin_focus == hit) fwin_focus = -1;
         return 1;
       }
       fwin_drag = hit;
@@ -4794,8 +4793,21 @@ int winipc_open(const char *title, int32_t w, int32_t h) {
   f->title[i] = 0;
   if (!i) { const char *d = "window"; for (i = 0; d[i]; i++) f->title[i] = d[i]; f->title[i] = 0; }
 
+  /* A window that opens takes the keyboard. Focus used to be a side effect of
+   * clicking, which meant a client could open, paint, and never see a key. */
+  fwin_focus = slot;
   needs_redraw = 1;
   return f->id;
+}
+
+/* Focus is a property of the desktop, not of the window that happens to hold it.
+ * When the focused window goes away the next one up the stack gets the keyboard;
+ * leaving focus at -1 meant a client could be the only window on screen and still
+ * never receive a key, because another client had opened and closed in between. */
+static void fwin_focus_topmost(void) {
+  fwin_focus = -1;
+  for (int i = 0; i < WINIPC_MAX; i++) if (fwin[i].used) fwin_focus = i;
+  needs_redraw = 1;
 }
 
 void winipc_close(int id) {
@@ -4818,11 +4830,11 @@ void winipc_close(int id) {
   surf_release_window(id);            /* the frames belong to the window */
   for (int i = 0; i < WINIPC_MAX; i++) {
     if (&fwin[i] == f) {
-      if (fwin_focus == i) fwin_focus = -1;
       if (fwin_drag == i) fwin_drag = -1;
     }
   }
   f->used = 0;
+  fwin_focus_topmost();
   needs_redraw = 1;
 }
 
@@ -5286,6 +5298,7 @@ static void draw_cursor(int x, int y) {
 static void keyboard_callback(int key) {
   /* Any key press triggers redraw */
   needs_redraw = 1;
+
 
   /* keys belong to a focused ring-3 window first */
   if (winipc_key(key)) return;

@@ -817,6 +817,28 @@ static int vm_fault_in(uint64_t addr, int err) {
   return 0;
 }
 
+/* Find a descriptor slot, or say why there is none. A silent ENOMEM here becomes
+ * a NULL malloc somewhere in a library that does not check, and the fault that
+ * follows points at the write rather than at the reason the mapping had nowhere
+ * to live - which is how the browser cost an afternoon. */
+static int vm_area_slot(mm_t *mm, uint64_t want, const char *what) {
+  for (int i = 0; i < TASK_AREAS; i++) if (!mm->areas[i].used) return i;
+  static int warned;
+  if (!warned) {
+    warned = 1;
+    serial_puts("[vm] out of area slots in task ");
+    serial_puts(task_name(task_current()));
+    serial_puts(": ");
+    serial_puts(what);
+    serial_puts(" wants ");
+    serial_puthex(want);
+    serial_puts(" bytes (TASK_AREAS=");
+    serial_puthex(TASK_AREAS);
+    serial_puts(")\n");
+  }
+  return -1;
+}
+
 static long sys_vm_alloc(uint64_t len, uint64_t prot) {
   task_t *t = task_at(task_current());
   if (!t || !t->mm) return -EINVAL;
@@ -825,8 +847,7 @@ static long sys_vm_alloc(uint64_t len, uint64_t prot) {
   len = (len + 0xFFF) & ~0xFFFULL;
   if (len > (RING3_MMAP_TOP - RING3_MMAP_BASE)) return -ENOMEM;
 
-  int slot = -1;
-  for (int i = 0; i < TASK_AREAS; i++) if (!mm->areas[i].used) { slot = i; break; }
+  int slot = vm_area_slot(mm, len, "mmap");
   if (slot < 0) return -ENOMEM;
 
   if (!mm->mmap_hint) mm->mmap_hint = RING3_MMAP_BASE;
@@ -940,8 +961,7 @@ static long sys_thread_create(uint64_t entry, uint64_t arg, uint64_t stack_bytes
   uint64_t base = top - stack_bytes;
   mm->stack_hint = base - 0x1000;                 /* and one between threads */
 
-  int slot = -1;
-  for (int i = 0; i < TASK_AREAS; i++) if (!mm->areas[i].used) { slot = i; break; }
+  int slot = vm_area_slot(mm, stack_bytes, "thread stack");
   if (slot < 0) return -ENOMEM;
   mm->areas[slot].base = base;
   mm->areas[slot].len = stack_bytes;
@@ -2315,7 +2335,13 @@ static long linux_arch_prctl(uint64_t op, uint64_t addr) {
   return -EINVAL;
 }
 
-#define LINUX_BRK_MAX (16u << 20)
+/* Address space, not memory: the area is reserved and nothing is mapped until a
+ * byte is touched, so this number costs no RAM. It is not what broke the browser -
+ * that was TASK_AREAS, and the faults I first blamed on this ceiling were pages in
+ * mallocng's guard gaps. It is raised anyway, because 16 MB of process heap is a
+ * floor a page parser reaches and the failure at the ceiling is an ENOMEM that a
+ * library turns into a NULL dereference. */
+#define LINUX_BRK_MAX (64u << 20)
 
 /* brk reserves one area and then moves a pointer inside it; nothing is mapped
  * until a byte is touched, so asking for 16 MB costs one area slot. Returning the
