@@ -47,6 +47,10 @@ int web_build(const char *html, int len, int width, web_measure_fn measure);
 /* Link hit test in page coordinates; NULL when the point is not over a link. */
 const char *web_hit_link(int x, int y);
 
+/* the page's own colours: paper to fill behind the content, ink for text that
+ * does not name a colour itself */
+uint32_t web_bg(void);
+uint32_t web_fg(void);
 void web_free(void);
 int web_height(void);
 int web_count(void);

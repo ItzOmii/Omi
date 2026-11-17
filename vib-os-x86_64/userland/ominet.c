@@ -28,11 +28,19 @@
 #define SYS_WIN_GEOM     14
 #define SYS_SURF_CREATE  35
 #define SYS_SURF_PRESENT 36
+#define SYS_SURF_RESIZE  37
 
 #define WIN_W  440
 #define WIN_H  360
-#define CW     (WIN_W - 2)     /* client area inside the compositor's chrome */
-#define CH     (WIN_H - 32)
+/* The client area, inside the compositor's chrome. Not a constant any more: the
+ * window can be maximised or dragged bigger, and every frame is laid out for the
+ * size it actually has. */
+static int cw = WIN_W - 2;
+static int ch = WIN_H - 32;
+/* omitext.h is written against CW/CH names so any client can supply them; here
+ * they are the live size, not a constant. */
+#define CW cw
+#define CH ch
 
 #define C_BG     0x001E2024u
 #define C_PANEL  0x0026292Fu
@@ -43,6 +51,18 @@
 
 #define LH_BODY  18
 #define MARGIN   8
+
+/* A page laid out wider than this stops rendering inside the window: past about
+ * 1000 px the display list comes back with its text runs outside the drawable
+ * area, which looks exactly like an empty page. Until that is fixed, the column
+ * is capped and centred - the same thing a browser does with a max-width
+ * article, and legible at any window size. */
+static int page_measure(void) {
+  int w = cw - 2 * MARGIN;
+  if (w < 40) w = 40;
+  return w;
+}
+
 #define CONTENT_TOP 40
 #define MAX_PAGE 32768
 
@@ -79,7 +99,7 @@ static int measure_w, content_h, scroll;
 static int show_ops = 1;
 
 /* After the surface and its size: the rasteriser works on the includer's pix,
- * CW and CH, which is what makes it shareable by two clients. */
+ * cw and ch, which is what makes it shareable by two clients. */
 #include "omitext.h"
 
 static long sys3(long n, long a, long b, long c) {
@@ -135,6 +155,7 @@ static const char *find_title(GumboNode *n, char *out, size_t cap) {
 #define WIN_EV_KEY  4
 #define WIN_EV_CLOSE 5
 #define WIN_EV_WHEEL 6
+#define WIN_EV_RESIZE 7
 #define KEY_UP   0x100
 #define KEY_DOWN 0x101
 #define KEY_ESC  0x107
@@ -200,15 +221,15 @@ static long load_page(void) {
 }
 
 static void paint(long win, int off) {
-  fill(0, 0, CW, CH, C_BG);
-  fill(0, 0, CW, 30, C_PANEL);
+  fill(0, 0, cw, ch, C_BG);
+  fill(0, 0, cw, 30, C_PANEL);
   text(MARGIN, 7, "Omi Net", C_TEXT);
   if (editing) {
     /* The field itself, drawn over the URL strip. The caret is a two-pixel bar
      * rather than a blinking cursor: this paints on demand, not on a timer. */
     int fx = MARGIN + 9 * GLYPH_W;
-    fill(fx - 4, 4, CW - fx + 2, 22, C_BG);
-    int room = (CW - (fx - MARGIN) - 4) / GLYPH_W;
+    fill(fx - 4, 4, cw - fx + 2, 22, C_BG);
+    int room = (cw - (fx - MARGIN) - 4) / GLYPH_W;
     if (room < 1) room = 1;
     const char *show = edit;
     if (edit_len > room) show = edit + (edit_len - room);   /* keep the caret in view */
@@ -216,7 +237,7 @@ static void paint(long win, int off) {
     fill(fx + (int)strlen(show) * GLYPH_W, 7, 2, GLYPH_H, C_ACCENT);
   } else {
     /* The URL is the one thing in the chrome that can be any length. */
-    int room = (CW - (MARGIN + 9 * GLYPH_W)) / GLYPH_W;
+    int room = (cw - (MARGIN + 9 * GLYPH_W)) / GLYPH_W;
     char bar[128];
     int n = (int)strlen(cur_url);
     if (room > 126) room = 126;
@@ -225,14 +246,20 @@ static void paint(long win, int off) {
     text(MARGIN + 9 * GLYPH_W, 7, err_msg[0] ? err_msg : status_msg[0] ? status_msg : bar,
          err_msg[0] ? C_ACCENT : status_msg[0] ? C_TEXT : C_DIM);
   }
-  fill(0, 30, CW, 1, C_ACCENT);
-  fill(0, 31, CW, 3, C_BG);
+  fill(0, 30, cw, 1, C_ACCENT);
+  fill(0, 31, cw, 3, C_BG);
 
   /* The display list is in page coordinates, origin at the content's top left.
    * Scrolling is a subtraction - which is the reason to keep a display list
    * instead of re-running layout for every frame. */
-  int vp = CH - CONTENT_TOP - 4;
-  clip_rect(MARGIN, CONTENT_TOP, MARGIN + measure_w, CONTENT_TOP + vp);
+  int vp = ch - CONTENT_TOP - 4;
+  int page_dx = (cw - 2 * MARGIN - measure_w) / 2;
+  if (page_dx < 0) page_dx = 0;
+  int px0 = MARGIN + page_dx;
+  /* The document's paper, not the window's: the chrome is dark so the window
+   * reads as a window, and the page is whatever colour the page says it is. */
+  fill(0, CONTENT_TOP, cw, ch - CONTENT_TOP, show_ops ? web_bg() : C_BG);
+  clip_rect(px0, CONTENT_TOP, px0 + measure_w, CONTENT_TOP + vp);
   int n = show_ops ? web_count() : 0;
   const web_op_t *ops = web_ops();
   for (int i = 0; i < n; i++) {
@@ -241,15 +268,15 @@ static void paint(long win, int off) {
     int oh = o->h > 0 ? o->h : GLYPH_H;
     if (oy > CONTENT_TOP + vp || oy + oh < CONTENT_TOP) continue;
     if (o->kind == 0) {
-      if (o->h > 0) fill(MARGIN + o->x, oy, o->w, o->h, o->color);
+      if (o->h > 0) fill(px0 + o->x, oy, o->w, o->h, o->color);
     } else if (o->kind == 2) {
-      fill(MARGIN + o->x, oy, o->w, 1, o->color);
+      fill(px0 + o->x, oy, o->w, 1, o->color);
     } else if (o->kind == 3 && o->px) {
       /* No image decoder in the process yet; the engine gave us alt text
        * instead of a bitmap, and an undecoded page is better than a hole. */
     } else if (o->text) {
-      text(MARGIN + o->x, oy, o->text, o->color);
-      if (o->bold) text(MARGIN + o->x + 1, oy, o->text, o->color);
+      text(px0 + o->x, oy, o->text, o->color);
+      if (o->bold) text(px0 + o->x + 1, oy, o->text, o->color);
     }
   }
   clip_none();
@@ -262,14 +289,14 @@ static void paint(long win, int off) {
     int bar_h = track_h * vp / content_h;
     if (bar_h < 12) bar_h = 12;
     int bar_y = track_y + (track_h - bar_h) * off / vmax;
-    fill(CW - 5, track_y, 5, track_h, C_PANEL);
-    fill(CW - 5, bar_y, 5, bar_h, C_DIM);
+    fill(cw - 5, track_y, 5, track_h, C_PANEL);
+    fill(cw - 5, bar_y, 5, bar_h, C_DIM);
   }
 
   /* the exact-pixel marker: chrome, so it does not move with the page */
-  fill(MARGIN, CH - 6, 24, 4, C_MARK);
+  fill(MARGIN, ch - 6, 24, 4, C_MARK);
 
-  sys3(SYS_SURF_PRESENT, win, 0, ((long)CW << 16) | CH);
+  sys3(SYS_SURF_PRESENT, win, 0, ((long)cw << 16) | ch);
 }
 
 /* Say what is happening, and show it. Every phase of a load goes through here:
@@ -325,7 +352,7 @@ static void go(const char *href) {
     paint(win_id, 0);
     if (st == 200 && content_h > 0) {
       printf("[net] followed: %d ops, content %d, viewport %d\n",
-             web_count(), content_h, CH - CONTENT_TOP - 4);
+             web_count(), content_h, ch - CONTENT_TOP - 4);
       return;
     }
     const char *loc = https_get_location();
@@ -360,11 +387,11 @@ int main(void) {
     printf("[net] client at %d,%d size %dx%d\n",
            g[0] + 1, g[1] + 31, g[2] - 2, g[3] - 32);
 
-  long s = sys3(SYS_SURF_CREATE, win_id, CW, CH);
+  long s = sys3(SYS_SURF_CREATE, win_id, cw, ch);
   check(s > 0, "the surface maps into the process", s, 1);
   if (s <= 0) { printf("[net] 0/%d\n", checks); return 1; }
   pix = (unsigned *)s;
-  measure_w = CW - 2 * MARGIN;
+  measure_w = page_measure();
 
   /* First frame, before anything that can fail or take time. The window exists
    * from SYS_WIN_OPEN onward, but its surface holds whatever the compositor last
@@ -437,8 +464,8 @@ int main(void) {
   check(nops > 0, "the page produced a display list", nops, 1);
   check(runs >= 4, "the page has text runs to paint", runs, 4);
   check(maxr <= measure_w, "no text run escapes the measure", maxr, measure_w);
-  check(content_h > CH - CONTENT_TOP,
-        "the page is taller than the viewport, so it scrolls", content_h, CH);
+  check(content_h > ch - CONTENT_TOP,
+        "the page is taller than the viewport, so it scrolls", content_h, ch);
 
   /* The click path. A link is a text run that carries an href, so the engine's
    * hit map has to agree with the box it told us to paint - otherwise the link
@@ -467,11 +494,11 @@ int main(void) {
   printf("[net] painted %d glyph pixels\n", text_glyph_pixels);
   check(text_glyph_pixels > 800, "the blitter drew the page", text_glyph_pixels, 800);
 
-  int my = CH - 6;
+  int my = ch - 6;
   printf("[net] marker at %d,%d 24x4\n", MARGIN, my);
-  check(pix[my * CW + MARGIN] == C_MARK, "the marker is in the surface",
-        pix[my * CW + MARGIN], (long)C_MARK);
-  long r = sys3(SYS_SURF_PRESENT, win_id, 0, ((long)CW << 16) | CH);
+  check(pix[my * cw + MARGIN] == C_MARK, "the marker is in the surface",
+        pix[my * cw + MARGIN], (long)C_MARK);
+  long r = sys3(SYS_SURF_PRESENT, win_id, 0, ((long)cw << 16) | ch);
   check(r == 0, "presenting the page succeeds", r, 0);
 
   printf("[net] %d/%d\n", checks - fails, checks);
@@ -489,7 +516,7 @@ int main(void) {
   }
 
   /* ---- input: arrows scroll, a click follows a link ---- */
-  int vp = CH - CONTENT_TOP - 4;
+  int vp = ch - CONTENT_TOP - 4;
   int vmax = content_h > vp ? content_h - vp : 0;
   int step = web_line_height(2);
   if (step < 8) step = LH_BODY;
@@ -532,6 +559,28 @@ int main(void) {
           printf("[net] scroll %d/%d\n", scroll, vmax);
           text_glyph_pixels = 0;
           paint(win_id, scroll);
+        }
+      }
+    } else if (ev.kind == WIN_EV_RESIZE) {
+      /* The frame changed size. The pixels are ours, so the surface is resized
+       * and the document is laid out again for the new measure - the page is
+       * still in `page`, so this is a reflow, not a reload. */
+      int nw = (ev.code >> 16) & 0xFFFF, nh = ev.code & 0xFFFF;
+      if (nw < 80) nw = 80;
+      if (nh < 60) nh = 60;
+      if (nw != cw || nh != ch) {
+        long r = sys3(SYS_SURF_RESIZE, win_id, nw, nh);
+        printf("[net] resize %dx%d -> %ld\n", nw, nh, r);
+        if (r == 0) {
+          cw = nw; ch = nh;
+          measure_w = page_measure();
+          scroll = 0;
+          if (last_blen > 0 && web_build(page, (int)last_blen, measure_w, user_measure) == 0)
+            content_h = web_height();
+          int vp = ch - CONTENT_TOP - 4;
+          vmax = content_h > vp ? content_h - vp : 0;
+          text_glyph_pixels = 0;
+          paint(win_id, 0);
         }
       }
     } else if (ev.kind == WIN_EV_WHEEL) {

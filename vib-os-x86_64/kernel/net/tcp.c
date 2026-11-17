@@ -585,6 +585,31 @@ static int dns_parse(const uint8_t *p, int len, uint16_t id, uint8_t out[4]) {
   return 0;
 }
 
+/* Every navigation resolved the same host again from scratch. Eight entries is
+ * enough for a browsing session's worth of hosts, and a stale entry costs one
+ * failed connection that the caller's retry path already handles. */
+#define DNS_CACHE 8
+static struct { char host[64]; uint8_t ip[4]; int used; } dns_cache[DNS_CACHE];
+static int dns_cache_next;
+
+static int dns_cache_get(const char *host, uint8_t ip_out[4]) {
+  for (int i = 0; i < DNS_CACHE; i++)
+    if (dns_cache[i].used && !strcmp(dns_cache[i].host, host)) {
+      memcpy(ip_out, dns_cache[i].ip, 4);
+      return 1;
+    }
+  return 0;
+}
+
+static void dns_cache_put(const char *host, const uint8_t ip[4]) {
+  int i = dns_cache_next++ % DNS_CACHE;
+  int n = 0;
+  while (host[n] && n < 63) { dns_cache[i].host[n] = host[n]; n++; }
+  dns_cache[i].host[n] = 0;
+  memcpy(dns_cache[i].ip, ip, 4);
+  dns_cache[i].used = 1;
+}
+
 static int dns_resolve_once(const net_cfg_t *cfg, const char *host, uint8_t ip_out[4]) {
   uint8_t q[300];
   uint8_t r[1600];
@@ -594,20 +619,22 @@ static int dns_resolve_once(const net_cfg_t *cfg, const char *host, uint8_t ip_o
    * then Google's secondary. A router stub resolver that is slow or broken
    * should not take the whole browser down with it. */
   static const uint8_t google[2][4] = {{8, 8, 8, 8}, {8, 8, 4, 4}};
+  if (dns_cache_get(host, ip_out)) return 1;
   uint8_t servers[3][4];
   int n_servers = 0;
   int have_dns = 0;
   for (int i = 0; i < 4; i++) if (cfg->dns[i]) have_dns = 1;
 
-  memcpy(servers[n_servers], google[0], 4);
-  n_servers++;
-  if (have_dns && memcmp(cfg->dns, google[0], 4) != 0) {
-    memcpy(servers[n_servers], cfg->dns, 4);
-    n_servers++;
-  }
-  if (memcmp(servers[n_servers - 1], google[1], 4) != 0) {
-    memcpy(servers[n_servers], google[1], 4);
-    n_servers++;
+  /* The resolver this network handed us goes first. It used to be second, after
+   * 8.8.8.8 - which on most home networks is either blocked by the router or
+   * filtered by the ISP, so every first lookup paid the full timeout before the
+   * local server, fifty milliseconds away, was even asked. Measured on the boot
+   * console: resolve 2040 ms of a 2340 ms page load. */
+  if (have_dns) { memcpy(servers[n_servers], cfg->dns, 4); n_servers++; }
+  for (int g = 0; g < 2; g++) {
+    int dup = 0;
+    for (int i = 0; i < n_servers; i++) if (!memcmp(servers[i], google[g], 4)) dup = 1;
+    if (!dup) { memcpy(servers[n_servers], google[g], 4); n_servers++; }
   }
 
   for (int attempt = 0; attempt < n_servers; attempt++) {
@@ -619,7 +646,17 @@ static int dns_resolve_once(const net_cfg_t *cfg, const char *host, uint8_t ip_o
 
     pacer_t p;
     pace_begin(&p);
-    while (pace_ms(&p) < 2500) {
+    unsigned last_send = 0;
+    while (pace_ms(&p) < 1200) {
+      /* A resolver reply is a single UDP packet and every task that polls the
+       * NIC can consume it: the boot self-tests alone have three connections
+       * reading at once. Waiting out the whole timeout because one datagram went
+       * to the wrong reader is what made a first lookup cost two seconds. Ask
+       * again every 300 ms on the same id instead. */
+      if (pace_ms(&p) - last_send >= 300u) {
+        net_udp_send(cfg, server, 5353, 53, q, qlen);
+        last_send = pace_ms(&p);
+      }
       if (rx_busy) { pace_yield(); continue; }
       rx_busy = 1;
       int n = e1000_poll_recv(r, sizeof r);
@@ -634,6 +671,7 @@ static int dns_resolve_once(const net_cfg_t *cfg, const char *host, uint8_t ip_o
             if (plen > 0 && dns_parse(udp + 8, plen, id, ip_out)) {
               extern void net_log_dns_via(const uint8_t *ip);
               net_log_dns_via(server);
+              dns_cache_put(host, ip_out);
               return 1;
             }
           }

@@ -232,6 +232,14 @@ $(LIMINE_DIR):
 userland/%.elf: userland/%.c
 	$(MAKE) -C userland $*.elf
 
+# The browser is several translation units and a shared header. Without these the
+# pattern rule above sees only ominet.c, so editing fetch.c or omilayout.c leaves
+# ominet.elf - and every image built from it - silently a version behind.
+userland/ominet.elf: userland/ominet.c userland/fetch.c userland/omilayout.c \
+                     userland/fetch.h userland/omilayout.h userland/omitext.h \
+                     userland/glyphs.h userland/roots_user.o
+	$(MAKE) -C userland ominet.elf
+
 $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf userland/tlsget.elf userland/surftest.elf userland/omirender.elf userland/surfexit.elf userland/ominet.elf
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)

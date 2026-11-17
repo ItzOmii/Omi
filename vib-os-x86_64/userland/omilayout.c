@@ -123,6 +123,22 @@ static int ci_eq(const char *a, const char *b, int n) {
 
 static const char *skip_ws(const char *p) { while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++; return p; }
 
+/* The page's own paper and ink. A document that says nothing about colours is
+ * read as black on white, which is what every browser does and what makes a page
+ * legible; the window's dark palette belongs to the window, not to the text of
+ * somebody else's document. Deriving the ink from the paper (rather than
+ * assuming the paper) is what stops a dark-themed page rendering black on
+ * black. */
+static uint32_t doc_bg = 0x00FFFFFF;
+static uint32_t doc_fg = 0x001A1B1D;
+static uint32_t doc_link = 0x001F4E9C;
+static int doc_lum;
+
+static int color_lum(uint32_t c) {
+  int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+  return (r * 299 + g * 587 + b * 114) / 1000;
+}
+
 static uint32_t named_color(const char *v, int n) {
   struct { const char *n; uint32_t c; } tab[] = {
     {"black",0x1A1B1D}, {"white",0xFFFFFF}, {"silver",0xC0C0C0}, {"gray",0x808080},
@@ -414,7 +430,7 @@ static void style_for(GumboTag tag, st_t *st) {
     case GUMBO_TAG_CENTER: st->align = 1; break;
     case GUMBO_TAG_B: case GUMBO_TAG_STRONG: st->bold = 1; break;
     case GUMBO_TAG_I: case GUMBO_TAG_EM: st->italic = 1; break;
-    case GUMBO_TAG_A: st->underline = 1; st->color = 0x1F4E9C; break;
+    case GUMBO_TAG_A: st->underline = 1; st->color = doc_lum < 128 ? 0x006FB4F0 : 0x001F4E9C; break;
     case GUMBO_TAG_SMALL: st->font = 2; break;
     case GUMBO_TAG_TD: case GUMBO_TAG_TH: st->pr = 8; st->pb = 4; break;
     case GUMBO_TAG_TITLE: case GUMBO_TAG_STYLE: case GUMBO_TAG_SCRIPT:
@@ -521,7 +537,7 @@ static void line_add(const char *word, int len, const st_t *st, int space_before
   }
   segs[nsegs].t = copy;
   segs[nsegs].font = st->font;
-  segs[nsegs].color = st->color ? st->color : 0x1A1B1D;
+  segs[nsegs].color = st->color ? st->color : doc_fg;
   segs[nsegs].bold = (uint8_t)st->bold;
   segs[nsegs].underline = (uint8_t)st->underline;
   segs[nsegs].w = w;
@@ -754,7 +770,7 @@ static void layout_table(GumboNode *table, st_t *st, int x, int avail, int depth
     if (tbl[r][0].head) op_push(0, x, cur_y, avail, rowh, 0xF4F0E7, 0, font, 0, 0);
     int cx = x;
     for (int c = 0; c < cols; c++) {
-      draw_wrapped(tbl[r][c].txt, font, st->color ? st->color : 0x1A1B1D,
+      draw_wrapped(tbl[r][c].txt, font, st->color ? st->color : doc_fg,
                    cx + TBL_PAD, cur_y + TBL_PAD, wcol[c] - 2 * TBL_PAD, lh,
                    tbl[r][c].head);
       cx += wcol[c];
@@ -895,7 +911,7 @@ static void layout_node(GumboNode *node, st_t st, int x, int avail, int depth) {
     else { mk[0] = '-'; mk[1] = 0; }
     st_t ms = st;
     ms.font = st.font;
-    ms.color = st.color ? st.color : 0x1A1B1D;
+    ms.color = st.color ? st.color : doc_fg;
     /* marker sits in the list's padding, one text row above the item's first line */
     int mw = tw(ms.font, mk);
     op_push(1, cx - 14 + (ordered ? 0 : 4), cur_y, mw, web_line_height(ms.font), ms.color, dup_n(mk, (int)strlen(mk)), ms.font, 0, 0);
@@ -1035,6 +1051,16 @@ int web_build(const char *html, int len, int width, web_measure_fn measure) {
     }
   }
 
+  /* the body (or html, if that is where the colour was put) decides the paper */
+  {
+    st_t bs;
+    style_resolve(body, &bs, &base);
+    if (bs.has_bg) doc_bg = bs.bg & 0x00FFFFFF;
+    doc_lum = color_lum(doc_bg);
+    doc_fg = doc_lum < 128 ? 0x00E8EAEE : 0x001A1B1D;
+    if (bs.color) doc_fg = bs.color;
+  }
+
   GumboVector *bk = &body->v.element.children;
   for (unsigned i = 0; i < bk->length; i++) {
     GumboNode *k = bk->data[i];
@@ -1053,6 +1079,8 @@ int web_build(const char *html, int len, int width, web_measure_fn measure) {
   return 0;
 }
 
+uint32_t web_bg(void) { return doc_bg; }
+uint32_t web_fg(void) { return doc_fg; }
 int web_height(void) { return page_h; }
 int web_count(void) { return nops; }
 const web_op_t *web_ops(void) { return ops; }

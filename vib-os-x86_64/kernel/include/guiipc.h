@@ -39,6 +39,7 @@ typedef struct {
 #define WIN_EV_KEY    4
 #define WIN_EV_CLOSE  5
 #define WIN_EV_WHEEL  6   /* code = notches, positive away from the user */
+#define WIN_EV_RESIZE 7   /* code = (client w << 16) | client h              */
 
 typedef struct {
   int32_t kind;
@@ -68,8 +69,8 @@ void winipc_draw_all(void);
 /* uses, so compositing is a row copy - no scaling, no resampling.       */
 /* ==================================================================== */
 
-#define SURF_MAX_W      620
-#define SURF_MAX_H      420
+#define SURF_MAX_W      1280
+#define SURF_MAX_H      768
 
 /* Bounds are clamped to the window limits. Returns the address the pixels
  * appeared at, or -errno (-ENOSPC when every slot is taken). */

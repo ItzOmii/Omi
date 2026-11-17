@@ -49,8 +49,12 @@
  * a slot, four slots, mapped only in the process that created them. VM_ALLOC
  * now stops below this, so a growing heap cannot run into a surface. */
 #define RING3_SURF_BASE   (RING3_USER_BASE + 0x0F000000ULL)
-#define RING3_SURF_AREA   0x00200000ULL           /* 2 MB per slot */
-#define RING3_SURF_SLOTS  4
+#define RING3_SURF_AREA   0x00400000ULL           /* 4 MB per slot: a 1280x768
+                                                   * client at 4 bytes a pixel,
+                                                   * rounded to the window region */
+#define RING3_SURF_SLOTS  3                       /* 3 x 4 MB = 12 MB, which
+                                                   * leaves the top 4 MB of the
+                                                   * window for the stack */
 
 /* PTE flags */
 #define RING3_P   0x001ULL   /* present */
@@ -94,6 +98,7 @@
 #define SYS_PIPE       34   /* (int fds[2]) -> 0 | -EMFILE  (fds[0] read, fds[1] write) */
 #define SYS_SURF_CREATE 35  /* (win, w, h) -> user address of the pixels | -errno */
 #define SYS_SURF_PRESENT 36 /* (win, (x<<16)|y, (w<<16)|h) -> 0 | -errno         */
+#define SYS_SURF_RESIZE 37  /* (win, w, h) -> 0 | -errno: the client changed size  */
 
 /* the switch, the gates and the fault handler */
 void     ring3_init(void);

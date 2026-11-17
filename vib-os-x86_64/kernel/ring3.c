@@ -597,8 +597,13 @@ uint64_t surf_create(int win_id, int w, int h) {
   if (w < 1 || h < 1 || win_id < 0) return (uint64_t)-EINVAL;
   if (w > SURF_MAX_W) w = SURF_MAX_W;
   if (h > SURF_MAX_H) h = SURF_MAX_H;
-  int pages = (int)(((size_t)w * (size_t)h * 4 + 4095) / 4096);
-  if (pages > SURF_PAGES) return (uint64_t)-EINVAL;
+  /* The whole slot is mapped, not just the pixels this size needs. A window
+   * that is resized or maximised then only changes its logical w/h - no frames
+   * move, no page tables change, and the process' pointer stays valid. Four
+   * megabytes a window is a fair price for not having to reason about a stale
+   * TLB entry on the frame it used to point at. */
+  int pages = SURF_PAGES;
+  if ((size_t)w * (size_t)h * 4 > (size_t)pages * 4096) return (uint64_t)-EINVAL;
   if (surf_slot_for_win(win_id) >= 0) return (uint64_t)-EEXIST;
 
   int slot = -1;
@@ -638,6 +643,24 @@ uint64_t surf_create(int win_id, int w, int h) {
   surf[slot].dam_x = 0; surf[slot].dam_y = 0;
   surf[slot].dam_w = w; surf[slot].dam_h = h;
   return base;
+}
+
+int surf_resize(int win_id, int w, int h) {
+  int slot = surf_slot_for_win(win_id);
+  if (slot < 0) return -EINVAL;
+  if (w < 1) w = 1;
+  if (h < 1) h = 1;
+  if (w > SURF_MAX_W) w = SURF_MAX_W;
+  if (h > SURF_MAX_H) h = SURF_MAX_H;
+  if ((size_t)w * (size_t)h * 4 > (size_t)surf[slot].pages * 4096) return -EINVAL;
+  if (w == surf[slot].w && h == surf[slot].h) return 0;
+  surf[slot].w = w;
+  surf[slot].h = h;
+  /* everything the old size showed is suspect, so the next blit is all of it */
+  surf[slot].has_damage = 1;
+  surf[slot].dam_x = 0; surf[slot].dam_y = 0;
+  surf[slot].dam_w = w; surf[slot].dam_h = h;
+  return 0;
 }
 
 int surf_present(int win_id, int x, int y, int w, int h) {
@@ -735,7 +758,12 @@ int ring3_copy_to_mm(uint64_t cr3, uint64_t vaddr, const void *src, uint64_t n) 
 }
 
 int ring3_make_stack(uint64_t cr3) {
-  const int pages = 8;                          /* 32 KB */
+  /* 256 KB, not 32. Gumbo parses by recursion and an HTML page is deep enough to
+   * matter: at 32 KB the browser ran with its stack against the wall, and any
+   * change in frame layout - one extra printf - pushed a return address off the
+   * top. The failure mode was a call to address 0 from inside the parser, which
+   * reads as a mysterious application bug rather than a stack that ran out. */
+  const int pages = 64;                         /* 256 KB */
   uint64_t base = RING3_LIMIT - (uint64_t)pages * 4096;
   for (int i = 0; i < pages; i++) {
     if (ring3_map(cr3, base + (uint64_t)i * 4096, PTE_P | PTE_W | PTE_U, 0) != 0)
@@ -3149,6 +3177,9 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
     case SYS_SURF_CREATE: {
       uint64_t r = surf_create((int)a0, (int)a1, (int)a2);
       return (long)r;
+    }
+    case SYS_SURF_RESIZE: {
+      return surf_resize((int)a0, (int)a1, (int)a2);
     }
     case SYS_SURF_PRESENT: {
       int x = (int)((a1 >> 16) & 0xFFFF), y = (int)(a1 & 0xFFFF);

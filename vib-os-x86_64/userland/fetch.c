@@ -230,14 +230,18 @@ long https_get(const char *host, int port, const char *path,
   if (ip_used) ip_used[0] = 0;
 
   char ip[16];
+  long t0 = sys3(SYS_TICKS, 0, 0, 0);
   if (resolve_host(host, ip) != 0) { *why = "resolve"; return -1; }
+  long t1 = sys3(SYS_TICKS, 0, 0, 0);
   if (ip_used) snprintf(ip_used, 16, "%s", ip);
 
   const char *sni = host;
   int fd = dial(ip, port);
   if (fd < 0) { *why = "connect"; return -1; }
 
+  long t2 = sys3(SYS_TICKS, 0, 0, 0);
   if (!handshake(fd, sni, why)) { close(fd); return -1; }
+  long t3 = sys3(SYS_TICKS, 0, 0, 0);
 
   char req[192];
   int n = snprintf(req, sizeof req,
@@ -246,7 +250,13 @@ long https_get(const char *host, int port, const char *path,
   if (n <= 0 || (size_t)n >= sizeof req) { *why = "request"; close(fd); return -1; }
 
   long got = exchange_all(fd, req, out, cap);
+  long t4 = sys3(SYS_TICKS, 0, 0, 0);
   close(fd);
+  /* Where the seconds go, in one line: resolve, dial, TLS handshake, body. A
+   * "slow" browser is not a diagnosis, and guessing at which stage is wrong
+   * about as often as it is right. */
+  printf("[net] timing resolve=%ldms dial=%ldms tls=%ldms body=%ldms total=%ldms\n",
+         (t1 - t0) * 10, (t2 - t1) * 10, (t3 - t2) * 10, (t4 - t3) * 10, (t4 - t0) * 10);
   if (got < 0) { *why = "exchange"; return -1; }
 
   /* Split the answer. The status is worth reporting: a 301 is a page too, and

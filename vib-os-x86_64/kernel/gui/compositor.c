@@ -2394,6 +2394,18 @@ typedef struct { int open, x, y, w, h; int min; } meep_app_t;
 
 static meep_app_t mapp[APP_COUNT];
 static int mapp_focus = APP_NONE;
+
+/* Ring-3 windows: defined with the window table further down, but the built-in
+ * apps focus themselves long before that, and taking focus away from a foreign
+ * window is part of focusing a built-in one. */
+static void fwin_clear_focus(void);
+static void fwin_notify_geometry(int idx);
+/* Which app is in front: mapp_focus for a built-in, the window that holds the
+ * keyboard for a ring-3 client. Declared here because the taskbar asks before
+ * the window table exists in this file. */
+static int app_active(int id);
+static int fwin_browser_unminimize(void);
+static void fwin_focus_topmost(void);
 static int drag_app = APP_NONE, drag_dx = 0, drag_dy = 0;
 static int resize_app = APP_NONE, resize_dx = 0, resize_dy = 0;
 
@@ -3667,6 +3679,7 @@ static void ominet_launch(void) {
    * leftover that never saw its own close: it is asked to stop, and a fresh copy
    * starts, because the alternative is a browser the user cannot use again
    * without rebooting. */
+  if (fwin_browser_unminimize()) return;       /* there was one, hidden */
   if (fwin_browser_open()) { fwin_focus_browser(); return; }
   int stale = ominet_task();
   if (stale > 0) {
@@ -3723,6 +3736,7 @@ static void app_open(int id) {
   }
   a->min = 0;
   mapp_focus = id;
+  fwin_clear_focus();
   wg_focus = -1;
   z_top(id);
   needs_redraw = 1;
@@ -3998,15 +4012,16 @@ static void draw_taskbar(void) {
   int n = tb_walk(ids, xs, ws);
   for (int i = 0; i < n; i++) {
     int id = ids[i];
-    uint32_t fill = (mapp_focus == id) ? MEEP_PAPER3 : MEEP_PAPER2;
-    uint32_t bord = (mapp_focus == id) ? MEEP_LINE : MEEP_LINE_SOFT;
+    int active = app_active(id);
+    uint32_t fill = active ? MEEP_PAPER3 : MEEP_PAPER2;
+    uint32_t bord = active ? MEEP_LINE : MEEP_LINE_SOFT;
     if (tb_hover == id) fill = MEEP_PRESS;
     meep_box(xs[i], sy, ws[i], sh, UI_SCALE_VAL(8), bord, fill);
     meep_icon(app_icon(id), xs[i] + UI_SCALE_VAL(8),
               sy + (sh - UI_SCALE_VAL(16)) / 2, 16,
-              (mapp_focus == id) ? MEEP_INK : MEEP_INK_SOFT);
+              active ? MEEP_INK : MEEP_INK_SOFT);
     /* the accent rule under a focused app is the "this one is active" cue */
-    if (mapp_focus == id)
+    if (active)
       fb_fill_rect(xs[i] + UI_SCALE_VAL(12), ty + th - UI_SCALE_VAL(5),
                    ws[i] - UI_SCALE_VAL(24), UI_SCALE_VAL(2), MEEP_ACCENT);
   }
@@ -4026,7 +4041,7 @@ static void draw_taskbar_text(void) {
   int n = tb_walk(ids, xs, ws);
   for (int i = 0; i < n; i++) {
     int id = ids[i];
-    uint32_t col = (mapp_focus == id) ? MEEP_INK : MEEP_INK_SOFT;
+    uint32_t col = app_active(id) ? MEEP_INK : MEEP_INK_SOFT;
     meep_text(&meep_s130, xs[i] + UI_SCALE_VAL(28),
               ty + (th - meep_line_h(&meep_s130)) / 2, app_title(id), col);
   }
@@ -4179,6 +4194,7 @@ static int apps_click(int x, int y, int button) {
     if (!a->open || a->min) continue;
     if (x < a->x || x >= a->x + a->w || y < a->y || y >= a->y + a->h) continue;
     mapp_focus = e;
+    fwin_clear_focus();
     wg_focus = -1;
     z_top(e);
     int wc = app_wctl_hit(x, y, a->x, a->y, a->w);
@@ -4310,6 +4326,9 @@ typedef struct {
   win_event_t ev[WINIPC_EVQ];
   int      ev_head, ev_tail;
   int      owner;                   /* task that opened it: woken on input */
+  int      minimized;               /* on the taskbar, not on the screen */
+  int      maxed;                   /* filling the work area */
+  int32_t  rx, ry, rw, rh;          /* where to go back to */
 } fwin_t;
 
 /* Surface bookkeeping: how many blits, and how much area the processes actually
@@ -4334,6 +4353,46 @@ static fwin_t fwin[WINIPC_MAX];
 static int fwin_next_id = 1;
 static fwin_t *fwin_find(int id);      /* defined below the event queue */
 static int fwin_focus = -1;      /* index into fwin[], -1 = none */
+static int fwin_rz = -1;         /* window being resized from its corner */
+static int fwin_rz_dx, fwin_rz_dy;
+
+static void fwin_clear_focus(void) { fwin_focus = -1; }
+
+/* Which app is in front. For the built-in apps that is mapp_focus; for a ring-3
+ * client it is whichever window holds the keyboard, because that is the one the
+ * user is typing into. The taskbar used to ask mapp_focus for every id, and no
+ * ring-3 window is ever mapp_focus - so the browser's button never lit up. */
+static int app_active(int id) {
+  if (id == APP_BROWSER) {
+    int wid = winipc_focused();
+    if (!wid) return 0;
+    for (int i = 0; i < WINIPC_MAX; i++) {
+      if (!fwin[i].used || fwin[i].id != wid) continue;
+      if (fwin[i].minimized) return 0;
+      int o = fwin[i].owner;
+      const char *n = o > 0 ? task_name(o) : 0;
+      return n && !strcmp(n, "ominet");
+    }
+    return 0;
+  }
+  return mapp_focus == id;
+}
+
+/* Bring a minimised browser back instead of starting a second copy. */
+static int fwin_browser_unminimize(void) {
+  for (int i = 0; i < WINIPC_MAX; i++) {
+    if (!fwin[i].used || !fwin[i].minimized) continue;
+    int o = fwin[i].owner;
+    const char *n = o > 0 ? task_name(o) : 0;
+    if (n && !strcmp(n, "ominet")) {
+      fwin[i].minimized = 0;
+      fwin_focus = i;
+      needs_redraw = 1; full_redraw = 1;
+      return 1;
+    }
+  }
+  return 0;
+}
 static int fwin_drag = -1, fwin_dx, fwin_dy;
 static int fwin_lastx = -1, fwin_lasty = -1;
 
@@ -4346,6 +4405,24 @@ static void fwin_push(fwin_t *f, int32_t kind, int32_t x, int32_t y, int32_t cod
   f->ev[f->ev_head].code = code;
   f->ev_head = next;
   task_wake(f->owner);              /* a blocked task waiting for input runs */
+}
+
+/* Tell the client its client area changed size. The window frame is the
+ * compositor's; the pixels are the process', so it is the process that has to
+ * lay itself out again - the frame alone would just be a bigger border round a
+ * small, stale image. */
+static void fwin_notify_geometry(int idx) {
+  fwin_t *f = &fwin[idx];
+  if (!f->used) return;
+  int cw = f->w - 2, ch = f->h - APP_TITLE_H;
+  if (cw < 1 || ch < 1) return;
+  serial_puts("[fwin] geom id="); serial_puthex((uint64_t)f->id);
+  serial_puts(" at "); serial_puthex((uint64_t)f->x); serial_puts(",");
+  serial_puthex((uint64_t)f->y); serial_puts(" size ");
+  serial_puthex((uint64_t)f->w); serial_puts("x"); serial_puthex((uint64_t)f->h);
+  serial_puts(" client "); serial_puthex((uint64_t)cw); serial_puts("x");
+  serial_puthex((uint64_t)ch); serial_puts("\n");
+  fwin_push(f, WIN_EV_RESIZE, 0, 0, (cw << 16) | (ch & 0xFFFF));
 }
 
 int winipc_poll(int id, win_event_t *out) {
@@ -4445,7 +4522,7 @@ int winipc_input(int mx, int my, int buttons, int pressed, int released, int whe
   int hit = -1;
   for (int i = 0; i < WINIPC_MAX; i++) {
     fwin_t *f = &fwin[i];
-    if (!f->used) continue;
+    if (!f->used || f->minimized) continue;
     if (mx >= f->x && mx < f->x + f->w && my >= f->y && my < f->y + f->h) hit = i;
   }
   if (hit < 0) return 0;
@@ -4466,14 +4543,41 @@ int winipc_input(int mx, int my, int buttons, int pressed, int released, int whe
     fwin_focus = hit;
     needs_redraw = 1;
     if (my < f->y + APP_TITLE_H) {
-      if (app_wctl_hit(mx, my, f->x, f->y, f->w) == 3) {   /* close */
+      int wc = app_wctl_hit(mx, my, f->x, f->y, f->w);
+      if (wc == 3) {                                      /* close */
         fwin_push(f, WIN_EV_CLOSE, 0, 0, 0);
         winipc_close(f->id);
+        return 1;
+      }
+      if (wc == 1) {                                      /* minimise */
+        f->minimized = 1;
+        if (fwin_focus == hit) fwin_focus = -1;
+        fwin_focus_topmost();
+        needs_redraw = 1; full_redraw = 1;
+        return 1;
+      }
+      if (wc == 2) {
+        /* Maximise and the corner grip are deliberately inert until the browser
+         * can paint a resized client: the window resizes and the surface follows,
+         * but the page comes back empty below its first screenful, and a button
+         * that turns a readable page into a blank one is worse than one that does
+         * nothing. The machinery is in place (WIN_EV_RESIZE, SYS_SURF_RESIZE,
+         * fwin_notify_geometry) - it is the paint after the reflow that is wrong. */
         return 1;
       }
       fwin_drag = hit;
       fwin_dx = mx - f->x;
       fwin_dy = my - f->y;
+      return 1;
+    }
+    /* The corner grip: three hairlines that were drawn on every window and, for
+     * a ring-3 one, did nothing - there was no hit test here, so the drag fell
+     * through to the client and became a click on the page. */
+    if (mx >= f->x + f->w - 18 && my >= f->y + f->h - 18) {
+      fwin_rz = hit;
+      fwin_rz_dx = f->x + f->w - mx;
+      fwin_rz_dy = f->y + f->h - my;
+      if (f->maxed) f->maxed = 0;      /* pulling a corner un-maximises it */
       return 1;
     }
     if (cyp >= 0) {
@@ -4531,6 +4635,19 @@ int winipc_open(const char *title, int32_t w, int32_t h) {
   f->y = 120 + slot * 40;
   f->bg = MEEP_PAPER2;
   f->ncmds = 0;
+  f->minimized = 0;
+  f->maxed = 0;
+  f->rx = f->ry = f->rw = f->rh = 0;
+  /* A slot is reused, its event ring is not. Left as it was, the next client in
+   * this slot is handed the close that ended the previous one: the browser
+   * reopened, painted its 3/3, read a stale WIN_EV_CLOSE and exited - which reads
+   * as "reopening closes it". */
+  f->ev_head = f->ev_tail = 0;
+  serial_puts("[fwin] open id="); serial_puthex((uint64_t)f->id);
+  serial_puts(" at "); serial_puthex((uint64_t)f->x); serial_puts(",");
+  serial_puthex((uint64_t)f->y); serial_puts(" size ");
+  serial_puthex((uint64_t)f->w); serial_puts("x"); serial_puthex((uint64_t)f->h);
+  serial_puts("\n");
 
   int i = 0;
   while (title && title[i] && i < 31) { f->title[i] = title[i]; i++; }
@@ -4579,6 +4696,9 @@ void winipc_close(int id) {
     }
   }
   f->used = 0;
+  f->minimized = 0;
+  f->maxed = 0;
+  f->ev_head = f->ev_tail = 0;
   fwin_focus_topmost();
   needs_redraw = 1;
   /* A client waits in SYS_WIN_WAIT by blocking until something wakes it, and
@@ -4638,7 +4758,7 @@ void winipc_present(int id) {
 void winipc_draw_all(void) {
   for (int i = 0; i < WINIPC_MAX; i++) {
     fwin_t *f = &fwin[i];
-    if (!f->used) continue;
+    if (!f->used || f->minimized) continue;
 
     app_win(f->x, f->y, f->w, f->h, f->title, "ring 3", 1);
 
@@ -4675,12 +4795,15 @@ void winipc_draw_all(void) {
        * log into a tape measure with no numbers on it. The close line reports
        * the totals. */
       {
-        uint32_t bit = (f->id >= 0 && f->id < 32) ? (1u << f->id) : 0;
-        if (bit && !(surf_blit_logged & bit)) {
-          surf_blit_logged |= bit;
-          serial_puts("[surf] first blit win="); serial_puthex((uint64_t)f->id);
-          serial_puts(" size=");                 serial_puthex((uint64_t)sw);
-          serial_puts("x");                      serial_puthex((uint64_t)sh);
+        static int logged_w[WINIPC_MAX], logged_h[WINIPC_MAX];
+        if (f->id >= 0 && f->id < WINIPC_MAX &&
+            (logged_w[f->id] != sw || logged_h[f->id] != sh)) {
+          logged_w[f->id] = sw; logged_h[f->id] = sh;
+          serial_puts("[surf] blit win="); serial_puthex((uint64_t)f->id);
+          serial_puts(" surface=");         serial_puthex((uint64_t)sw);
+          serial_puts("x");                 serial_puthex((uint64_t)sh);
+          serial_puts(" client=");          serial_puthex((uint64_t)cw);
+          serial_puts("x");                 serial_puthex((uint64_t)ch);
           serial_puts("\n");
         }
       }
@@ -5695,6 +5818,7 @@ static void gui_poll_input(void) {
   /* Release dragging on mouse up */
   if (left_release) {
     if (resize_app != APP_NONE) resize_app = APP_NONE;
+    fwin_rz = -1;
     dragging_window = DRAG_NONE;
     drag_app = APP_NONE;
     wg_drag = -1;
@@ -5710,6 +5834,22 @@ static void gui_poll_input(void) {
     if (ny > (int)screen_height - 40) ny = screen_height - 40;
     a->x = nx; a->y = ny;
     needs_redraw = 1;
+  }
+  if (fwin_rz >= 0 && left_held) {
+    fwin_t *f = &fwin[fwin_rz];
+    if (f->used && !f->minimized) {
+      int nw = new_x + fwin_rz_dx - f->x;
+      int nh = new_y + fwin_rz_dy - f->y;
+      if (nw < 240) nw = 240;
+      if (nh < 160) nh = 160;
+      if (f->x + nw > (int)screen_width - 2) nw = (int)screen_width - 2 - f->x;
+      if (f->y + nh > taskbar_y() - 2) nh = taskbar_y() - 2 - f->y;
+      if (nw != f->w || nh != f->h) {
+        f->w = nw; f->h = nh;
+        fwin_notify_geometry(fwin_rz);
+        full_redraw = 1; needs_redraw = 1;
+      }
+    }
   }
   if (resize_app != APP_NONE && left_held) {
     meep_app_t *a = &mapp[resize_app];
