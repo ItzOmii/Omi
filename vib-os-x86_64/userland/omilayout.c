@@ -627,6 +627,16 @@ static void layout_text(GumboText *t, st_t *st) {
 typedef struct { char txt[TBL_CELLW]; uint8_t head; } tcell_t;
 static tcell_t tbl[TBL_ROWS][TBL_COLS];
 
+/* A forced line break inside a cell's flattened text. Cells are one string, and
+ * the things that filled them were block elements: a footer cell holding a <ul>
+ * of links used to come out as "Registry.INT Registry.ARPA Registry" because the
+ * block boundaries - the only thing separating them - were dropped. */
+#define CELL_BREAK '\x01'
+
+static void tbl_sep(char *out, int cap, int *pn) {
+  if (*pn > 0 && *pn < cap - 1 && out[*pn - 1] != CELL_BREAK) out[(*pn)++] = CELL_BREAK;
+}
+
 static void tbl_text(GumboNode *n, char *out, int cap, int *pn, int depth) {
   if (!n || depth > 12) return;
   if (n->type == GUMBO_NODE_TEXT) {
@@ -638,11 +648,11 @@ static void tbl_text(GumboNode *n, char *out, int cap, int *pn, int depth) {
     return;
   }
   if (n->type != GUMBO_NODE_ELEMENT) return;
-  if (n->v.element.tag == GUMBO_TAG_BR || n->v.element.tag == GUMBO_TAG_P) {
-    if (*pn > 0 && out[*pn - 1] != ' ' && *pn < cap - 1) out[(*pn)++] = ' ';
-  }
+  int block = is_block_tag(n->v.element.tag);
+  if (block) tbl_sep(out, cap, pn);
   GumboVector *k = &n->v.element.children;
   for (unsigned i = 0; i < k->length; i++) tbl_text(k->data[i], out, cap, pn, depth + 1);
+  if (block) tbl_sep(out, cap, pn);
 }
 
 static void tbl_rows(GumboNode *n, GumboNode **rows, int *nr, int depth) {
@@ -664,9 +674,10 @@ static int wrap_count(const char *s, int font, int width) {
   int lines = 1, w = 0, sp = tw(font, " ");
   while (*s) {
     while (*s == ' ') s++;
+    while (*s == CELL_BREAK) { s++; if (w || lines) { lines++; w = 0; } }
     if (!*s) break;
     char word[64]; int len = 0;
-    while (*s && *s != ' ' && len < 63) word[len++] = *s++;
+    while (*s && *s != ' ' && *s != CELL_BREAK && len < 63) word[len++] = *s++;
     word[len] = 0;
     int ww = tw(font, word);
     if (w && w + sp + ww > width) { lines++; w = ww; }
@@ -681,9 +692,10 @@ static void draw_wrapped(const char *s, int font, uint32_t color, int x, int y,
   int cx = x, cy = y, sp = tw(font, " ");
   while (*s) {
     while (*s == ' ') s++;
+    while (*s == CELL_BREAK) { s++; if (cx != x) { cx = x; cy += lh; } }
     if (!*s) break;
     char word[64]; int len = 0;
-    while (*s && *s != ' ' && len < 63) word[len++] = *s++;
+    while (*s && *s != ' ' && *s != CELL_BREAK && len < 63) word[len++] = *s++;
     word[len] = 0;
     int ww = tw(font, word);
     if (cx > x && cx + ww > x + width) { cx = x; cy += lh; }

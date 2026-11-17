@@ -70,8 +70,11 @@ static void blend(int x, int y, int w, int h, unsigned c, int a) {
  * rather than how much it asked to draw. Reset it before a paint pass. */
 static int text_glyph_pixels;
 
-static void glyph(int x, int y, char ch, unsigned c) {
-  int idx = (unsigned char)ch - GLYPH_FIRST;
+/* `code`, not `ch`: a client defines CH as its live height (#define CH ch in
+ * ominet.c), so a parameter called ch silently rewrote the bottom bound into
+ * "py >= <character code>" and sheared every glyph below its ASCII value. */
+static void glyph(int x, int y, char code, unsigned c) {
+  int idx = (unsigned char)code - GLYPH_FIRST;
   if (idx < 0 || idx > GLYPH_LAST - GLYPH_FIRST) return;
   const unsigned char *rows = glyphs[idx];
   for (int r = 0; r < GLYPH_H; r++) {

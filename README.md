@@ -265,7 +265,8 @@ it a real engine rather than a tag stripper:
 - **Text** through stb_truetype with the real Bricolage Grotesque and JetBrains Mono faces.
 - **Images** decoded system-wide by stb_image (PNG and JPEG), not just in the browser.
 - **Links are clickable** and resolved against the page they came from; **tables get genuine
-  per-column widths** from their own layout pass.
+  per-column widths** from their own layout pass, and a cell that holds block children (a footer
+  column of links) breaks them onto their own lines instead of running them together.
 - **Typed URLs work**: `/` opens the address strip, Enter navigates, Esc drops it, and a 301/302/303/
   307/308 is followed up to five hops — `iana.org` lands on `www.iana.org` instead of an error page.
 - **The window comes up before the network does.** Chrome and a status line — `loading host (2/3)` —
@@ -296,8 +297,14 @@ it a real engine rather than a tag stripper:
 - **Windows resize, and the page reflows.** `□` fills the work area and the grip drags a corner; the
   frame tells the client its new size, the client resizes its surface and re-lays the document out
   from the HTML it still holds, so this is a reflow and not a reload. The text is laid out in a
-  column of at most 640 px and centred, because past that the table renderer starts losing cell text
-  - and a capped column is what a browser does with a long article anyway.
+  centred column of at most 640 px: a long article at 1280 px is a hard read, and the full width is
+  still used for the paper, the rules and the table's own columns.
+- **Glyphs are drawn against the right bound.** `omitext.h` names its size `CW`/`CH`, and clients
+  define those as live variables (`#define CH ch` in `ominet.c`). The rasteriser's character
+  parameter used to be called `ch` too, so `py >= CH` compiled to `py >= <character code>`: every
+  row below a glyph's ASCII value was dropped. Ascenders went first, which is why a heading read as
+  `^` for `A`, and past ~128 px nothing drew at all - a full-screen page looked empty while the
+  display list and the paint counters both said it was fine. The parameter is `code` now.
 - **A second page costs a request, not a handshake.** The fetch keeps its connection: DNS, TCP and
   TLS are paid once per host, so following a link on the same site is ~240 ms where it used to be
   1.7 s. The read stops when the body ends - at `Content-Length`, or at the zero-length chunk when

@@ -291,8 +291,8 @@ static void paint(long win, int off) {
   clip_none();
   if (dbg_ink) {
     int ink = 0;
-    for (int y = CONTENT_TOP; y < ch; y += 2)
-      for (int x = 0; x < cw; x += 2)
+    for (int y = CONTENT_TOP; y < ch; y++)
+      for (int x = 0; x < cw; x++)
         if ((pix[y * cw + x] & 0xFFFFFF) < 0x404040u) ink++;
     printf("[net] ink=%d of %dx%d\n", ink, cw, ch);
   }

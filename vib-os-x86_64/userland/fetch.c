@@ -19,6 +19,25 @@
  *      name matches no chain - presenting as "not trusted" on a good chain.
  */
 #include <bearssl.h>
+
+/* This libc has no strcasestr, and an implicit declaration makes the compiler
+ * assume it returns int - which truncates a 64-bit pointer. Header detection
+ * silently pointed into nowhere. Roll the search here instead. */
+static char *omi_strcasestr(const char *hay, const char *needle) {
+  if (!*needle) return (char *)hay;
+  for (; *hay; hay++) {
+    const char *h = hay, *n = needle;
+    while (*h && *n) {
+      char a = *h >= 'A' && *h <= 'Z' ? *h + 32 : *h;
+      char b = *n >= 'A' && *n <= 'Z' ? *n + 32 : *n;
+      if (a != b) break;
+      h++; n++;
+    }
+    if (!*n) return (char *)hay;
+  }
+  return 0;
+}
+#define strcasestr omi_strcasestr
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
