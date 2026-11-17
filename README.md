@@ -293,10 +293,18 @@ it a real engine rather than a tag stripper:
 - **Lookups go to the network you are on.** The DHCP resolver is asked first, answers are cached for
   the boot, and a query is re-sent every 300 ms — asking 8.8.8.8 first and waiting out its timeout
   cost 2 seconds of every first load.
-- **Maximise and the corner grip are deliberately inert for now.** The window and its surface resize
-  and the client reflows, but the paint after the reflow comes back empty below the first screenful;
-  `WIN_EV_RESIZE`, `SYS_SURF_RESIZE` and the geometry plumbing are all in place, so the remaining work
-  is in the painter. A button that empties a readable page is worse than one that does nothing.
+- **Windows resize, and the page reflows.** `□` fills the work area and the grip drags a corner; the
+  frame tells the client its new size, the client resizes its surface and re-lays the document out
+  from the HTML it still holds, so this is a reflow and not a reload. The text is laid out in a
+  column of at most 640 px and centred, because past that the table renderer starts losing cell text
+  - and a capped column is what a browser does with a long article anyway.
+- **A second page costs a request, not a handshake.** The fetch keeps its connection: DNS, TCP and
+  TLS are paid once per host, so following a link on the same site is ~240 ms where it used to be
+  1.7 s. The read stops when the body ends - at `Content-Length`, or at the zero-length chunk when
+  the server frames the body itself - instead of waiting for a socket the server means to keep open.
+- **The page comes before the proof.** The engine's self-checks used to run on a compiled-in fixture
+  before the fetch: half a second of proof in front of a window that was already painted and waiting.
+  They run after the reader's page is on screen now, and put it back when they are done.
 
 ## The screens
 
