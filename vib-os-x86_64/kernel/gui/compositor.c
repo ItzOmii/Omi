@@ -4556,13 +4556,19 @@ int winipc_input(int mx, int my, int buttons, int pressed, int released, int whe
         needs_redraw = 1; full_redraw = 1;
         return 1;
       }
-      if (wc == 2) {
-        /* Maximise and the corner grip are deliberately inert until the browser
-         * can paint a resized client: the window resizes and the surface follows,
-         * but the page comes back empty below its first screenful, and a button
-         * that turns a readable page into a blank one is worse than one that does
-         * nothing. The machinery is in place (WIN_EV_RESIZE, SYS_SURF_RESIZE,
-         * fwin_notify_geometry) - it is the paint after the reflow that is wrong. */
+      if (wc == 2) {                                      /* maximise / restore */
+        if (!f->maxed) {
+          f->rx = f->x; f->ry = f->y; f->rw = f->w; f->rh = f->h;
+          f->x = 0; f->y = 0;
+          f->w = (int)screen_width;
+          f->h = taskbar_y();
+          f->maxed = 1;
+        } else {
+          if (f->rw > 0) { f->x = f->rx; f->y = f->ry; f->w = f->rw; f->h = f->rh; }
+          f->maxed = 0;
+        }
+        fwin_notify_geometry(hit);
+        needs_redraw = 1; full_redraw = 1;
         return 1;
       }
       fwin_drag = hit;

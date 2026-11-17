@@ -29,6 +29,7 @@
 #define SYS_SURF_CREATE  35
 #define SYS_SURF_PRESENT 36
 #define SYS_SURF_RESIZE  37
+#define SYS_TICKS        4
 
 #define WIN_W  440
 #define WIN_H  360
@@ -57,8 +58,15 @@ static int ch = WIN_H - 32;
  * area, which looks exactly like an empty page. Until that is fixed, the column
  * is capped and centred - the same thing a browser does with a max-width
  * article, and legible at any window size. */
+/* The column a page is laid out in. Capped and centred rather than stretched to
+ * the window: at full-screen widths the table renderer loses its cell text
+ * entirely - the rules and the nav survive, the rows do not - and a 640 px column
+ * is both what the renderer gets right and what a browser does with a long
+ * article. */
+#define PAGE_MAX_W 640
 static int page_measure(void) {
   int w = cw - 2 * MARGIN;
+  if (w > PAGE_MAX_W) w = PAGE_MAX_W;
   if (w < 40) w = 40;
   return w;
 }
@@ -97,6 +105,7 @@ static int measure_w, content_h, scroll;
  * the fixture at startup - and painting it would show a page that is not the one
  * being fetched. The status frames suppress the display list entirely. */
 static int show_ops = 1;
+static int dbg_ink = 0;   /* surface ink probe: flip to 1 to measure a paint */
 
 /* After the surface and its size: the rasteriser works on the includer's pix,
  * cw and ch, which is what makes it shareable by two clients. */
@@ -280,6 +289,13 @@ static void paint(long win, int off) {
     }
   }
   clip_none();
+  if (dbg_ink) {
+    int ink = 0;
+    for (int y = CONTENT_TOP; y < ch; y += 2)
+      for (int x = 0; x < cw; x += 2)
+        if ((pix[y * cw + x] & 0xFFFFFF) < 0x404040u) ink++;
+    printf("[net] ink=%d of %dx%d\n", ink, cw, ch);
+  }
 
   /* A scrollbar, because a page that can move should say so - and because it is
    * the one element whose position an outside check can predict. */
@@ -393,6 +409,8 @@ int main(void) {
   pix = (unsigned *)s;
   measure_w = page_measure();
 
+  long t_start = sys3(SYS_TICKS, 0, 0, 0);
+
   /* First frame, before anything that can fail or take time. The window exists
    * from SYS_WIN_OPEN onward, but its surface holds whatever the compositor last
    * had there - black - until this process presents something. A fetch is
@@ -401,34 +419,12 @@ int main(void) {
    * process that died. Chrome and a status line go up first, always. */
   show_status("starting");
 
-  /* ---- the fixture page: what the engine has to do with CSS ----
-   * A fetched page is whatever it is tomorrow, so the proof is compiled in: a
-   * background colour, padding, a stylesheet colour on text, and a list. */
-  static const char *const fixture =
-    "<!doctype html><html><head><title>fixture</title>"
-    "<style>p{color:#00ff00}</style></head><body>"
-    "<div style=\"background:#3366cc;padding:12px\">boxed</div>"
-    "<p>green paragraph text, long enough to wrap at this width, so the wrap "
-    "is exercised as well as the colour</p>"
-    "<ul><li>one item</li><li>two item</li></ul></body></html>";
-  int fx = web_build(fixture, (int)strlen(fixture), measure_w, user_measure) == 0;
-  check(fx, "the engine builds the fixture", fx, 1);
-  int ftext = 0, green = 0, blue_h = 0;
-  for (int i = 0; i < web_count(); i++) {
-    const web_op_t *o = &web_ops()[i];
-    if (o->kind == 0 && (o->color & 0xFFFFFF) == 0x3366CC && o->h > blue_h) blue_h = o->h;
-    if (o->text) { ftext++; if ((o->color & 0xFFFFFF) == 0x00FF00) green++; }
-  }
-  printf("[net] fixture %d ops, %d text runs, background box %d px tall, height %d\n",
-         web_count(), ftext, blue_h, web_height());
-  check(blue_h >= 24, "a padded background is as tall as its padding plus a line",
-        blue_h, 24);
-  check(green > 0, "a stylesheet colour reaches a text run", green, 1);
-  check(ftext >= 3, "the fixture laid its text out", ftext, 3);
-  check(web_height() > 0, "the fixture has a height", web_height(), 1);
-
-  /* ---- fetch the real page ---- */
+  printf("[net] t=first-fetch %ldms after launch\n",
+         (sys3(SYS_TICKS, 0, 0, 0) - t_start) * 10);
   load_page();
+  printf("[net] t=page-painted %ldms after launch\n",
+         (sys3(SYS_TICKS, 0, 0, 0) - t_start) * 10);
+
   check(last_ip[0] && strchr(last_ip, '.'), "the kernel resolved the name",
         (long)strlen(last_ip), 7);
   check(last_status == 200, "the page answers 200 over TLS", last_status, 200);
@@ -500,6 +496,46 @@ int main(void) {
         pix[my * cw + MARGIN], (long)C_MARK);
   long r = sys3(SYS_SURF_PRESENT, win_id, 0, ((long)cw << 16) | ch);
   check(r == 0, "presenting the page succeeds", r, 0);
+
+
+  /* ---- the self-checks come after the reader has their page ----
+   * They prove the engine's contract with a compiled-in fixture, and they used to
+   * run before the fetch: half a second of proof in front of every launch, in
+   * front of a window that was already painted and waiting. Now the page is on
+   * screen first and the checks rebuild the fixture over it, so the last thing
+   * this block does is put the real page back. */
+  /* ---- the fixture page: what the engine has to do with CSS ----
+   * A fetched page is whatever it is tomorrow, so the proof is compiled in: a
+   * background colour, padding, a stylesheet colour on text, and a list. */
+  static const char *const fixture =
+    "<!doctype html><html><head><title>fixture</title>"
+    "<style>p{color:#00ff00}</style></head><body>"
+    "<div style=\"background:#3366cc;padding:12px\">boxed</div>"
+    "<p>green paragraph text, long enough to wrap at this width, so the wrap "
+    "is exercised as well as the colour</p>"
+    "<ul><li>one item</li><li>two item</li></ul></body></html>";
+  int fx = web_build(fixture, (int)strlen(fixture), measure_w, user_measure) == 0;
+  check(fx, "the engine builds the fixture", fx, 1);
+  int ftext = 0, green = 0, blue_h = 0;
+  for (int i = 0; i < web_count(); i++) {
+    const web_op_t *o = &web_ops()[i];
+    if (o->kind == 0 && (o->color & 0xFFFFFF) == 0x3366CC && o->h > blue_h) blue_h = o->h;
+    if (o->text) { ftext++; if ((o->color & 0xFFFFFF) == 0x00FF00) green++; }
+  }
+  printf("[net] fixture %d ops, %d text runs, background box %d px tall, height %d\n",
+         web_count(), ftext, blue_h, web_height());
+  check(blue_h >= 24, "a padded background is as tall as its padding plus a line",
+        blue_h, 24);
+  check(green > 0, "a stylesheet colour reaches a text run", green, 1);
+  check(ftext >= 3, "the fixture laid its text out", ftext, 3);
+  check(web_height() > 0, "the fixture has a height", web_height(), 1);
+
+  /* put the fetched page back: the fixture proved the engine, it is not what the
+   * reader asked for */
+  if (last_blen > 0 && web_build(page, (int)last_blen, measure_w, user_measure) == 0) {
+    content_h = web_height();
+    paint(win_id, 0);
+  }
 
   printf("[net] %d/%d\n", checks - fails, checks);
   if (fails) {

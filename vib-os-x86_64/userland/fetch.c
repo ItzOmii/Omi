@@ -174,7 +174,11 @@ static int handshake(int fd, const char *sni, const char **why) {
 
 /* Read until the peer closes or the buffer is full. A page is not a header
  * block: there is no point at which the answer is "complete enough". */
-static long exchange_all(int fd, const char *req, char *out, size_t cap) {
+/* A connection worth keeping: the response said how long it is and did not ask
+ * for the socket back. Without a length there is no way to know the body ended
+ * except EOF, and EOF means the connection is gone by definition. */
+static long exchange_all(int fd, const char *req, char *out, size_t cap,
+                         int *keep_out) {
   size_t rlen = strlen(req), total = 0;
 
   size_t alen = 0;
@@ -184,6 +188,9 @@ static long exchange_all(int fd, const char *req, char *out, size_t cap) {
   br_ssl_engine_sendapp_ack(&cc.eng, rlen);
   br_ssl_engine_flush(&cc.eng, 0);
 
+  long want = -1;           /* total bytes to stop at, once the headers are in */
+  int chunked = 0;          /* the body frames itself: stop at the end marker */
+  *keep_out = 0;
   for (int guard = 0; guard < 20000 && total + 1 < cap; guard++) {
     unsigned st = br_ssl_engine_current_state(&cc.eng);
     if (st & BR_SSL_CLOSED) break;
@@ -208,6 +215,38 @@ static long exchange_all(int fd, const char *req, char *out, size_t cap) {
       memcpy(out + total, b, take);
       total += take;
       br_ssl_engine_recvapp_ack(&cc.eng, len);
+      /* Once the headers are complete, decide how much body to expect. */
+      if (want < 0) {
+        out[total] = 0;
+        char *he = strstr(out, "\r\n\r\n");
+        if (he) {
+          long hlen = (he + 4) - out;
+          long cl = -1;
+          const char *p = strcasestr(out, "\r\nContent-Length:");
+          if (p && p < he) cl = atol(p + 17);
+          int close_asked = 0;
+          const char *cx = strcasestr(out, "\r\nConnection:");
+          if (cx && cx < he) {
+            const char *v = cx + 13;
+            while (*v == ' ') v++;
+            if (!strncasecmp(v, "close", 5)) close_asked = 1;
+          }
+          const char *te = strcasestr(out, "\r\nTransfer-Encoding:");
+          if (te && te < he) {
+            const char *v = te + 20;
+            while (*v == ' ') v++;
+            if (!strncasecmp(v, "chunked", 7)) chunked = 1;
+          }
+          /* Chunked framing delimits the body itself, so the socket can be kept
+           * even though there is no length - and, more importantly, the read has
+           * a reason to stop instead of waiting for a peer that is under no
+           * obligation to close. */
+          if (chunked && !close_asked) *keep_out = 1;
+          if (cl >= 0 && !close_asked) { want = hlen + cl; *keep_out = 1; }
+        }
+      }
+      if (want >= 0 && total >= want) break;
+      if (chunked && total >= 7 && !memcmp(out + total - 7, "\r\n0\r\n\r\n", 7)) break;
     } else break;
   }
   out[total] = 0;
@@ -221,6 +260,40 @@ static char last_location[256];
 
 const char *https_get_location(void) { return last_location; }
 
+/* One connection, kept between navigations. A TLS handshake costs most of a
+ * second on this machine, and every click used to pay for a new one. */
+static int  ka_fd = -1;
+static char ka_host[128];
+static char ka_ip[16];
+static int  ka_port;
+
+/* HTTP/1.1 lets a server frame the body as chunks. Peel the framing off in place
+ * so the renderer sees a document and not a wall of hex lengths. */
+static long dechunk(char *b, long len) {
+  long out = 0, i = 0;
+  while (i < len) {
+    long n = 0;
+    int digits = 0;
+    while (i < len && b[i] != '\r' && b[i] != '\n' && b[i] != ';') {
+      char c = b[i];
+      int d = (c >= '0' && c <= '9') ? c - '0'
+            : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+            : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+      if (d < 0) break;
+      n = n * 16 + d; digits++; i++;
+    }
+    while (i < len && b[i] != '\n') i++;
+    i++;
+    if (!digits || n <= 0) break;
+    if (i + n > len) n = len - i;
+    if (out != i) memmove(b + out, b + i, (size_t)n);
+    out += n; i += n;
+    while (i < len && (b[i] == '\r' || b[i] == '\n')) i++;
+  }
+  b[out] = 0;
+  return out;
+}
+
 long https_get(const char *host, int port, const char *path,
                char *out, size_t cap, const char **why, long *body_len,
                char *ip_used) {
@@ -230,32 +303,53 @@ long https_get(const char *host, int port, const char *path,
   if (ip_used) ip_used[0] = 0;
 
   char ip[16];
+  int reused = 0;
   long t0 = sys3(SYS_TICKS, 0, 0, 0);
-  if (resolve_host(host, ip) != 0) { *why = "resolve"; return -1; }
+  if (ka_fd >= 0 && ka_port == port && !strcmp(ka_host, host)) {
+    /* Same host, live socket: no resolver, no dial, no handshake. */
+    memcpy(ip, ka_ip, sizeof ip);
+    reused = 1;
+  } else {
+    if (ka_fd >= 0) { close(ka_fd); ka_fd = -1; }
+    if (resolve_host(host, ip) != 0) { *why = "resolve"; return -1; }
+  }
   long t1 = sys3(SYS_TICKS, 0, 0, 0);
   if (ip_used) snprintf(ip_used, 16, "%s", ip);
 
   const char *sni = host;
-  int fd = dial(ip, port);
-  if (fd < 0) { *why = "connect"; return -1; }
+  int fd = ka_fd;
+  if (!reused) {
+    fd = dial(ip, port);
+    if (fd < 0) { *why = "connect"; return -1; }
+  }
 
   long t2 = sys3(SYS_TICKS, 0, 0, 0);
-  if (!handshake(fd, sni, why)) { close(fd); return -1; }
+  if (!reused && !handshake(fd, sni, why)) { close(fd); return -1; }
   long t3 = sys3(SYS_TICKS, 0, 0, 0);
 
   char req[192];
   int n = snprintf(req, sizeof req,
-                   "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n"
-                   "User-Agent: omi-net\r\n\r\n", path, sni);
-  if (n <= 0 || (size_t)n >= sizeof req) { *why = "request"; close(fd); return -1; }
+                   "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n"
+                   "User-Agent: omi-net\r\nAccept-Encoding: identity\r\n\r\n", path, sni);
+  if (n <= 0 || (size_t)n >= sizeof req) { *why = "request"; close(fd); ka_fd = -1; return -1; }
 
-  long got = exchange_all(fd, req, out, cap);
+  int keep = 0;
+  long got = exchange_all(fd, req, out, cap, &keep);
   long t4 = sys3(SYS_TICKS, 0, 0, 0);
-  close(fd);
+  if (keep && got > 0) {
+    ka_fd = fd;
+    snprintf(ka_host, sizeof ka_host, "%s", host);
+    memcpy(ka_ip, ip, sizeof ka_ip);
+    ka_port = port;
+  } else {
+    close(fd);
+    ka_fd = -1;
+  }
   /* Where the seconds go, in one line: resolve, dial, TLS handshake, body. A
    * "slow" browser is not a diagnosis, and guessing at which stage is wrong
    * about as often as it is right. */
-  printf("[net] timing resolve=%ldms dial=%ldms tls=%ldms body=%ldms total=%ldms\n",
+  printf("[net] timing%s resolve=%ldms dial=%ldms tls=%ldms body=%ldms total=%ldms\n",
+         reused ? " (reused)" : "",
          (t1 - t0) * 10, (t2 - t1) * 10, (t3 - t2) * 10, (t4 - t3) * 10, (t4 - t0) * 10);
   if (got < 0) { *why = "exchange"; return -1; }
 
@@ -283,6 +377,14 @@ long https_get(const char *host, int port, const char *path,
   }
   long hlen = (hdr_end + 4) - out;
   long blen = got - hlen;
+  {
+    const char *te = strcasestr(out, "\r\nTransfer-Encoding:");
+    if (te && te < hdr_end) {
+      const char *v = te + 20;
+      while (*v == ' ') v++;
+      if (!strncasecmp(v, "chunked", 7)) blen = dechunk(hdr_end + 4, blen);
+    }
+  }
   memmove(out, hdr_end + 4, (size_t)blen + 1);   /* the body in place */
   if (body_len) *body_len = blen;
   return status;
