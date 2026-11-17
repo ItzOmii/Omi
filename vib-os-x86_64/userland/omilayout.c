@@ -571,15 +571,325 @@ static int is_block_tag(GumboTag t) {
 }
 
 /* collapse runs of whitespace, drop control bytes and anything non-ASCII */
+/* --------------------------------------------------------- folding to ASCII
+ * The font is 8x16 ASCII (glyphs.h, generated from kernel/gui/font.c), and the
+ * old cleaner dropped every byte above 126. Real pages are full of exactly those
+ * bytes: "IETF\xAE" lost its mark, "Z\xFCrich" lost the umlaut, and a page served
+ * as Latin-1 lost whole words. Fold what the font cannot draw into the nearest
+ * thing it can, where text becomes printable (clean_text), so the widths the
+ * wrapper measures are the widths the rasteriser draws. Replace this with real
+ * glyphs when the font grows. */
+typedef struct { unsigned short cp; const char *asc; } fold_t;
+static const fold_t fold_tbl[] = {
+  {0x00A0, " "},
+  {0x00A1, "!"},
+  {0x00A2, "c"},
+  {0x00A3, "GBP"},
+  {0x00A4, "$"},
+  {0x00A5, "JPY"},
+  {0x00A6, "|"},
+  {0x00A7, "S"},
+  {0x00A8, "\""},
+  {0x00A9, "(c)"},
+  {0x00AA, "a"},
+  {0x00AB, "\""},
+  {0x00AC, "!"},
+  {0x00AD, "-"},
+  {0x00AE, "(r)"},
+  {0x00AF, "-"},
+  {0x00B0, "o"},
+  {0x00B1, "+/-"},
+  {0x00B2, "2"},
+  {0x00B3, "3"},
+  {0x00B4, "'"},
+  {0x00B5, "u"},
+  {0x00B6, "P"},
+  {0x00B7, "*"},
+  {0x00B8, ","},
+  {0x00B9, "1"},
+  {0x00BA, "o"},
+  {0x00BB, "\""},
+  {0x00BC, "1/4"},
+  {0x00BD, "1/2"},
+  {0x00BE, "3/4"},
+  {0x00BF, "?"},
+  {0x00C0, "A"},
+  {0x00C1, "A"},
+  {0x00C2, "A"},
+  {0x00C3, "A"},
+  {0x00C4, "A"},
+  {0x00C5, "A"},
+  {0x00C6, "AE"},
+  {0x00C7, "C"},
+  {0x00C8, "E"},
+  {0x00C9, "E"},
+  {0x00CA, "E"},
+  {0x00CB, "E"},
+  {0x00CC, "I"},
+  {0x00CD, "I"},
+  {0x00CE, "I"},
+  {0x00CF, "I"},
+  {0x00D0, "D"},
+  {0x00D1, "N"},
+  {0x00D2, "O"},
+  {0x00D3, "O"},
+  {0x00D4, "O"},
+  {0x00D5, "O"},
+  {0x00D6, "O"},
+  {0x00D7, "x"},
+  {0x00D8, "O"},
+  {0x00D9, "U"},
+  {0x00DA, "U"},
+  {0x00DB, "U"},
+  {0x00DC, "U"},
+  {0x00DD, "Y"},
+  {0x00DE, "TH"},
+  {0x00DF, "ss"},
+  {0x00E0, "a"},
+  {0x00E1, "a"},
+  {0x00E2, "a"},
+  {0x00E3, "a"},
+  {0x00E4, "a"},
+  {0x00E5, "a"},
+  {0x00E6, "ae"},
+  {0x00E7, "c"},
+  {0x00E8, "e"},
+  {0x00E9, "e"},
+  {0x00EA, "e"},
+  {0x00EB, "e"},
+  {0x00EC, "i"},
+  {0x00ED, "i"},
+  {0x00EE, "i"},
+  {0x00EF, "i"},
+  {0x00F0, "d"},
+  {0x00F1, "n"},
+  {0x00F2, "o"},
+  {0x00F3, "o"},
+  {0x00F4, "o"},
+  {0x00F5, "o"},
+  {0x00F6, "o"},
+  {0x00F7, "/"},
+  {0x00F8, "o"},
+  {0x00F9, "u"},
+  {0x00FA, "u"},
+  {0x00FB, "u"},
+  {0x00FC, "u"},
+  {0x00FD, "y"},
+  {0x00FE, "th"},
+  {0x00FF, "y"},
+  {0x0100, "A"},
+  {0x0101, "a"},
+  {0x0102, "A"},
+  {0x0103, "a"},
+  {0x0104, "A"},
+  {0x0105, "a"},
+  {0x0106, "C"},
+  {0x0107, "c"},
+  {0x0108, "C"},
+  {0x0109, "c"},
+  {0x010A, "C"},
+  {0x010B, "c"},
+  {0x010C, "C"},
+  {0x010D, "c"},
+  {0x010E, "D"},
+  {0x010F, "d"},
+  {0x0110, "D"},
+  {0x0111, "d"},
+  {0x0112, "E"},
+  {0x0113, "e"},
+  {0x0114, "E"},
+  {0x0115, "e"},
+  {0x0116, "E"},
+  {0x0117, "e"},
+  {0x0118, "E"},
+  {0x0119, "e"},
+  {0x011A, "E"},
+  {0x011B, "e"},
+  {0x011C, "G"},
+  {0x011D, "g"},
+  {0x011E, "G"},
+  {0x011F, "g"},
+  {0x0120, "G"},
+  {0x0121, "g"},
+  {0x0122, "G"},
+  {0x0123, "g"},
+  {0x0124, "H"},
+  {0x0125, "h"},
+  {0x0126, "H"},
+  {0x0127, "h"},
+  {0x0128, "I"},
+  {0x0129, "i"},
+  {0x012A, "I"},
+  {0x012B, "i"},
+  {0x012C, "I"},
+  {0x012D, "i"},
+  {0x012E, "I"},
+  {0x012F, "i"},
+  {0x0130, "I"},
+  {0x0131, "i"},
+  {0x0132, "I"},
+  {0x0133, "J"},
+  {0x0134, "J"},
+  {0x0135, "j"},
+  {0x0136, "J"},
+  {0x0137, "j"},
+  {0x0138, "k"},
+  {0x0139, "L"},
+  {0x013A, "l"},
+  {0x013B, "L"},
+  {0x013C, "l"},
+  {0x013D, "L"},
+  {0x013E, "l"},
+  {0x013F, "L"},
+  {0x0140, "l"},
+  {0x0141, "L"},
+  {0x0142, "l"},
+  {0x0143, "N"},
+  {0x0144, "n"},
+  {0x0145, "N"},
+  {0x0146, "n"},
+  {0x0147, "N"},
+  {0x0148, "n"},
+  {0x0149, "n"},
+  {0x014A, "N"},
+  {0x014B, "n"},
+  {0x014C, "N"},
+  {0x014D, "n"},
+  {0x014E, "N"},
+  {0x014F, "n"},
+  {0x0150, "N"},
+  {0x0151, "n"},
+  {0x0152, "O"},
+  {0x0153, "E"},
+  {0x0154, "R"},
+  {0x0155, "r"},
+  {0x0156, "R"},
+  {0x0157, "r"},
+  {0x0158, "R"},
+  {0x0159, "r"},
+  {0x015A, "S"},
+  {0x015B, "s"},
+  {0x015C, "S"},
+  {0x015D, "s"},
+  {0x015E, "S"},
+  {0x015F, "s"},
+  {0x0160, "S"},
+  {0x0161, "s"},
+  {0x0162, "T"},
+  {0x0163, "t"},
+  {0x0164, "T"},
+  {0x0165, "t"},
+  {0x0166, "T"},
+  {0x0167, "t"},
+  {0x0168, "U"},
+  {0x0169, "u"},
+  {0x016A, "U"},
+  {0x016B, "u"},
+  {0x016C, "U"},
+  {0x016D, "u"},
+  {0x016E, "U"},
+  {0x016F, "u"},
+  {0x0170, "U"},
+  {0x0171, "u"},
+  {0x0172, "U"},
+  {0x0173, "u"},
+  {0x0174, "W"},
+  {0x0175, "w"},
+  {0x0176, "W"},
+  {0x0177, "w"},
+  {0x0178, "W"},
+  {0x0179, "w"},
+  {0x017A, "W"},
+  {0x017B, "w"},
+  {0x017F, "s"},
+  {0x017D, "Z"},
+  {0x017E, "z"},
+  {0x2018, "'"},
+  {0x2019, "'"},
+  {0x201A, "'"},
+  {0x201B, "'"},
+  {0x201C, "\""},
+  {0x201D, "\""},
+  {0x201E, "\""},
+  {0x201F, "\""},
+  {0x2010, "-"},
+  {0x2011, "-"},
+  {0x2012, "-"},
+  {0x2013, "-"},
+  {0x2014, "-"},
+  {0x2015, "-"},
+  {0x2022, "*"},
+  {0x2026, "..."},
+  {0x2032, "'"},
+  {0x2033, "\""},
+  {0x2039, "<"},
+  {0x203A, ">"},
+  {0x2044, "/"},
+  {0x20AC, "EUR"},
+  {0x2116, "No"},
+  {0x2122, "(tm)"},
+  {0x2190, "<"},
+  {0x2192, ">"},
+  {0x2191, "^"},
+  {0x2193, "v"},
+  {0x2212, "-"},
+  {0x2215, "/"},
+  {0x2260, "!="},
+  {0x2264, "<="},
+  {0x2265, ">="},
+  {0x2009, " "},
+  {0x200A, " "},
+  {0x202F, " "},
+  {0x2007, " "},
+  {0x200B, ""},
+  {0x200C, ""},
+  {0x200D, ""},
+  {0xFEFF, ""},
+};
+static const char *fold_cp(int cp) {
+  for (unsigned i = 0; i < sizeof fold_tbl / sizeof fold_tbl[0]; i++)
+    if (fold_tbl[i].cp == cp) return fold_tbl[i].asc;
+  return "?";                      /* an unknown letter must not vanish */
+}
+/* One UTF-8 sequence, or a bare Latin-1 byte. Returns the bytes consumed. */
+static int utf8_next(const char *s, int len, int *cp) {
+  unsigned char c = (unsigned char)s[0];
+  if (c < 0x80) { *cp = c; return 1; }
+  int need = 0, v = 0;
+  if ((c & 0xE0) == 0xC0) { need = 1; v = c & 0x1F; }
+  else if ((c & 0xF0) == 0xE0) { need = 2; v = c & 0x0F; }
+  else if ((c & 0xF8) == 0xF0) { need = 3; v = c & 0x07; }
+  else { *cp = c; return 1; }                  /* stray Latin-1 high byte */
+  if (need + 1 > len) { *cp = c; return 1; }
+  for (int i = 1; i <= need; i++) {
+    unsigned char cc = (unsigned char)s[i];
+    if ((cc & 0xC0) != 0x80) { *cp = c; return 1; }
+    v = (v << 6) | (cc & 0x3F);
+  }
+  *cp = v;
+  return need + 1;
+}
+
 static int clean_text(const char *s, int len, char *out, int cap) {
   int o = 0, sp = 0;
-  for (int i = 0; i < len && o < cap - 1; i++) {
-    unsigned char c = (unsigned char)s[i];
-    if (c == '\n' || c == '\t' || c == '\r' || c == ' ') { sp = 1; continue; }
-    if (c < 32 || c >= 127) continue;
+  for (int i = 0; i < len; ) {
+    int cp = 0;
+    int used = utf8_next(s + i, len - i, &cp);
+    i += used;
+    if (cp == '\n' || cp == '\t' || cp == '\r' || cp == ' ') { sp = 1; continue; }
+    if (cp < 32) continue;
+    const char *rep = cp < 127 ? 0 : fold_cp(cp);
+    if (cp < 127) {
+      if (sp && o) out[o++] = ' ';
+      sp = 0;
+      out[o++] = (char)cp;
+      continue;
+    }
+    if (!*rep) continue;                       /* zero-width: nothing to draw */
+    if (rep[0] == ' ' && rep[1] == 0) { sp = 1; continue; }
     if (sp && o) out[o++] = ' ';
     sp = 0;
-    out[o++] = (char)c;
+    for (const char *r = rep; *r && o < cap - 1; r++) out[o++] = *r;
   }
   out[o] = 0;
   return o;
@@ -640,10 +950,24 @@ static void tbl_sep(char *out, int cap, int *pn) {
 static void tbl_text(GumboNode *n, char *out, int cap, int *pn, int depth) {
   if (!n || depth > 12) return;
   if (n->type == GUMBO_NODE_TEXT) {
-    for (const char *s = n->v.text.text; *s; s++) {
-      if (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') {
+    const char *s = n->v.text.text;
+    int len = (int)strlen(s);
+    for (int i = 0; i < len; ) {
+      int cp = 0;
+      i += utf8_next(s + i, len - i, &cp);
+      if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r') {
         if (*pn > 0 && out[*pn - 1] != ' ' && *pn < cap - 1) out[(*pn)++] = ' ';
-      } else if (*pn < cap - 1) out[(*pn)++] = *s;
+        continue;
+      }
+      /* cells fold the same way body text does, or a table keeps the mojibake
+       * the paragraph beside it lost */
+      const char *rep = cp < 127 && cp >= 32 ? 0 : fold_cp(cp);
+      if (!rep) {
+        if (*pn < cap - 1) out[(*pn)++] = (char)cp;
+      } else {
+        for (const char *r = rep; *r && *pn < cap - 1; r++)
+          out[(*pn)++] = *r == ' ' ? ' ' : *r;
+      }
     }
     return;
   }

@@ -91,6 +91,7 @@ static long win_id;
 
 /* The address bar: '/' opens it, Enter loads, Esc drops it. */
 static int editing, edit_len;
+static int dragging_bar, drag_off;
 static char err_msg[96];      /* the last failure, shown in the chrome */
 /* What the browser is doing right now: resolving, connecting, reading. A load
  * takes seconds on a good day, and the window used to show nothing at all until
@@ -160,7 +161,9 @@ static const char *find_title(GumboNode *n, char *out, size_t cap) {
 
 
 
+#define WIN_EV_MOVE 1
 #define WIN_EV_DOWN 2
+#define WIN_EV_UP   3
 #define WIN_EV_KEY  4
 #define WIN_EV_CLOSE 5
 #define WIN_EV_WHEEL 6
@@ -168,6 +171,10 @@ static const char *find_title(GumboNode *n, char *out, size_t cap) {
 #define KEY_UP   0x100
 #define KEY_DOWN 0x101
 #define KEY_ESC  0x107
+#define KEY_HOME 0x114
+#define KEY_END  0x115
+#define KEY_PGUP 0x116
+#define KEY_PGDN 0x117
 
 /* 16 bytes, matching win_event_t in kernel/include/guiipc.h: kind, x, y, code. */
 typedef struct { int kind, x, y, code; } win_ev_user_t;
@@ -300,13 +307,25 @@ static void paint(long win, int off) {
   /* A scrollbar, because a page that can move should say so - and because it is
    * the one element whose position an outside check can predict. */
   int vmax = content_h > vp ? content_h - vp : 0;
+  {
+    /* Where the scrollbar actually is, so input tests can aim instead of guess. */
+    static int gc = -1, gh = -1, gm = -1;
+    if (cw != gc || ch != gh || measure_w != gm) {
+      gc = cw; gh = ch; gm = measure_w;
+      printf("[net] geom cw=%d ch=%d vp=%d vmax=%d px0=%d bar_x=%d track_y=%d track_h=%d\n",
+             cw, ch, vp, vmax, px0, cw - 13, CONTENT_TOP, vp);
+    }
+  }
   if (vmax > 0) {
     int track_y = CONTENT_TOP, track_h = vp;
     int bar_h = track_h * vp / content_h;
     if (bar_h < 12) bar_h = 12;
     int bar_y = track_y + (track_h - bar_h) * off / vmax;
-    fill(cw - 5, track_y, 5, track_h, C_PANEL);
-    fill(cw - 5, bar_y, 5, bar_h, C_DIM);
+    /* Six pixels at cw-13, not five at cw-5: a scrollbar under the window
+     * manager's edge zone can never be grabbed, and 3px of border is not a
+     * target anyone can hit. */
+    fill(cw - 13, track_y, 6, track_h, C_PANEL);
+    fill(cw - 13, bar_y, 6, bar_h, C_DIM);
   }
 
   /* the exact-pixel marker: chrome, so it does not move with the page */
@@ -362,7 +381,12 @@ static void go(const char *href) {
     memcpy(cur_host, host, sizeof cur_host);
     memcpy(cur_path, path, sizeof cur_path);
     snprintf(cur_url, sizeof cur_url, "https://%s%s", cur_host, cur_path);
+    /* The fetch is synchronous, so the click has to be acknowledged before it
+     * starts or the window looks dead for the whole round trip. */
+    snprintf(status_msg, sizeof status_msg, "Loading %s", host);
+    paint(win_id, scroll);
     long st = load_page();
+    status_msg[0] = 0;
     scroll = 0;
     text_glyph_pixels = 0;
     paint(win_id, 0);
@@ -513,7 +537,10 @@ int main(void) {
     "<div style=\"background:#3366cc;padding:12px\">boxed</div>"
     "<p>green paragraph text, long enough to wrap at this width, so the wrap "
     "is exercised as well as the colour</p>"
-    "<ul><li>one item</li><li>two item</li></ul></body></html>";
+    "<ul><li>one item</li><li>two item</li></ul>"
+    /* Latin-1 in UTF-8, an accented word, a copyright sign and an em dash: the
+     * font cannot draw any of them, and they used to be dropped silently */
+    "<p>Z\xc3\xbcrich \xc2\xa9 2019 \xe2\x80\x94 caf\xc3\xa9</p></body></html>";
   int fx = web_build(fixture, (int)strlen(fixture), measure_w, user_measure) == 0;
   check(fx, "the engine builds the fixture", fx, 1);
   int ftext = 0, green = 0, blue_h = 0;
@@ -528,6 +555,23 @@ int main(void) {
         blue_h, 24);
   check(green > 0, "a stylesheet colour reaches a text run", green, 1);
   check(ftext >= 3, "the fixture laid its text out", ftext, 3);
+  /* The fold: an accented word, a copyright sign and an em dash must reach the
+   * display list as something the 8x16 ASCII font can actually draw. */
+  int f_zurich = 0, f_c = 0, f_dash = 0, f_cafe = 0;
+  for (int i = 0; i < web_count(); i++) {
+    const web_op_t *o = &web_ops()[i];
+    if (!o->text) continue;
+    /* runs carry the separating space that preceded them */
+    const char *t2 = o->text;
+    while (*t2 == ' ') t2++;
+    if (!strcmp(t2, "Zurich")) f_zurich = 1;
+    else if (!strcmp(t2, "(c)")) f_c = 1;
+    else if (!strcmp(t2, "cafe")) f_cafe = 1;
+    else if (!strcmp(t2, "-")) f_dash = 1;
+  }
+  /* named, not counted: the fixture's two list items also draw a "-" marker */
+  int folded = f_zurich + f_c + f_cafe + f_dash;
+  check(folded == 4, "Latin-1 and typographic text folds to drawable ASCII", folded, 4);
   check(web_height() > 0, "the fixture has a height", web_height(), 1);
 
   /* put the fetched page back: the fixture proved the engine, it is not what the
@@ -587,8 +631,14 @@ int main(void) {
         paint(win_id, scroll);
       } else {
         int before = scroll;
+        int page = ch - CONTENT_TOP - 4 - 2 * step;   /* a screenful less a line at each end */
+        if (page < step) page = step;
         if (ev.code == KEY_DOWN) scroll += step;
         else if (ev.code == KEY_UP) scroll -= step;
+        else if (ev.code == KEY_PGDN) scroll += page;
+        else if (ev.code == KEY_PGUP) scroll -= page;
+        else if (ev.code == KEY_HOME) scroll = 0;
+        else if (ev.code == KEY_END) scroll = vmax;
         if (scroll < 0) scroll = 0;
         if (scroll > vmax) scroll = vmax;
         if (scroll != before) {
@@ -632,8 +682,59 @@ int main(void) {
         paint(win_id, scroll);
       }
     } else if (ev.kind == WIN_EV_DOWN) {
-      const char *href = web_hit_link(ev.x - MARGIN, ev.y - CONTENT_TOP + scroll);
-      if (href) go(href);
+      /* The chrome is the window's own: a click in the address strip edits the
+       * URL instead of falling through to whatever the page has under it, and a
+       * click on the scrollbar moves the page. Both used to do nothing, which
+       * read as a dead window. */
+      if (ev.y < CONTENT_TOP) {
+        editing = 1;
+        edit_len = 0;
+        for (const char *u = cur_url; *u && edit_len < (int)sizeof(edit) - 1; u++) edit[edit_len++] = *u;
+        edit[edit_len] = 0;
+        paint(win_id, scroll);
+      } else if (ev.x >= cw - 16) {
+        int vp2 = ch - CONTENT_TOP - 4;
+        int vmax2 = content_h > vp2 ? content_h - vp2 : 0;
+        if (vmax2 > 0) {
+          int bar_h = vp2 * vp2 / content_h;
+          if (bar_h < 12) bar_h = 12;
+          int bar_y = CONTENT_TOP + (vp2 - bar_h) * scroll / vmax2;
+          /* grab the thumb, or page towards the click */
+          if (ev.y >= bar_y && ev.y < bar_y + bar_h) {
+            drag_off = ev.y - bar_y;
+            dragging_bar = 1;
+          } else if (ev.y < bar_y) {
+            scroll -= vp2 - step;
+            if (scroll < 0) scroll = 0;
+          } else {
+            scroll += vp2 - step;
+            if (scroll > vmax2) scroll = vmax2;
+          }
+          text_glyph_pixels = 0;
+          paint(win_id, scroll);
+        }
+      } else {
+        const char *href = web_hit_link(ev.x - MARGIN, ev.y - CONTENT_TOP + scroll);
+        if (href) go(href);
+      }
+    } else if (ev.kind == WIN_EV_MOVE && dragging_bar) {
+      int vp2 = ch - CONTENT_TOP - 4;
+      int vmax2 = content_h > vp2 ? content_h - vp2 : 0;
+      int bar_h = vp2 * vp2 / content_h;
+      if (bar_h < 12) bar_h = 12;
+      if (vmax2 > 0 && vp2 > bar_h) {
+        int rel = ev.y - CONTENT_TOP - drag_off;
+        int ns = rel * vmax2 / (vp2 - bar_h);
+        if (ns < 0) ns = 0;
+        if (ns > vmax2) ns = vmax2;
+        if (ns != scroll) {
+          scroll = ns;
+          text_glyph_pixels = 0;
+          paint(win_id, scroll);
+        }
+      }
+    } else if (ev.kind == WIN_EV_UP) {
+      dragging_bar = 0;
     }
   }
   return 0;

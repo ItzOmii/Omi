@@ -48,13 +48,19 @@
  * sized so a maximum window (620x420) fits in one slot with room to spare: 2 MB
  * a slot, four slots, mapped only in the process that created them. VM_ALLOC
  * now stops below this, so a growing heap cannot run into a surface. */
-#define RING3_SURF_BASE   (RING3_USER_BASE + 0x0F000000ULL)
+#define RING3_SURF_BASE   (RING3_USER_BASE + 0x0E400000ULL)
 #define RING3_SURF_AREA   0x00400000ULL           /* 4 MB per slot: a 1280x768
                                                    * client at 4 bytes a pixel,
                                                    * rounded to the window region */
-#define RING3_SURF_SLOTS  3                       /* 3 x 4 MB = 12 MB, which
-                                                   * leaves the top 4 MB of the
-                                                   * window for the stack */
+#define RING3_SURF_SLOTS  6                       /* 6 x 4 MB = 24 MB, ending at
+                                                   * 252 MB with the top 4 MB left
+                                                   * for the stack. Three was too
+                                                   * few: the desktop boots with
+                                                   * four ring-3 demo windows, so a
+                                                   * browser asking for a fourth
+                                                   * slot got -ENOSPC and quietly
+                                                   * went away - a click that opens
+                                                   * nothing and says nothing. */
 
 /* PTE flags */
 #define RING3_P   0x001ULL   /* present */

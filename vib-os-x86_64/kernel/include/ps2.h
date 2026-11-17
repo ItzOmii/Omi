@@ -31,6 +31,10 @@
 #define KEY_F10 0x111
 #define KEY_F11 0x112
 #define KEY_F12 0x113
+#define KEY_HOME 0x114
+#define KEY_END  0x115
+#define KEY_PGUP 0x116
+#define KEY_PGDN 0x117
 
 /* ===================================================================== */
 /* Keyboard Callback                                                     */

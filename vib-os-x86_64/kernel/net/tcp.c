@@ -637,51 +637,55 @@ static int dns_resolve_once(const net_cfg_t *cfg, const char *host, uint8_t ip_o
     if (!dup) { memcpy(servers[n_servers], google[g], 4); n_servers++; }
   }
 
-  for (int attempt = 0; attempt < n_servers; attempt++) {
-    const uint8_t *server = servers[attempt];
-    uint16_t id = ++dns_id;
-    int qlen = dns_build(q, id, host);
-    if (qlen <= 0) return 0;
-    if (!net_udp_send(cfg, server, 5353, 53, q, qlen)) return 0;
+  /* Ask every server at once, all with the same query id. The DHCP resolver
+   * answers in a few milliseconds at home; when it is slow, broken or filtering,
+   * a sequential fallback made the browser pay its full timeout first - measured
+   * at 1200 ms of a 1960 ms first load. One id means the first valid reply wins
+   * whoever sent it, and a dead server now costs nothing but a wasted packet. */
+  uint16_t id = ++dns_id;
+  int qlen = dns_build(q, id, host);
+  if (qlen <= 0) return 0;
+  int sent = 0;
+  for (int i = 0; i < n_servers; i++)
+    if (net_udp_send(cfg, servers[i], 5353, 53, q, qlen)) sent = 1;
+  if (!sent) return 0;
 
-    pacer_t p;
-    pace_begin(&p);
-    unsigned last_send = 0;
-    while (pace_ms(&p) < 1200) {
-      /* A resolver reply is a single UDP packet and every task that polls the
-       * NIC can consume it: the boot self-tests alone have three connections
-       * reading at once. Waiting out the whole timeout because one datagram went
-       * to the wrong reader is what made a first lookup cost two seconds. Ask
-       * again every 300 ms on the same id instead. */
-      if (pace_ms(&p) - last_send >= 300u) {
-        net_udp_send(cfg, server, 5353, 53, q, qlen);
-        last_send = pace_ms(&p);
-      }
-      if (rx_busy) { pace_yield(); continue; }
-      rx_busy = 1;
-      int n = e1000_poll_recv(r, sizeof r);
-      rx_busy = 0;
-      if (n > ETH_LEN + 28) {
-        const uint8_t *ip = r + ETH_LEN;
-        int ihl = (ip[0] & 0x0F) * 4;
-        if (get16(r + 12) == ETH_IPV4 && ip[9] == IP_PROTO_UDP) {
-          const uint8_t *udp = ip + ihl;
-          if (get16(udp + 2) == 5353 && get16(udp) == 53) {
-            int plen = get16(udp + 4) - 8;
-            if (plen > 0 && dns_parse(udp + 8, plen, id, ip_out)) {
-              extern void net_log_dns_via(const uint8_t *ip);
-              net_log_dns_via(server);
-              dns_cache_put(host, ip_out);
-              return 1;
-            }
-          }
-        } else {
-          /* A resolution must not swallow another connection's segments. */
-          tcp_dispatch(r, n);
-        }
-      }
-      pace_yield();
+  pacer_t p;
+  pace_begin(&p);
+  unsigned last_send = 0;
+  while (pace_ms(&p) < 700) {
+    /* Re-ask everyone on the same id every 300 ms: a single UDP reply can be
+     * consumed by another task polling the NIC, and a lost datagram must not
+     * become a lost page. */
+    if (pace_ms(&p) - last_send >= 300u) {
+      for (int i = 0; i < n_servers; i++)
+        net_udp_send(cfg, servers[i], 5353, 53, q, qlen);
+      last_send = pace_ms(&p);
     }
+    if (rx_busy) { pace_yield(); continue; }
+    rx_busy = 1;
+    int n = e1000_poll_recv(r, sizeof r);
+    rx_busy = 0;
+    if (n > ETH_LEN + 28) {
+      const uint8_t *ip = r + ETH_LEN;
+      int ihl = (ip[0] & 0x0F) * 4;
+      if (get16(r + 12) == ETH_IPV4 && ip[9] == IP_PROTO_UDP) {
+        const uint8_t *udp = ip + ihl;
+        if (get16(udp + 2) == 5353 && get16(udp) == 53) {
+          int plen = get16(udp + 4) - 8;
+          if (plen > 0 && dns_parse(udp + 8, plen, id, ip_out)) {
+            extern void net_log_dns_via(const uint8_t *ip);
+            net_log_dns_via(ip + 12);          /* whoever actually answered */
+            dns_cache_put(host, ip_out);
+            return 1;
+          }
+        }
+      } else {
+        /* A resolution must not swallow another connection's segments. */
+        tcp_dispatch(r, n);
+      }
+    }
+    pace_yield();
   }
   return 0;
 }

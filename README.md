@@ -256,7 +256,7 @@ UDP sockets.
 
 ## The renderer
 
-**Omi Net** is a browser window with an address bar, tabs, scrolling and a status strip — and behind
+**Omi Net** is a browser window with an address bar, scrolling and a status strip — and behind
 it a real engine rather than a tag stripper:
 
 - **HTML5** parsed by vendored Gumbo.
@@ -274,7 +274,12 @@ it a real engine rather than a tag stripper:
   doing, not a black rectangle. A load that cannot be made says why in the strip, in the accent
   colour, and leaves the window open to be pointed somewhere else.
 - **The mouse works inside the window**: a click on a link follows it, and the wheel scrolls the
-  page a line a notch, both directions, the same step the arrow keys use. Wheel support is
+  page a line a notch, both directions, the same step the arrow keys use. A click in the address
+  strip edits the URL it is showing, a click on the scrollbar pages towards the click, and the thumb
+  drags — the scrollbar sits six pixels in from the right edge because the window manager's edge
+  zone owns the last three, and a bar drawn under it can never be grabbed. Home and End jump to
+  either end of the page and Page Up/Page Down move a screenful; those four keys had no codes of
+  their own, so the driver folded them into the arrow keys. Wheel support is
   negotiated at boot — the driver asks the mouse for IntelliMouse mode (200/100/80 knock) and reads
   the fourth packet byte only if the device answers ID 3, so a three-byte mouse is unaffected.
   `[ps2] mouse id=0x3 wheel: 4-byte packets` on the serial log says which one you have.
@@ -288,12 +293,21 @@ it a real engine rather than a tag stripper:
 - **The active app is the window that holds the keyboard.** The taskbar marks it with an accent rule.
   For a built-in app that is the app table's focus; for a ring-3 window it is whichever window the
   keyboard is going to, which is why the browser's entry lights up while you are reading it.
+- **Text the font cannot draw is folded, not dropped.** The rasteriser is 8x16 ASCII, so every byte
+  above 126 used to be discarded: `IETF®` lost its mark, `Zürich` lost the umlaut, and a Latin-1 page
+  lost whole words. Accented Latin, typographic quotes and dashes, currency signs and the common
+  symbols fold to the nearest drawable ASCII at the point where text becomes printable, so the width
+  the wrapper measures is the width the rasteriser draws. It is a stopgap, and it is asserted: the
+  compiled-in fixture carries `Zürich © 2019 — café` and the checks require `Zurich`, `(c)`, `-` and
+  `cafe` to reach the display list.
 - **Pages get their own paper.** The window's chrome is dark so the window reads as a window; the page
   is whatever colour the document says, white if it says nothing, and the default ink follows that
   paper's luminance. A dark-themed page gets light text instead of black on black.
-- **Lookups go to the network you are on.** The DHCP resolver is asked first, answers are cached for
-  the boot, and a query is re-sent every 300 ms — asking 8.8.8.8 first and waiting out its timeout
-  cost 2 seconds of every first load.
+- **Every resolver is asked at once.** One query, one id, sent to the DHCP resolver and the fallbacks
+  together: the first valid reply wins, so a resolver that is slow, filtering or absent costs a
+  wasted packet instead of its full timeout. Asking them one at a time measured 1660 ms of a
+  1960 ms first load; in parallel the resolve lands in 110-220 ms. Answers are cached for the boot
+  and a query is re-sent every 300 ms in case a datagram is consumed by another poller.
 - **Windows resize, and the page reflows.** `□` fills the work area and the grip drags a corner; the
   frame tells the client its new size, the client resizes its surface and re-lays the document out
   from the HTML it still holds, so this is a reflow and not a reload. The text is laid out in a

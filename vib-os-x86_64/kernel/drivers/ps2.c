@@ -127,6 +127,10 @@ static const char scancode_to_ascii_shift[128] = {
 
 /* Special key codes */
 #define KEY_UP 0x100
+#define KEY_HOME 0x114
+#define KEY_END  0x115
+#define KEY_PGUP 0x116
+#define KEY_PGDN 0x117
 #define KEY_DOWN 0x101
 #define KEY_LEFT 0x102
 #define KEY_RIGHT 0x103
@@ -365,10 +369,13 @@ void ps2_poll(void) {
         case 0x4D: key = KEY_RIGHT; break;
         case 0x1D: ctrl_pressed = 1; continue;   /* Right Ctrl */
         case 0x38: alt_pressed = 1; continue;    /* Right Alt */
-        case 0x47: key = KEY_UP; break;          /* Home -> Up */
-        case 0x4F: key = KEY_DOWN; break;        /* End -> Down */
-        case 0x49: key = KEY_UP; break;          /* Page Up -> Up */
-        case 0x51: key = KEY_DOWN; break;        /* Page Down -> Down */
+        /* Home/End/Page Up/Page Down get their own codes: folding them into
+         * the arrows made a browser that could not jump to either end of a
+         * page or scroll a screenful at a time. */
+        case 0x47: key = KEY_HOME; break;
+        case 0x4F: key = KEY_END;  break;
+        case 0x49: key = KEY_PGUP; break;
+        case 0x51: key = KEY_PGDN; break;
         case 0x53:                               /* Delete (E0 53) */
           if (ctrl_pressed && alt_pressed) { cad_flag = 1; continue; }
           key = '\b'; break;                     /* plain Delete -> Backspace */
