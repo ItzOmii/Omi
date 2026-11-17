@@ -1,18 +1,15 @@
-/* ominet - the browser's first ring-3 half: fetch, parse, lay out, paint.
+/* ominet - the browser, in a process.
  *
- * Omi Net renders inside the kernel today (kernel/gui/omiweb.c, ~1000 lines that
- * write into the framebuffer). That is a parser and a layout engine sharing an
- * address space with the scheduler and the heap, which is the arrangement a
- * browser cannot have: a malformed page becomes a kernel memory bug.
+ * Fetch over TLS (fetch.c), parse with Gumbo, lay out with the engine that used
+ * to run inside the kernel (omilayout.c, moved here rather than rewritten), and
+ * paint the display list it returns through the shared rasteriser (omitext.h).
  *
- * This program takes the whole pipeline into ring 3. It dials TLS itself
- * (fetch.c), parses the HTML with Gumbo - the same parser the kernel uses, so
- * this is a move and not a rewrite - lays out block boxes, and paints the text
- * through the shared rasteriser (omitext.h). The kernel's part is a window and a
- * surface: it never learns what a character is, or what a tag is.
+ * The kernel's part is a window and a surface: it never learns what a character
+ * or a tag is. That is the arrangement a browser needs - a malformed page is a
+ * process's memory bug, not the kernel's.
  *
- * Everything it claims is asserted in-process and then, for the pixels, checked
- * from outside at the coordinates it prints.
+ * Everything it claims is asserted in-process, and the pixels are checked from
+ * outside at the coordinates it prints.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -22,6 +19,7 @@
 #include "gumbo.h"
 #include "glyphs.h"
 #include "fetch.h"
+#include "omilayout.h"
 
 #define SYS_YIELD        3
 #define SYS_WIN_OPEN     6
@@ -43,20 +41,29 @@
 #define C_ACCENT 0x00C4622Du
 #define C_MARK   0x0000FF00u
 
-#define LH_HEAD  22
 #define LH_BODY  18
 #define MARGIN   8
+#define CONTENT_TOP 40
 #define MAX_PAGE 32768
 
-/* A page with enough text to be worth scrolling. 10.9 KB of HTML, about 3200
- * characters of it text, so the document is roughly three viewports tall. */
-#define HOST "www.iana.org"
-#define PATH "/domains/reserved"
+/* A page with enough text to be worth scrolling: ~11 KB of HTML, about three
+ * viewports tall, with links to follow. */
+#define HOST0 "www.iana.org"
+#define PATH0 "/domains/reserved"
 
 static unsigned *pix;
-static GumboNode *doc_root;
 static int checks, fails;
 
+static char cur_host[128] = HOST0;
+static char cur_path[256] = PATH0;
+static char cur_url[192] = "https://" HOST0 PATH0;
+static char page[MAX_PAGE];
+
+static long win_id;
+static int measure_w, content_h, scroll;
+
+/* After the surface and its size: the rasteriser works on the includer's pix,
+ * CW and CH, which is what makes it shareable by two clients. */
 #include "omitext.h"
 
 static long sys3(long n, long a, long b, long c) {
@@ -82,102 +89,19 @@ static int count_elements(GumboNode *n) {
   return c;
 }
 
-static int count_tag(GumboNode *n, GumboTag t) {
-  if (n->type != GUMBO_NODE_ELEMENT) return 0;
-  int c = (n->v.element.tag == t) ? 1 : 0;
-  GumboVector *k = &n->v.element.children;
-  for (unsigned i = 0; i < k->length; i++)
-    c += count_tag((GumboNode *)k->data[i], t);
-  return c;
-}
-
-/* Append text with every whitespace run collapsed to one space. HTML says a newline
- * in the source is a space on the screen, and a layout that draws the newline is a
- * layout that draws a box glyph the font does not have. */
-static void norm_append(const char *s, size_t len, char *out, size_t cap, size_t *used) {
-  for (size_t i = 0; i < len && *used + 2 < cap; i++) {
-    unsigned char c = (unsigned char)s[i];
-    /* The font is 8x16 ASCII. An entity like &ldquo; decodes to multi-byte UTF-8,
-     * and drawing those bytes would index past the glyph table and paint noise. */
-    if (c >= 0x80) continue;
-    if (isspace(c)) {
-      if (*used > 0 && out[*used - 1] != ' ') out[(*used)++] = ' ';
-    } else {
-      out[(*used)++] = (char)c;
-    }
-  }
-  out[*used] = 0;
-}
-
-static void collect_text(GumboNode *n, char *out, size_t cap, size_t *used) {
-  if (n->type == GUMBO_NODE_TEXT || n->type == GUMBO_NODE_WHITESPACE) {
-    norm_append(n->v.text.text, strlen(n->v.text.text), out, cap, used);
-    return;
-  }
-  if (n->type != GUMBO_NODE_ELEMENT) return;
-  GumboTag t = n->v.element.tag;
-  if (t == GUMBO_TAG_SCRIPT || t == GUMBO_TAG_STYLE || t == GUMBO_TAG_HEAD) return;
-  /* A <br> is a container with no children, so without this the words on either
-   * side of it fuse: IANA's nav came out as "DomainNames". A line break is a
-   * space until there is inline layout that can honour the break itself. */
-  if (t == GUMBO_TAG_BR) {
-    if (*used > 0 && out[*used - 1] != ' ') out[(*used)++] = ' ';
-    out[*used] = 0;
-    return;
-  }
-  GumboVector *k = &n->v.element.children;
-  for (unsigned i = 0; i < k->length; i++)
-    collect_text((GumboNode *)k->data[i], out, cap, used);
-}
-
-enum { BLK_NONE = 0, BLK_HEAD = 1, BLK_BODY = 2 };
-
-static int block_kind(GumboTag t) {
-  switch (t) {
-    case GUMBO_TAG_H1: case GUMBO_TAG_H2: case GUMBO_TAG_H3: return BLK_HEAD;
-    case GUMBO_TAG_P:  case GUMBO_TAG_LI: case GUMBO_TAG_BLOCKQUOTE:
-    case GUMBO_TAG_PRE: case GUMBO_TAG_TD: case GUMBO_TAG_DD: return BLK_BODY;
-    default: return BLK_NONE;
-  }
-}
-
-static void collect_text(GumboNode *n, char *out, size_t cap, size_t *used);
-
-/* How many boxes the page should produce, by the same rule the layout applies:
- * a block-level tag, reached through non-block containers, with text inside it.
- * layout_node stops descending at a block (its subtree becomes one run of text),
- * and an empty block draws nothing at all - so a <p> inside an <li> is part of the
- * <li>'s box and a <td> holding only whitespace is no box. Counting any other way
- * makes the assertion disagree with the paint by however many nested or empty
- * blocks the page happens to have, and then the failure looks like a layout bug. */
-static int count_boxes(GumboNode *n, int inside_block) {
-  if (n->type != GUMBO_NODE_ELEMENT) return 0;
-  GumboTag t = n->v.element.tag;
-  if (t == GUMBO_TAG_SCRIPT || t == GUMBO_TAG_STYLE || t == GUMBO_TAG_HEAD ||
-      t == GUMBO_TAG_TITLE || t == GUMBO_TAG_META || t == GUMBO_TAG_LINK) return 0;
-
-  if (block_kind(t) != BLK_NONE) {
-    if (inside_block) return 0;
-    static char b[8192];
-    size_t used = 0;
-    b[0] = 0;
-    collect_text(n, b, sizeof b, &used);
-    return used ? 1 : 0;
-  }
-
-  int c = 0;
-  GumboVector *k = &n->v.element.children;
-  for (unsigned i = 0; i < k->length; i++)
-    c += count_boxes((GumboNode *)k->data[i], inside_block);
-  return c;
-}
-
 static const char *find_title(GumboNode *n, char *out, size_t cap) {
   if (n->type != GUMBO_NODE_ELEMENT) return NULL;
   if (n->v.element.tag == GUMBO_TAG_TITLE) {
     size_t used = 0;
     out[0] = 0;
-    collect_text(n, out, cap, &used);
+    GumboVector *k = &n->v.element.children;
+    for (unsigned i = 0; i < k->length && used + 1 < cap; i++) {
+      GumboNode *c = (GumboNode *)k->data[i];
+      if (c->type != GUMBO_NODE_TEXT && c->type != GUMBO_NODE_WHITESPACE) continue;
+      for (const char *t = c->v.text.text; *t && used + 1 < cap; t++)
+        out[used++] = (*t == '\n' || *t == '\r' || *t == '\t') ? ' ' : *t;
+    }
+    out[used] = 0;
     return out;
   }
   GumboVector *k = &n->v.element.children;
@@ -188,97 +112,109 @@ static const char *find_title(GumboNode *n, char *out, size_t cap) {
   return NULL;
 }
 
-/* ---- layout ---- */
 
-typedef struct {
-  int y, blocks, lines, widest, glyphs;
-} layout_t;
 
-static void layout_node(GumboNode *n, layout_t *L, int measure, int draw);
 
-/* One block: its text, wrapped, with the spacing the block kind asks for.
- * With draw == 0 it measures and places without touching a pixel, which is how
- * the fixture page is checked: same blocks, same wrap, no paint. */
-static void layout_block(GumboNode *n, layout_t *L, int measure, int draw) {
-  static char buf[8192];
-  size_t used = 0;
-  buf[0] = 0;
-  collect_text(n, buf, sizeof buf, &used);
-  while (used > 0 && buf[used - 1] == ' ') buf[--used] = 0;
-  if (!used) return;
-
-  int head = block_kind(n->v.element.tag) == BLK_HEAD;
-  int lh = head ? LH_HEAD : LH_BODY;
-  unsigned col = head ? C_ACCENT : C_TEXT;
-
-  L->y += head ? 6 : 4;                      /* the gap between blocks */
-  int widest = 0;
-  int lines = draw ? wrap_text(buf, MARGIN, L->y, measure, lh, col, &widest)
-                   : measure_wrap(buf, measure, &widest);
-
-  L->blocks++;
-  L->lines += lines;
-  if (widest > L->widest) L->widest = widest;
-  L->y += lines * lh;
-
-  if (head && draw) {
-    /* A rule under a heading: the only exact-pixel anchor a page has that does
-     * not depend on glyph shapes, so an outside check can be arithmetic. */
-    fill(MARGIN, L->y - 3, 64, 3, C_ACCENT);
-  }
-}
-
-static void layout_node(GumboNode *n, layout_t *L, int measure, int draw) {
-  if (n->type == GUMBO_NODE_TEXT || n->type == GUMBO_NODE_WHITESPACE) return;
-  if (n->type != GUMBO_NODE_ELEMENT) return;
-
-  GumboTag t = n->v.element.tag;
-  if (t == GUMBO_TAG_SCRIPT || t == GUMBO_TAG_STYLE || t == GUMBO_TAG_HEAD ||
-      t == GUMBO_TAG_TITLE || t == GUMBO_TAG_META || t == GUMBO_TAG_LINK) return;
-
-  if (block_kind(t) != BLK_NONE) { layout_block(n, L, measure, draw); return; }
-
-  GumboVector *k = &n->v.element.children;
-  for (unsigned i = 0; i < k->length; i++)
-    layout_node((GumboNode *)k->data[i], L, measure, draw);
-}
-
-/* ---- painting the document at an offset ---- */
-
+#define WIN_EV_DOWN 2
+#define WIN_EV_KEY  4
+#define WIN_EV_CLOSE 5
 #define KEY_UP   0x100
 #define KEY_DOWN 0x101
-#define WIN_EV_KEY 4
-#define WIN_EV_CLOSE 5
-#define CONTENT_TOP 40
 
 /* 16 bytes, matching win_event_t in kernel/include/guiipc.h: kind, x, y, code. */
 typedef struct { int kind, x, y, code; } win_ev_user_t;
 
-static int measure, content_h;
+/* The engine measures through this. A process has one face - 8x16 - so every
+ * font index the engine asks about is answered with the same width; the engine
+ * keeps its own metrics for placement. */
+static long last_status, last_blen;
+static char last_ip[16];
 
-/* The whole page is laid out again for every offset, starting at a negative y.
- * Layout is cheap and stateless, and the alternative - caching placed boxes and
- * translating them - is a second layout engine that can disagree with the first. */
-static void repaint(long win, int scroll) {
+static int user_measure(int font, const char *s) {
+  (void)font;
+  return (int)strlen(s) * GLYPH_W;
+}
+
+/* Fetch the current URL and lay it out. Returns the status, and leaves
+ * content_h at 0 when there is nothing to paint. */
+static long load_page(void) {
+  const char *why = "not tried";
+  long blen = 0;
+  char ip[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  /* A dropped SYN is not a bug in the browser, so it gets three tries before
+   * the page is called dead - but every attempt is printed, and the checks run
+   * against the last one. */
+  long status = -1;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    blen = 0;
+    why = "not tried";
+    status = https_get(cur_host, 443, cur_path, page, sizeof page, &why, &blen, ip);
+    printf("[net] https://%s%s -> %s attempt %d status=%ld body=%ld %s\n",
+           cur_host, cur_path, ip[0] ? ip : "?", attempt, status, blen, why);
+    if (status == 200 && blen > 0) break;
+    for (int k = 0; k < 20000; k++) sys3(SYS_YIELD, 0, 0, 0);
+  }
+  last_status = status; last_blen = blen;
+  memcpy(last_ip, ip, sizeof ip);
+  content_h = 0;
+  if (status == 200 && blen > 0) {
+    if (web_build(page, (int)blen, measure_w, user_measure) == 0) content_h = web_height();
+    else printf("[net] the engine refused the page\n");
+  }
+  return status;
+}
+
+static void paint(long win, int off) {
   fill(0, 0, CW, CH, C_BG);
   fill(0, 0, CW, 30, C_PANEL);
   text(MARGIN, 7, "Omi Net", C_TEXT);
-  text(MARGIN + 9 * GLYPH_W, 7, "https://" HOST PATH, C_DIM);
+  {
+    /* The URL is the one thing in the chrome that can be any length. */
+    int room = (CW - (MARGIN + 9 * GLYPH_W)) / GLYPH_W;
+    char bar[128];
+    int n = (int)strlen(cur_url);
+    if (room > 126) room = 126;
+    if (n <= room) { memcpy(bar, cur_url, n + 1); }
+    else { memcpy(bar, cur_url, room - 3); memcpy(bar + room - 3, "...", 4); }
+    text(MARGIN + 9 * GLYPH_W, 7, bar, C_DIM);
+  }
   fill(0, 30, CW, 1, C_ACCENT);
   fill(0, 31, CW, 3, C_BG);
 
-  layout_t L = { .y = CONTENT_TOP - scroll, .blocks = 0, .lines = 0,
-                 .widest = 0, .glyphs = 0 };
-  layout_node(doc_root, &L, measure, 1);
+  /* The display list is in page coordinates, origin at the content's top left.
+   * Scrolling is a subtraction - which is the reason to keep a display list
+   * instead of re-running layout for every frame. */
+  int vp = CH - CONTENT_TOP - 4;
+  clip_rect(MARGIN, CONTENT_TOP, MARGIN + measure_w, CONTENT_TOP + vp);
+  int n = web_count();
+  const web_op_t *ops = web_ops();
+  for (int i = 0; i < n; i++) {
+    const web_op_t *o = &ops[i];
+    int oy = CONTENT_TOP + o->y - off;
+    int oh = o->h > 0 ? o->h : GLYPH_H;
+    if (oy > CONTENT_TOP + vp || oy + oh < CONTENT_TOP) continue;
+    if (o->kind == 0) {
+      if (o->h > 0) fill(MARGIN + o->x, oy, o->w, o->h, o->color);
+    } else if (o->kind == 2) {
+      fill(MARGIN + o->x, oy, o->w, 1, o->color);
+    } else if (o->kind == 3 && o->px) {
+      /* No image decoder in the process yet; the engine gave us alt text
+       * instead of a bitmap, and an undecoded page is better than a hole. */
+    } else if (o->text) {
+      text(MARGIN + o->x, oy, o->text, o->color);
+      if (o->bold) text(MARGIN + o->x + 1, oy, o->text, o->color);
+    }
+  }
+  clip_none();
 
-  /* A scrollbar, because a page that can move should say so. It is also the one
-   * element whose position the outside check can predict arithmetically. */
-  int vmax = content_h > CH ? content_h - CH : 0;
+  /* A scrollbar, because a page that can move should say so - and because it is
+   * the one element whose position an outside check can predict. */
+  int vmax = content_h > vp ? content_h - vp : 0;
   if (vmax > 0) {
-    int track_y = CONTENT_TOP, track_h = CH - CONTENT_TOP - 4;
-    int bar_h = track_h * CH / content_h;
+    int track_y = CONTENT_TOP, track_h = vp;
+    int bar_h = track_h * vp / content_h;
     if (bar_h < 12) bar_h = 12;
-    int bar_y = track_y + (track_h - bar_h) * scroll / vmax;
+    int bar_y = track_y + (track_h - bar_h) * off / vmax;
     fill(CW - 5, track_y, 5, track_h, C_PANEL);
     fill(CW - 5, bar_y, 5, bar_h, C_DIM);
   }
@@ -289,172 +225,185 @@ static void repaint(long win, int scroll) {
   sys3(SYS_SURF_PRESENT, win, 0, ((long)CW << 16) | CH);
 }
 
+/* Follow a link. The engine hands back the href as written, so resolve the two
+ * shapes a page actually uses: an absolute URL, or a path on this host. A
+ * relative link is refused out loud rather than guessed at. */
+static void go(const char *href) {
+  char host[128], path[256];
+  const char *p = href;
+  if (!strncmp(p, "https://", 8)) p += 8;
+  else if (!strncmp(p, "http://", 7)) p += 7;
+  if (*p == '/') {
+    memcpy(host, cur_host, sizeof host < sizeof cur_host ? sizeof host : sizeof cur_host);
+    host[sizeof host - 1] = 0;
+  } else if (*p) {
+    int i = 0;
+    while (p[i] && p[i] != '/' && i < 127) { host[i] = p[i]; i++; }
+    host[i] = 0;
+    p += i;
+  } else return;
+
+  if (*p != '/') { path[0] = '/'; path[1] = 0; }
+  else { int j = 0; while (p[j] && j < 255) { path[j] = p[j]; j++; } path[j] = 0; }
+
+  if (!strcmp(host, cur_host) && !strcmp(path, cur_path)) return;
+  printf("[net] clicked -> https://%s%s\n", host, path);
+  memcpy(cur_host, host, sizeof cur_host);
+  memcpy(cur_path, path, sizeof cur_path);
+  snprintf(cur_url, sizeof cur_url, "https://%s%s", cur_host, cur_path);
+  if (load_page() == 200) {
+    scroll = 0;
+    text_glyph_pixels = 0;
+    paint(win_id, 0);
+    printf("[net] followed: %d ops, content %d, viewport %d\n",
+           web_count(), content_h, CH - CONTENT_TOP - 4);
+  }
+}
+
 int main(void) {
-  long win = sys3(SYS_WIN_OPEN, (long)"Omi Net", WIN_W, WIN_H);
-  check(win > 0, "the window opens", win, 1);
+  win_id = sys3(SYS_WIN_OPEN, (long)"Omi Net", WIN_W, WIN_H);
+  check(win_id > 0, "the window opens", win_id, 1);
 
   int32_t g[4] = {0, 0, 0, 0};
-  if (sys3(SYS_WIN_GEOM, win, (long)g, 0) == 0)
+  if (sys3(SYS_WIN_GEOM, win_id, (long)g, 0) == 0)
     printf("[net] client at %d,%d size %dx%d\n",
            g[0] + 1, g[1] + 31, g[2] - 2, g[3] - 32);
 
-  long s = sys3(SYS_SURF_CREATE, win, CW, CH);
+  long s = sys3(SYS_SURF_CREATE, win_id, CW, CH);
   check(s > 0, "the surface maps into the process", s, 1);
   if (s <= 0) { printf("[net] 0/%d\n", checks); return 1; }
   pix = (unsigned *)s;
+  measure_w = CW - 2 * MARGIN;
 
-  /* ---- fetch ---- */
-  static char page[MAX_PAGE];
-  const char *why = "not tried";
-  long blen = 0, status;
-  char ip[16];
+  /* ---- the fixture page: what the engine has to do with CSS ----
+   * A fetched page is whatever it is tomorrow, so the proof is compiled in: a
+   * background colour, padding, a stylesheet colour on text, and a list. */
+  static const char *const fixture =
+    "<!doctype html><html><head><title>fixture</title>"
+    "<style>p{color:#00ff00}</style></head><body>"
+    "<div style=\"background:#3366cc;padding:12px\">boxed</div>"
+    "<p>green paragraph text, long enough to wrap at this width, so the wrap "
+    "is exercised as well as the colour</p>"
+    "<ul><li>one item</li><li>two item</li></ul></body></html>";
+  int fx = web_build(fixture, (int)strlen(fixture), measure_w, user_measure) == 0;
+  check(fx, "the engine builds the fixture", fx, 1);
+  int ftext = 0, green = 0, blue_h = 0;
+  for (int i = 0; i < web_count(); i++) {
+    const web_op_t *o = &web_ops()[i];
+    if (o->kind == 0 && (o->color & 0xFFFFFF) == 0x3366CC && o->h > blue_h) blue_h = o->h;
+    if (o->text) { ftext++; if ((o->color & 0xFFFFFF) == 0x00FF00) green++; }
+  }
+  printf("[net] fixture %d ops, %d text runs, background box %d px tall, height %d\n",
+         web_count(), ftext, blue_h, web_height());
+  check(blue_h >= 24, "a padded background is as tall as its padding plus a line",
+        blue_h, 24);
+  check(green > 0, "a stylesheet colour reaches a text run", green, 1);
+  check(ftext >= 3, "the fixture laid its text out", ftext, 3);
+  check(web_height() > 0, "the fixture has a height", web_height(), 1);
 
-  status = https_get(HOST, 443, PATH, page, sizeof page, &why, &blen, ip);
-  printf("[net] %s is %s; status=%ld body=%ld %s\n",
-         HOST, ip[0] ? ip : "?", status, blen, why);
-  check(ip[0] && strchr(ip, '.'), "the kernel resolved the name", (long)strlen(ip), 7);
-  check(status == 200, "the page answers 200 over TLS", status, 200);
-  check(blen > 200, "the body arrived, not just the headers", blen, 200);
+  /* ---- fetch the real page ---- */
+  load_page();
+  check(last_ip[0] && strchr(last_ip, '.'), "the kernel resolved the name",
+        (long)strlen(last_ip), 7);
+  check(last_status == 200, "the page answers 200 over TLS", last_status, 200);
+  check(last_blen > 200, "the body arrived, not just the headers", last_blen, 200);
 
-  /* ---- parse ---- */
+  /* ---- parse, for structure that has to hold whatever the page is ----
+   * The engine parsed the same bytes already; this second parse is for the
+   * checks, and it is cheap next to the fetch. */
   GumboOutput *out = gumbo_parse(page);
   check(out != NULL, "gumbo parsed the page", out != NULL, 1);
-  if (!out) { printf("[net] %d/%d\n", checks - fails, checks); return 1; }
+  if (out) {
+    int elems = count_elements(out->root);
+    char tbuf[256];
+    const char *title = find_title(out->root, tbuf, sizeof tbuf);
+    printf("[net] dom %d elements, title \"%s\"\n", elems, title ? title : "?");
+    check(elems >= 8, "the DOM is a tree, not a stray text node", elems, 8);
+    check(title && strlen(title) >= 3, "the parser found a title",
+          title ? (long)strlen(title) : 0, 3);
+    gumbo_destroy_output(&kGumboDefaultOptions, out);
+  }
 
-  /* Counted, not assumed. The first version of this asserted a heading and a
-   * link because that is what example.com used to serve; the page is now one
-   * paragraph and a script, so those checks failed on a parser that was right.
-   * Whatever the page is, structure has to hold: a tree with elements, a title
-   * the parser found, and at least one text block to lay out. */
-  int elems  = count_elements(out->root);
-  int blocks = count_boxes(out->root, 0);
-  char tbuf[256];
-  const char *title = find_title(out->root, tbuf, sizeof tbuf);
-  printf("[net] dom %d elements, %d boxes, title \"%s\"\n",
-         elems, blocks, title ? title : "?");
-  check(elems >= 8, "the DOM is a tree, not a stray text node", elems, 8);
-  check(blocks >= 1, "the page has a text block to lay out", blocks, 1);
-  check(title && strlen(title) >= 3,
-        "the parser found a title", title ? (long)strlen(title) : 0, 3);
-
-  /* ---- measure, then paint ---- */
-  /* One measuring pass first: the height decides whether the page scrolls, and a
-   * repaint needs to know where the bottom is before it draws anything. */
-  measure = CW - 2 * MARGIN;
-  layout_t L = { .y = CONTENT_TOP, .blocks = 0, .lines = 0, .widest = 0, .glyphs = 0 };
-  layout_node(out->root, &L, measure, 0);
-  content_h = L.y;
-  doc_root = out->root;
-  repaint(win, 0);
-  L.glyphs = text_glyph_pixels;
-
-  printf("[net] layout %d blocks, %d lines, widest %d px, %d glyph pixels, bottom %d\n",
-         L.blocks, L.lines, L.widest, L.glyphs, L.y);
-  /* The layout pass and the tree walk must agree on how many boxes there are:
-   * a check that hard-codes "at least two" only describes the page I happened to
-   * fetch today. */
-  check(L.blocks == blocks, "every counted block became a box", L.blocks, blocks);
-  check(L.lines >= 4, "the text wrapped onto several lines", L.lines, 4);
-  check(L.widest <= measure, "no line escapes the measure", L.widest, measure);
-  check(L.glyphs > 800, "the glyph blitter drew the page", L.glyphs, 800);
+  check(content_h > 0, "the engine laid the page out", content_h, 1);
+  int nops = web_count(), runs = 0, maxr = 0;
+  for (int i = 0; i < nops; i++) {
+    const web_op_t *o = &web_ops()[i];
+    if (!o->text) continue;
+    runs++;
+    int r = o->x + (int)strlen(o->text) * GLYPH_W;
+    if (r > maxr) maxr = r;
+  }
+  printf("[net] layout %d ops, %d text runs, widest %d px, height %d\n",
+         nops, runs, maxr, content_h);
+  check(nops > 0, "the page produced a display list", nops, 1);
+  check(runs >= 4, "the page has text runs to paint", runs, 4);
+  check(maxr <= measure_w, "no text run escapes the measure", maxr, measure_w);
   check(content_h > CH - CONTENT_TOP,
         "the page is taller than the viewport, so it scrolls", content_h, CH);
 
-  /* ---- the fixture page ----
-   * A page fetched from the internet can be any shape tomorrow, so it cannot be
-   * the thing that proves multi-block layout. This one is compiled in: a heading,
-   * two paragraphs and a list, laid out through the same code with drawing off.
-   * The live page proves the pipeline end to end; this proves the boxes. */
-  static const char *const fixture =
-    "<!doctype html><html><head><title>fixture</title></head><body>"
-    "<h1>Layout Fixture</h1>"
-    "<p>Alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi "
-    "omicron pi rho sigma tau upsilon phi chi psi omega.</p>"
-    "<p>Short second paragraph.</p>"
-    "<ul><li>One item.</li><li>Two item.</li></ul>"
-    "<p>Joined<br>by a break.</p>"
-    "</body></html>";
-  GumboOutput *fx = gumbo_parse(fixture);
-  layout_t F = { .y = 40, .blocks = 0, .lines = 0, .widest = 0, .glyphs = 0 };
-  layout_node(fx->root, &F, measure, 0);
-  printf("[net] fixture %d blocks, %d lines, widest %d px, bottom %d\n",
-         F.blocks, F.lines, F.widest, F.y);
-  /* A <br> has no children, so text on either side of it fuses unless the
-   * collector turns it into a space. Checked on known input, because on a live
-   * page a missing space is invisible until someone reads the screen. */
-  {
-    GumboNode *p = 0;
-    GumboVector *b = &fx->root->v.element.children;
-    for (unsigned i = 0; i < b->length; i++) {
-      GumboNode *h = (GumboNode *)b->data[i];
-      if (h->type == GUMBO_NODE_ELEMENT && h->v.element.tag == GUMBO_TAG_BODY) {
-        GumboVector *k = &h->v.element.children;
-        for (unsigned j = 0; j < k->length; j++) {
-          GumboNode *c = (GumboNode *)k->data[j];
-          if (c->type == GUMBO_NODE_ELEMENT && c->v.element.tag == GUMBO_TAG_P) {
-            GumboVector *kc = &c->v.element.children;
-            for (unsigned m = 0; m < kc->length; m++) {
-              GumboNode *g = (GumboNode *)kc->data[m];
-              if (g->type == GUMBO_NODE_ELEMENT && g->v.element.tag == GUMBO_TAG_BR) p = c;
-            }
-          }
-        }
-      }
+  /* The click path. A link is a text run that carries an href, so the engine's
+   * hit map has to agree with the box it told us to paint - otherwise the link
+   * is decoration and the mouse handler is dead code. */
+  int links = 0, hits = 0, lost = 0, lx = -1, ly = -1;
+  for (int i = 0; i < nops; i++) {
+    const web_op_t *o = &web_ops()[i];
+    if (o->kind != 1 || !o->href) continue;
+    /* <a name="x"> and <a id="x"> are anchors with no box: they paint nothing,
+     * so there is nothing for the mouse to land on and nothing to check. */
+    if (o->w <= 0 || !o->text || !o->text[0]) { lost++; continue; }
+    links++;
+    if (web_hit_link(o->x + 1, o->y + 1) == o->href) {
+      hits++;
+      if (lx < 0) { lx = MARGIN + o->x; ly = CONTENT_TOP + o->y; }
     }
-    static char tb[256];
-    size_t u = 0; tb[0] = 0;
-    int found = 0;
-    check(p != 0, "the fixture has a paragraph with a break in it", p ? 1 : 0, 1);
-    if (p) {
-      collect_text(p, tb, sizeof tb, &u);
-      found = strstr(tb, "Joined by") != 0 || strstr(tb, "Joined  by") != 0;
-    }
-    printf("[net] br case: \"%s\"\n", tb);
-    check(found, "a <br> leaves a space between the words", found, 1);
   }
+  printf("[net] links %d, hit-tested %d, %d empty anchors, first at client %d,%d\n",
+         links, hits, lost, lx, ly);
+  check(links > 0, "the page has links", links, 1);
+  check(hits == links, "every link's painted box hit-tests to its own URL", hits, links);
 
-  check(F.blocks == 6, "the fixture lays out six boxes", F.blocks, 6);
-  check(F.lines >= 5, "the fixture's long paragraph wraps", F.lines, 5);
-  check(F.widest <= measure, "the fixture respects the measure", F.widest, measure);
-  check(F.y <= CH, "the fixture fits", F.y, CH);
-  gumbo_destroy_output(&kGumboDefaultOptions, fx);
+  /* ---- paint ---- */
+  text_glyph_pixels = 0;
+  paint(win_id, 0);
+  printf("[net] painted %d glyph pixels\n", text_glyph_pixels);
+  check(text_glyph_pixels > 800, "the blitter drew the page", text_glyph_pixels, 800);
 
-  /* the exact-pixel marker: below everything, known coordinate */
   int my = CH - 6;
-  fill(MARGIN, my, 24, 4, C_MARK);
   printf("[net] marker at %d,%d 24x4\n", MARGIN, my);
   check(pix[my * CW + MARGIN] == C_MARK, "the marker is in the surface",
         pix[my * CW + MARGIN], (long)C_MARK);
-
-  long r = sys3(SYS_SURF_PRESENT, win, 0, ((long)CW << 16) | CH);
+  long r = sys3(SYS_SURF_PRESENT, win_id, 0, ((long)CW << 16) | CH);
   check(r == 0, "presenting the page succeeds", r, 0);
 
   printf("[net] %d/%d\n", checks - fails, checks);
-  if (fails) { gumbo_destroy_output(&kGumboDefaultOptions, out); return 1; }
+  if (fails) return 1;
 
-  /* ---- scrolling ----
-   * Arrow keys move the page by one line. Each move is printed, so the serial log
-   * shows the input arriving rather than the program claiming it would. */
-  int vmax = content_h > CH ? content_h - CH : 0;
-  int scroll = 0;
-  printf("[net] scroll 0/%d (content %d, viewport %d)\n", vmax, content_h, CH);
+  /* ---- input: arrows scroll, a click follows a link ---- */
+  int vp = CH - CONTENT_TOP - 4;
+  int vmax = content_h > vp ? content_h - vp : 0;
+  int step = web_line_height(2);
+  if (step < 8) step = LH_BODY;
+  printf("[net] scroll 0/%d (content %d, viewport %d, step %d)\n", vmax, content_h, vp, step);
   for (;;) {
     win_ev_user_t ev;
-    long r = sys3(SYS_WIN_WAIT, win, (long)&ev, 0);
-    if (r < 0) break;
+    long w = sys3(SYS_WIN_WAIT, win_id, (long)&ev, 0);
+    if (w < 0) break;
     if (ev.kind == WIN_EV_CLOSE) break;
     if (ev.kind == WIN_EV_KEY) {
       int before = scroll;
-      if (ev.code == KEY_DOWN) scroll += LH_BODY;
-      else if (ev.code == KEY_UP) scroll -= LH_BODY;
+      if (ev.code == KEY_DOWN) scroll += step;
+      else if (ev.code == KEY_UP) scroll -= step;
       if (scroll < 0) scroll = 0;
       if (scroll > vmax) scroll = vmax;
       if (scroll != before) {
         printf("[net] scroll %d/%d\n", scroll, vmax);
-        repaint(win, scroll);
+        text_glyph_pixels = 0;
+        paint(win_id, scroll);
       }
+    } else if (ev.kind == WIN_EV_DOWN) {
+      const char *href = web_hit_link(ev.x - MARGIN, ev.y - CONTENT_TOP + scroll);
+      if (href) go(href);
     }
   }
-  gumbo_destroy_output(&kGumboDefaultOptions, out);
   return 0;
 }

@@ -23,11 +23,33 @@ static unsigned blend_px(unsigned dst, unsigned src, int a) {
   return (unsigned)((r << 16) | (g << 8) | b);
 }
 
+/* An optional clip rectangle, honoured by every primitive below. A page is drawn
+ * from a display list whose rectangles are the full content width, so without
+ * this a page's own background paints over the title bar and the scrollbar. Off
+ * until the includer turns it on: omirender draws its whole surface. */
+static int clip_x0, clip_y0, clip_x1, clip_y1, clip_on;
+
+static void clip_rect(int x0, int y0, int x1, int y1) {
+  clip_x0 = x0; clip_y0 = y0; clip_x1 = x1; clip_y1 = y1; clip_on = 1;
+}
+static void clip_none(void) { clip_on = 0; }
+
+/* Narrow a rectangle to the surface and then to the clip box. */
+static void clip_bounds(int *x, int *y, int *w, int *h) {
+  if (*x < 0) { *w += *x; *x = 0; }
+  if (*y < 0) { *h += *y; *y = 0; }
+  if (*x + *w > CW) *w = CW - *x;
+  if (*y + *h > CH) *h = CH - *y;
+  if (clip_on) {
+    if (*x < clip_x0) { *w -= clip_x0 - *x; *x = clip_x0; }
+    if (*y < clip_y0) { *h -= clip_y0 - *y; *y = clip_y0; }
+    if (*x + *w > clip_x1) *w = clip_x1 - *x;
+    if (*y + *h > clip_y1) *h = clip_y1 - *y;
+  }
+}
+
 static void fill(int x, int y, int w, int h, unsigned c) {
-  if (x < 0) { w += x; x = 0; }
-  if (y < 0) { h += y; y = 0; }
-  if (x + w > CW) w = CW - x;
-  if (y + h > CH) h = CH - y;
+  clip_bounds(&x, &y, &w, &h);
   if (w <= 0 || h <= 0) return;
   for (int j = 0; j < h; j++) {
     unsigned *row = pix + (y + j) * CW + x;
@@ -36,10 +58,7 @@ static void fill(int x, int y, int w, int h, unsigned c) {
 }
 
 static void blend(int x, int y, int w, int h, unsigned c, int a) {
-  if (x < 0) { w += x; x = 0; }
-  if (y < 0) { h += y; y = 0; }
-  if (x + w > CW) w = CW - x;
-  if (y + h > CH) h = CH - y;
+  clip_bounds(&x, &y, &w, &h);
   if (w <= 0 || h <= 0) return;
   for (int j = 0; j < h; j++) {
     unsigned *row = pix + (y + j) * CW + x;
@@ -62,6 +81,7 @@ static void glyph(int x, int y, char ch, unsigned c) {
       if (!(bits & (0x80 >> col))) continue;
       int px = x + col, py = y + r;
       if (px < 0 || py < 0 || px >= CW || py >= CH) continue;
+      if (clip_on && (px < clip_x0 || py < clip_y0 || px >= clip_x1 || py >= clip_y1)) continue;
       pix[py * CW + px] = c;
       text_glyph_pixels++;
     }

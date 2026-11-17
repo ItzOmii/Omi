@@ -22,8 +22,9 @@ process.
 windows, a bottom taskbar and a magnification dock, wallpapers decoded from JPEG
 at boot, midnight theme by default. Widgets: sticky note, big clock, weather.
 Apps drawn by the kernel shell: calculator, notes, media player, file manager,
-task manager (live process count), and Omi Net - a browser with its own HTML
-parsing (Gumbo) and image decoding.
+task manager (live process count). Omi Net, the browser, is not one of them: it
+is a ring-3 process that opens a window and a surface and does its own fetching,
+parsing (Gumbo) and layout.
 
 **Talks to the network.** e1000 driver, ARP, IPv4, ICMP, UDP, TCP with a real state
 machine and retransmission, a DNS resolver, and an HTTP client. The compositor
@@ -55,7 +56,8 @@ scaling and no resampling, so a surface pixel is a screen pixel.
 - **Surfaces are small and few.** Four at a time, up to 620x420 each. Damage
   rectangles are tracked and counted, but the compositor rebuilds the scene from
   the wallpaper every frame, so the copy still covers the whole client rect.
-- **Omi Net is a reader, not a browser.** HTML and images; no JavaScript, no CSS,
+- **Omi Net is a reader, not a browser.** A ring-3 process (`ominet.elf`) that
+  the dock spawns; HTML only, no JavaScript, no CSS,
   no images yet, and its text is one 8x16 ASCII font, so a page written outside
   ASCII loses the characters that are not in the font. It scrolls with the arrow
   keys: one line per press, clamped to the document.
@@ -101,7 +103,7 @@ in the serial log) and these numbered tallies:
 | `surftest` | 10/10 | surface mapping, present, damage, refusals |
 | `omirender` | 12/12 | glyphs, wrap, clipping and blending in a ring-3 rasteriser |
 | `surfexit` | — | a window and its surface are reaped when the process exits |
-| `ominet` | 22/22 | name resolution, TLS, HTML parsing, layout, painting, scrolling |
+| `ominet` | 23/23 | name resolution, TLS, HTML parsing, layout, painting, scrolling |
 | `tlsget` | 7/7 | real TLS handshakes from ring 3 |
 | `socktest` | 20/20 | musl's `socket`/`connect`/`send` over the BSD ABI |
 | `linux3` | 27/27 | Linux syscall surface |
@@ -121,7 +123,7 @@ Its colour bars are four pixels wide on purpose - a blit shifted by one pixel, o
 a downscale of one, does not survive that check.
 
 The surface tests park in a blocking wait rather than exiting, so the dump is
-taken with their windows alive; `ominet` fetches example.com over TLS and paints
+taken with their windows alive; `ominet` fetches iana.org over TLS and paints
 the page it received, and `surfexit` is the opposite test, filling a window
 with a colour nothing else uses and returning from `main` immediately. Nothing of
 that colour is left on screen afterwards, which is how the reaping is checked.
@@ -133,13 +135,14 @@ kernel/
 ├── boot/        Limine entry, boot modules
 ├── drivers/     framebuffer, ps2, usb (ehci/xhci/hid), e1000, hda, acpi, pci
 ├── fs/          VFS, descriptors, pipes, sockets, epoll
-├── gui/         compositor, shell apps, Omi Net, fonts, icons
+├── gui/         compositor, shell apps, fonts, icons
 ├── mm/          paging, heap, copy-on-write
 ├── net/         TCP, DNS, HTTP
 ├── ring3.c      ELF loader, native syscalls, Linux ABI, surfaces
 ├── lib/         BearSSL, Gumbo, string
 └── user/        the first process
-userland/        programs that run in ring 3 (built with musl-gcc)
+userland/        ring-3 programs (musl-gcc): ominet (browser, and the only HTML
+                 engine - omilayout.c), omirender, surftest, tlsget, socktest
 limine.conf      bootloader config
 Makefile         build
 ```

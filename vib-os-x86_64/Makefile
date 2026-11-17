@@ -96,7 +96,6 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/gui/desktop_mgr.c \
            $(KERNEL_DIR)/gui/window.c \
            $(KERNEL_DIR)/gui/compositor.c \
-           $(KERNEL_DIR)/gui/omiweb.c \
            $(KERNEL_DIR)/gui/ttf.c \
            $(KERNEL_DIR)/kernel_task.c \
            $(KERNEL_DIR)/gdt.c \
@@ -111,7 +110,6 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/fs/socket_selftest.c \
            $(KERNEL_DIR)/fs/readiness_selftest.c \
          $(KERNEL_DIR)/fs/preempt_selftest.c \
-           $(KERNEL_DIR)/gui/webimg.c \
            $(KERNEL_DIR)/gui/icons_ri.c \
            $(KERNEL_DIR)/net/tcp.c \
            $(KERNEL_DIR)/net/tls.c \
@@ -185,12 +183,6 @@ $(BUILD_DIR)/media/mp3.o: $(KERNEL_DIR)/media/mp3.c | $(BUILD_DIR)
 $(BUILD_DIR)/lib/gumbo/%.o: $(KERNEL_DIR)/lib/gumbo/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) -I$(GUMBO_DIR)/port -I$(GUMBO_DIR)/src $(CFLAGS) -w -c $< -o $@
-
-# The renderer includes gumbo.h, so it needs the same port headers the parser
-# uses (they keep clang's stdint/stddef/stdbool from colliding with types.h).
-$(BUILD_DIR)/gui/omiweb.o: $(KERNEL_DIR)/gui/omiweb.c | $(BUILD_DIR)
-	@mkdir -p $(dir $@)
-	$(CC) -I$(GUMBO_DIR)/port -I$(GUMBO_DIR)/src $(CFLAGS) -c $< -o $@
 
 # The user program. Freestanding C, no libc, no relocations, linked by its own
 # script (kernel/user/app.ld) at 0x8000000000 - the window elf.c maps.

@@ -19,16 +19,14 @@
 #include "icons_ri.h"
 #include "omi_net.h"
 #include "../include/task.h"
+#include "../include/elf.h"   /* ring3_spawn_elf: the dock starts the browser */
 #include "limine_modules.h"
 #include "mp3.h"
 #include "../include/hda.h"
 #include "../include/guiipc.h"
 #include "omi_http.h"
-#include "omiweb.h"
 #include "ttf.h"
-#include "webimg.h"
 
-static const web_image_t *on_page_image(const char *src, int len);
 #include "omi_tls.h"
 
 /* External font data */
@@ -3638,263 +3636,24 @@ static void draw_media(void) {
 }
 
 /* ---- Omi Net ----------------------------------------------------------
-   A real browser needs three things this has: a TCP stream, an HTTP client
-   (net/http.c) and something to paint. There is no TLS, so https-only hosts
-   are refused up front rather than failing mysteriously; the renderer is a
-   tag stripper that keeps block breaks, not a layout engine. */
-#define ON_MAX 40000
-static char on_url[192] = "example.com";
-static char on_text[ON_MAX];
-static char on_lines[400][92];
-static int  on_nlines;
-static int  on_state;          /* 0 idle, 1 loading, 2 ok, 3 failed */
-static int  on_scroll;
-static int  on_caret;
-static int  on_status;
-static http_result_t on_res;
-
-static int on_lc(char c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
-
-static int on_tag(const char *s, int len, int i, const char *name, int *closing) {
-  int n = 0;
-  while (name[n]) n++;
-  int at = i + 1;
-  *closing = 0;
-  if (at < len && s[at] == '/') { *closing = 1; at++; }
-  if (at + n > len) return 0;
-  for (int k = 0; k < n; k++)
-    if (on_lc(s[at + k]) != on_lc(name[k])) return 0;
-  char after = (at + n < len) ? s[at + n] : ' ';
-  return after == ' ' || after == '>' || after == '/' || after == '\r' ||
-         after == '\n' || after == '\t';
+   The browser is a process now (userland/ominet.c): it fetches over TLS, parses
+   with Gumbo, lays out with the engine this file used to own, and paints its own
+   surface. What is left here is a dock entry that starts it - a window and a
+   surface are the only things the kernel still provides. */
+static int ominet_running(void) {
+  for (int i = 0; i < task_count(); i++) {
+    task_t *t = task_at(i);
+    if (!t || t->state == TASK_FREE || t->state == TASK_DEAD) continue;
+    const char *n = task_name(i);
+    if (n && !strcmp(n, "ominet")) return 1;
+  }
+  return 0;
 }
 
-/* ---- page rendering -------------------------------------------------- */
-/* The renderer in gui/omiweb.c owns layout; it only needs to measure text,
- * which is why the font bitmaps stay in this file. */
-#define ON_PAD_L 14
-
-static const mface *web_faces(int f) {
-  switch (f) {
-    case 1: return &meep_s145;
-    case 2: return &meep_m100;
-    case 3: return &meep_m105;
-    case 4: return &meep_m115;
-    default: return &meep_s130;
-  }
-}
-
-static int web_measure(int font, const char *s) { return meep_text_w(web_faces(font), s); }
-
-/* re-flow the current document for a new viewport width - no refetch */
-static void web_relayout(void) {
-  if (on_state != 2 || !on_text[0]) return;
-  int cw = mapp[APP_BROWSER].w - 2 * ON_PAD_L;
-  if (cw < 120) cw = 120;
-  web_image_provider(on_page_image);
-  if (web_build(on_text, (int)strlen(on_text), cw, web_measure) == 0) on_nlines = web_height();
-}
-
-
-/* page images: bilinear, 16.16 fixed point, clipped to the window.
- * Weights are 0..256 in each axis and the four of them sum to 65536, so the
- * accumulation must be shifted by 16 - dividing by 256 lets a channel spill
- * into the next one and the result looks like noise. */
-static void blit_scaled(int dx, int dy, int dw, int dh, const uint32_t *src,
-                        int sw, int sh, int clip_y, int clip_b) {
-  if (!backbuffer || !src || sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
-  uint32_t sx = (uint32_t)((sw << 16) / dw), sy = (uint32_t)((sh << 16) / dh);
-  int W = (int)screen_width;
-  for (int y = 0; y < dh; y++) {
-    int py = dy + y;
-    if (py < clip_y || py >= clip_b) continue;
-    uint32_t fy = (uint32_t)y * sy;
-    int y0 = (int)(fy >> 16), y1 = y0 + 1 < sh ? y0 + 1 : sh - 1;
-    int wy = (int)((fy >> 8) & 0xFF);
-    const uint32_t *r0 = src + (size_t)y0 * sw, *r1 = src + (size_t)y1 * sw;
-    uint32_t *dst = backbuffer + (size_t)py * W;
-    for (int x = 0; x < dw; x++) {
-      int px = dx + x;
-      if (px < 0 || px >= W) continue;
-      uint32_t fx = (uint32_t)x * sx;
-      int x0 = (int)(fx >> 16), x1 = x0 + 1 < sw ? x0 + 1 : sw - 1;
-      int wx = (int)((fx >> 8) & 0xFF);
-      int w00 = (256 - wx) * (256 - wy), w01 = wx * (256 - wy);
-      int w10 = (256 - wx) * wy,        w11 = wx * wy;
-      uint32_t c00 = r0[x0], c01 = r0[x1], c10 = r1[x0], c11 = r1[x1];
-      uint32_t r = (uint32_t)((((c00 >> 16) & 0xFF) * w00 + ((c01 >> 16) & 0xFF) * w01 +
-                               ((c10 >> 16) & 0xFF) * w10 + ((c11 >> 16) & 0xFF) * w11) >> 16);
-      uint32_t g = (uint32_t)((((c00 >> 8) & 0xFF) * w00 + ((c01 >> 8) & 0xFF) * w01 +
-                               ((c10 >> 8) & 0xFF) * w10 + ((c11 >> 8) & 0xFF) * w11) >> 16);
-      uint32_t b = (uint32_t)(((c00 & 0xFF) * w00 + (c01 & 0xFF) * w01 +
-                               (c10 & 0xFF) * w10 + (c11 & 0xFF) * w11) >> 16);
-      if (r > 255) r = 255;
-      if (g > 255) g = 255;
-      if (b > 255) b = 255;
-      dst[px] = (r << 16) | (g << 8) | b;
-    }
-  }
-}
-
-
-static const web_image_t *on_page_image(const char *src, int len) {
-  static web_image_t v;
-  const oweb_image_t *im = webimg_get(src, len);
-  if (!im) return 0;
-  v.w = im->w; v.h = im->h; v.px = im->px;
-  return &v;
-}
-
-static void draw_web(int x, int y, int bottom) {
-  int n = web_count();
-  const web_op_t *ops = web_ops();
-  for (int i = 0; i < n; i++) {
-    const web_op_t *o = &ops[i];
-    int oy = y + o->y - on_scroll;
-    int oh = o->h > 0 ? o->h : 4;
-    if (oy > bottom) continue;
-    if (oy + oh < y - 2) continue;
-    if (o->kind == 0) {
-      if (o->h <= 0) continue;
-      meep_box(x + o->x, oy, o->w, o->h, o->radius, o->color, o->color);
-    } else if (o->kind == 3 && o->px) {
-      blit_scaled(x + o->x, oy, o->w, o->h, o->px, o->iw, o->ih, y, bottom);
-    } else if (o->kind == 2) {
-      meep_hline(x + o->x, oy, o->w, 1, o->color);
-    } else if (o->text) {
-      const mface *f = web_faces(o->font);
-      meep_text(f, x + o->x, oy, o->text, o->color);
-      if (o->bold) meep_text(f, x + o->x + 1, oy, o->text, o->color);
-    }
-  }
-}
-
-
-static void on_load(void) {
-  on_scroll = 0;
-  on_state = 1;
-  on_nlines = 0;
-  on_text[0] = 0;
-  const net_cfg_t *cfg = net_get();
-  if (!cfg->valid || !e1000_link()) { on_state = 3; on_status = 0; return; }
-  char url[256];
-  int u = 0;
-  if (!(on_url[0] == 'h' && on_url[1] == 't')) {
-    const char *p = "http://";
-    while (*p) url[u++] = *p++;
-  }
-  for (int i = 0; on_url[i] && u < 254; i++) url[u++] = on_url[i];
-  url[u] = 0;
-  /* paint "fetching..." before the blocking request, or the desktop just freezes */
-  gui_compose();
-  if (!http_get(cfg, url, on_text, ON_MAX, &on_res)) {
-    on_state = 3;
-    on_status = on_res.status;        /* -1 dns, -2 tcp, -3 send, -4 not http, -5 tls */
-    return;
-  }
-  on_status = on_res.status;
-  on_state = (on_res.status == 200) ? 2 : 3;
-  int n = on_res.len;
-  if (n <= 0) n = 0;
-  if (n > ON_MAX - 1) n = ON_MAX - 1;
-  on_text[n] = 0;
-  {
-    int cw = mapp[APP_BROWSER].w - 2 * ON_PAD_L;
-    if (cw < 120) cw = 120;
-    web_image_provider(on_page_image);
-    if (web_build(on_text, n, cw, web_measure) != 0) { on_state = 3; on_status = -4; return; }
-
-  }
-  on_nlines = web_height();
-}
-
-static void draw_browser(void) {
-  meep_app_t *a = &mapp[APP_BROWSER];
-  const char *state = "idle";
-  if (on_state == 1) state = "loading";
-  else if (on_state == 2) state = "live";
-  else if (on_state == 3) state = "no page";
-  app_win(a->x, a->y, a->w, a->h, "Omi Net", state, mapp_focus == APP_BROWSER);
-
-  int ty = a->y + APP_TITLE_H;
-
-  /* address pill: typed text, with a caret when focused */
-  int uy = ty + 10, uw = a->w - 20;
-  meep_box(a->x + 10, uy, uw, 24, 12, MEEP_LINE, MEEP_PAPER2);
-  int tw = meep_text_w(&meep_m100, on_url);
-  int avail = uw - 22;
-  int skip = 0;
-  while (tw > avail && skip < (int)sizeof(on_url)) {
-    skip++;
-    tw = meep_text_w(&meep_m100, on_url + skip);
-  }
-  meep_text(&meep_m100, a->x + 16, uy + (24 - meep_line_h(&meep_m100)) / 2,
-            on_url + skip, MEEP_INK);
-  if (mapp_focus == APP_BROWSER && ((on_caret / 20) & 1) == 0)
-    gui_draw_line(a->x + 17 + tw, uy + 6, a->x + 17 + tw, uy + 18, MEEP_INK);
-
-  meep_hline(a->x + 1, uy + 30, a->w - 2, 1, MEEP_LINE_SOFT);
-
-  int bx = a->x + 16, byy = uy + 42;
-  int bottom = a->y + a->h - 26;
-
-  if (on_state == 0) {
-    meep_text(&meep_m115, bx, byy, "type a url, press enter", MEEP_INK);
-    byy += 24;
-    meep_text(&meep_m100, bx, byy, "http and https both work.", MEEP_INK_SOFT);
-    byy += 16;
-    meep_text(&meep_m100, bx, byy, "bookmarks load, or type and press enter.", MEEP_INK_SOFT);
-  } else if (on_state == 1) {
-    meep_text(&meep_m115, bx, byy, "fetching...", MEEP_INK);
-  } else if (on_state == 3) {
-    meep_text(&meep_m115, bx, byy, "could not load that page", MEEP_INK);
-    byy += 22;
-    const char *why = "the reply did not parse.",
-                   *hint = "try another host.";
-    if (on_status == -1) { why = "dns has no address for that host."; hint = "check the name, or add a dot-com."; }
-    else if (on_status == -2) { why = "the host never opened a port."; hint = "site down or blocked."; }
-    else if (on_status == -3) { why = "the connection died mid request."; hint = "try again."; }
-    else if (on_status == -5) {
-      why = on_res.err[0] ? on_res.err : "the secure connection failed.";
-      hint = "no page was trusted, so nothing was shown.";
-    }
-    else if (on_status > 0) { why = "the server refused to serve the page."; hint = "it answered, but not with 200."; }
-    meep_text(&meep_m100, bx, byy, why, MEEP_INK_SOFT);
-    byy += 16;
-    meep_text(&meep_m100, bx, byy, hint, MEEP_INK_SOFT);
-  } else if (on_state == 2) {
-    /* the page gets its own paper: html assumes a light canvas */
-    meep_box(a->x + 1, byy - 2, a->w - 2, bottom - byy + 4, 0, 0xFCFAF4, 0xFCFAF4);
-    draw_web(a->x + ON_PAD_L, byy, bottom);
-  }
-
-  /* status strip, like the web shell's .mn-status */
-  char foot[84];
-  int f = 0;
-  const char *p = "http  ";
-  while (*p) foot[f++] = *p++;
-  if (on_status > 0) {
-    int v = on_status, d[4], n = 0;
-    if (!v) d[n++] = 0;
-    while (v) { d[n++] = v % 10; v /= 10; }
-    while (n) foot[f++] = (char)('0' + d[--n]);
-  } else if (on_status < 0) {
-    const char *q = "failed";
-    while (*q) foot[f++] = *q++;
-  } else foot[f++] = '-';
-  p = "   page ";
-  while (*p) foot[f++] = *p++;
-  { int v = on_nlines, d[6], n = 0; if (!v) d[n++] = 0;
-    while (v) { d[n++] = v % 10; v /= 10; }
-    while (n) foot[f++] = (char)('0' + d[--n]); }
-  p = "px   at ";
-  while (*p) foot[f++] = *p++;
-  { int v = on_scroll, d[6], n = 0; if (!v) d[n++] = 0;
-    while (v) { d[n++] = v % 10; v /= 10; }
-    while (n) foot[f++] = (char)('0' + d[--n]); }
-  foot[f] = 0;
-  meep_hline(a->x + 1, a->y + a->h - 24, a->w - 2, 1, MEEP_LINE_SOFT);
-  meep_text(&meep_m100, a->x + 14, a->y + a->h - 18, foot, MEEP_INK_SOFT);
+static void ominet_launch(void) {
+  if (ominet_running()) { serial_puts("[gui] ominet is already running\n"); return; }
+  int pid = ring3_spawn_elf("ominet", "ominet.elf", 0);
+  if (pid < 0) { serial_puts("[gui] ominet did not start: "); serial_puthex((uint64_t)pid); serial_puts("\n"); }
 }
 
 /* ---- one z-order for windows *and* widgets ---------------------------- */
@@ -3925,7 +3684,6 @@ static void app_defaults(int id, int *x, int *y, int *w, int *h) {
     case APP_CALC:  *x = 120; *y = 320; *w = 250; *h = APP_TITLE_H + 12 + 64 + 10 + 5 * 40 + 4 * 6 + 14; break;
     case APP_NOTES: *x = 400; *y = 300; *w = 430; *h = 360; break;
     case APP_MEDIA: *x = 300; *y = 190; *w = 420; *h = 260; break;
-    case APP_BROWSER: *x = 230; *y = 150; *w = 470; *h = 300; break;
     case APP_TASKS:   *x = 250; *y = 170; *w = 460; *h = 300; break;
     case APP_FILES:   *x = 300; *y = 130; *w = 520; *h = 380; break;
     default:        *x = 240; *y = 140; *w = 520; *h = 340; break;
@@ -3934,6 +3692,7 @@ static void app_defaults(int id, int *x, int *y, int *w, int *h) {
 
 static void app_open(int id) {
   if (id <= APP_NONE || id >= APP_COUNT) return;
+  if (id == APP_BROWSER) { ominet_launch(); return; }
   meep_app_t *a = &mapp[id];
   if (!a->open) {
     int x, y, w, h;
@@ -3950,6 +3709,7 @@ static void app_open(int id) {
 
 static void app_toggle(int id) {
   if (id <= APP_NONE || id >= APP_COUNT) return;
+  if (id == APP_BROWSER) { ominet_launch(); return; }
   if (mapp[id].open) {
     mapp[id].open = 0;
     if (mapp_focus == id) mapp_focus = APP_NONE;
@@ -4371,37 +4131,6 @@ static void open_task_manager(void) {
 /* Resolve an href against the page we are on: absolute, protocol-relative,
  * root-relative or sibling-relative. Anything else (mailto:, javascript:)
  * returns empty and the click is ignored. */
-static void on_resolve_url(const char *href, char *out, int cap) {
-  out[0] = 0;
-  if (!href || !*href) return;
-  int n = 0;
-  if (!strncmp(href, "http://", 7) || !strncmp(href, "https://", 8)) {
-    while (href[n] && n < cap - 1) { out[n] = href[n]; n++; }
-  } else if (href[0] == '/' && href[1] == '/') {
-    const char *pre = "https:";
-    while (pre[0] && n < cap - 1) out[n++] = *pre++;
-    while (*href && n < cap - 1) out[n++] = *href++;
-  } else if (href[0] == '/') {
-    const char *scheme = (!strncmp(on_url, "https://", 8)) ? "https://" : "http://";
-    int sl = (int)strlen(scheme);
-    for (int i = 0; i < sl && n < cap - 1; i++) out[n++] = scheme[i];
-    const char *hs = on_url + sl;
-    while (*hs && *hs != '/' && n < cap - 1) out[n++] = *hs++;
-    while (*href && n < cap - 1) out[n++] = *href++;
-  } else if (href[0] == '#') {
-    return;                              /* in-page anchors are not handled */
-  } else {
-    const char *base = on_url;
-    const char *last = 0;
-    for (const char *q = base; *q; q++) if (*q == '/') last = q;
-    if (!last) return;
-    last++;                              /* keep the trailing slash */
-    while (base < last && n < cap - 1) out[n++] = *base++;
-    while (*href && n < cap - 1) out[n++] = *href++;
-  }
-  out[n] = 0;
-}
-
 static int apps_click(int x, int y, int button) {
   if (button == 2) return 0;
   if (zl_n == 0) z_init();
@@ -4454,25 +4183,6 @@ static int apps_click(int x, int y, int button) {
       needs_redraw = 1; return 1;
     }
     if (y < a->y + APP_TITLE_H) { drag_app = e; drag_dx = x - a->x; drag_dy = y - a->y; needs_redraw = 1; return 1; }
-    if (e == APP_BROWSER && on_state == 2) {
-      int ox = a->x + ON_PAD_L, oy = a->y + APP_TITLE_H + 52;
-      int pbottom = a->y + a->h - 26;
-      if (y >= oy && y < pbottom && x >= ox) {
-        const char *href = web_hit_link(x - ox, y - oy + on_scroll);
-        if (href) {
-          char u[256];
-          on_resolve_url(href, u, (int)sizeof u);
-          if (u[0]) {
-            int k = 0;
-            while (u[k] && k < (int)sizeof on_url - 1) { on_url[k] = u[k]; k++; }
-            on_url[k] = 0;
-            on_load();
-          }
-          needs_redraw = 1;
-          return 1;
-        }
-      }
-    }
     if (e == APP_CALC) calc_body_click(x, y);
     if (e == APP_FILES) files_click(x, y, a);
     if (e == APP_MEDIA) {
@@ -4548,30 +4258,6 @@ static int apps_key(int key) {
   }
   if (mapp_focus == APP_NOTES) {
     np_key(key);
-    needs_redraw = 1;
-    return 1;
-  }
-  if (mapp_focus == APP_BROWSER) {
-    int n = 0;
-    while (on_url[n]) n++;
-    if (key == '\b' || key == 127) {
-      if (n > 0) on_url[n - 1] = 0;
-    } else if (key == '\n' || key == '\r') {
-      on_load();
-    } else if (key == KEY_UP) {
-      on_scroll -= 36;
-      if (on_scroll < 0) on_scroll = 0;
-    } else if (key == KEY_DOWN) {
-      int maxs = on_nlines - (mapp[APP_BROWSER].h - APP_TITLE_H - 100);
-      if (maxs < 0) maxs = 0;
-      on_scroll += 36;
-      if (on_scroll > maxs) on_scroll = maxs;
-    } else if (key >= 32 && key < 127 && n < (int)sizeof(on_url) - 1) {
-      on_url[n] = (char)key;
-      on_url[n + 1] = 0;
-    } else {
-      return 0;
-    }
     needs_redraw = 1;
     return 1;
   }
@@ -4998,7 +4684,6 @@ static void apps_draw(void) {
     else if (e == APP_FILES) draw_files();
     else if (e == APP_NOTES) draw_notes();
     else if (e == APP_MEDIA) draw_media();
-    else if (e == APP_BROWSER) draw_browser();
   }
   winipc_draw_all();          /* ring-3 windows sit above the built-in apps */
 }
@@ -5855,6 +5540,31 @@ static void gui_poll_input(void) {
   int left_release = !(buttons & 1) && (prev_buttons & 1);
   int left_press = (buttons & 1) && !(prev_buttons & 1);
 
+  /* The drawn pointer follows the hardware every frame, including while it is
+   * over a foreign window: the early return below hands the click to ring 3
+   * and used to skip this block, which parked the cursor on the window edge. */
+  /* Check if mouse moved */
+  if (new_x != last_mouse_x || new_y != last_mouse_y) {
+    /* Mark old and new cursor positions as dirty */
+    int cursor_size = UI_SCALE_VAL(20);
+    mark_dirty(last_mouse_x, last_mouse_y, cursor_size, cursor_size);
+    mark_dirty(new_x, new_y, cursor_size, cursor_size);
+    
+    /* Mark dock area if mouse is near - include space for magnified icons and labels */
+    int dock_extend = UI_SCALE_VAL(80); /* Space for magnification + label */
+    if (new_y > (int)screen_height - DOCK_HEIGHT - dock_extend || 
+        last_mouse_y > (int)screen_height - DOCK_HEIGHT - dock_extend) {
+      mark_dirty(0, screen_height - DOCK_HEIGHT - dock_extend, screen_width, DOCK_HEIGHT + dock_extend + 10);
+    }
+    
+    last_mouse_x = new_x;
+    last_mouse_y = new_y;
+    needs_redraw = 1;
+  }
+  
+  mouse_x = new_x;
+  mouse_y = new_y;
+
   /* A foreign window that owns the pointer consumes the click: the built-in
    * apps and the desktop never see it. */
   if (winipc_input(new_x, new_y, buttons, left_press, left_release)) {
@@ -5916,7 +5626,7 @@ static void gui_poll_input(void) {
   
   /* Release dragging on mouse up */
   if (left_release) {
-    if (resize_app != APP_NONE) { web_relayout(); resize_app = APP_NONE; }
+    if (resize_app != APP_NONE) resize_app = APP_NONE;
     dragging_window = DRAG_NONE;
     drag_app = APP_NONE;
     wg_drag = -1;
@@ -5954,27 +5664,6 @@ static void gui_poll_input(void) {
     needs_redraw = 1;
   }
   
-  /* Check if mouse moved */
-  if (new_x != last_mouse_x || new_y != last_mouse_y) {
-    /* Mark old and new cursor positions as dirty */
-    int cursor_size = UI_SCALE_VAL(20);
-    mark_dirty(last_mouse_x, last_mouse_y, cursor_size, cursor_size);
-    mark_dirty(new_x, new_y, cursor_size, cursor_size);
-    
-    /* Mark dock area if mouse is near - include space for magnified icons and labels */
-    int dock_extend = UI_SCALE_VAL(80); /* Space for magnification + label */
-    if (new_y > (int)screen_height - DOCK_HEIGHT - dock_extend || 
-        last_mouse_y > (int)screen_height - DOCK_HEIGHT - dock_extend) {
-      mark_dirty(0, screen_height - DOCK_HEIGHT - dock_extend, screen_width, DOCK_HEIGHT + dock_extend + 10);
-    }
-    
-    last_mouse_x = new_x;
-    last_mouse_y = new_y;
-    needs_redraw = 1;
-  }
-  
-  mouse_x = new_x;
-  mouse_y = new_y;
   
   /* Detect clicks */
   int left_click = (buttons & 1) && !(prev_buttons & 1);
@@ -6396,12 +6085,7 @@ void gui_main_loop(void) {
       if (!wx_tried && frame_count > 40 && e1000_link()) { wx_tried = 1; wx_fetch(); }
     }
     mp_pump();                       /* paces playback at real time */
-    /* a focused Omi Net window needs a caret tick even when nothing happens */
-    if (++idle > 3000000u) {
-      idle = 0;
-      on_caret++;
-      if (mapp_focus == APP_BROWSER && mapp[APP_BROWSER].open) needs_redraw = 1;
-    }
+    if (++idle > 3000000u) idle = 0;
     /* Poll input aggressively - USB legacy emulation requires frequent polling */
     for (int poll = 0; poll < 20; poll++) {
       ps2_poll();

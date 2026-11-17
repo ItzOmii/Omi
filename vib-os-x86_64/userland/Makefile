@@ -113,10 +113,12 @@ $(GUMBO_LIB): $(GUMBO_SRCS)
 	   musl-gcc -O2 -I$(CURDIR)/$(GUMBO_USR)/src -c {} -o $$o || exit 255' || { echo "Gumbo build failed"; rm -f $@; exit 1; }
 	@ar rcs $@ build/gumbo_user/obj/*.o
 
-ominet.elf: ominet.c fetch.c fetch.h omitext.h glyphs.h roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB)
+# omilayout.c is the layout engine that used to run in the kernel, moved here
+# rather than rewritten: one copy in the tree, and its CSS subset comes with it.
+ominet.elf: ominet.c fetch.c fetch.h omitext.h glyphs.h omilayout.c omilayout.h roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB)
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping ominet"; exit 0; }
 	@musl-gcc -O2 -static -no-pie $(BEARSSL_INC) -Ishim -I$(GUMBO_USR)/src -o $@ \
-	  ominet.c fetch.c roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB) \
+	  ominet.c fetch.c omilayout.c roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB) \
 	  && echo "built $@ ($$(stat -c%s $@) bytes)"
 
 tlsget.elf: tlsget.c roots_user.o $(BEARSSL_LIB)

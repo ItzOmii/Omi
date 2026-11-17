@@ -7,18 +7,20 @@
  * readable, no scripting, no images, no floats or flexbox.
  */
 
-#include "types.h"
-#include "kmalloc.h"
-#include "string.h"
-#include "omiweb.h"
-
-extern void serial_puts(const char *s);
-extern void serial_puthex(uint64_t v);
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include "omilayout.h"
 #include "gumbo.h"
 
-/* provided by lib/gumbo/glue.c - the parser allocates from the kernel heap */
-void *malloc(size_t n);
-void free(void *p);
+/* The kernel writes kmalloc/kfree; in a process these are libc's malloc/free.
+ * Same names, so the engine did not need rewriting to move - which is the point
+ * of moving it instead of reimplementing it. */
+static void *kmalloc(size_t n) { return malloc(n); }
+static void kfree(void *p) { free(p); }
+static void *krealloc(void *p, size_t n) { return realloc(p, n); }
 
 /* ------------------------------------------------------------------ state */
 
@@ -944,7 +946,11 @@ const char *web_hit_link(int x, int y) {
     const web_op_t *o = &ops[i];
     if (o->kind != 1 || !o->href) continue;
     if (x < o->x || x >= o->x + o->w) continue;
-    if (y < o->y || y > o->y + (o->h > 0 ? o->h : 4) + 2) continue;
+    /* The box, not the box plus slack: text boxes on consecutive lines touch,
+     * and two pixels of downward grace made a click on a wrapped link's second
+     * line land on the first, opening the wrong page. An empty box keeps a
+     * little height so a bare anchor is still reachable. */
+    if (y < o->y || y > o->y + (o->h > 0 ? o->h - 1 : 4)) continue;
     return o->href;
   }
   return 0;

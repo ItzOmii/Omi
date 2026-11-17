@@ -1,5 +1,5 @@
 /*
- * Omi - HTML rendering
+ * Omi - HTML rendering, in the process that owns the window
  *
  * Gumbo parses the document; this file turns the tree into a flat display list
  * of rectangles and text runs that the compositor paints inside the browser
@@ -8,10 +8,11 @@
  * basic colours and boxes) comes out readable instead of as one run-on line.
  */
 
-#ifndef _OMIWEB_H
-#define _OMIWEB_H
+#ifndef _OMILAYOUT_H
+#define _OMILAYOUT_H
 
-#include "types.h"
+#include <stdint.h>
+#include <stddef.h>
 
 /* one drawing instruction, in page coordinates (origin = top left of content) */
 typedef struct {
