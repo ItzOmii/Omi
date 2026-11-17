@@ -90,7 +90,7 @@ boot it in UEFI or legacy mode.
 ## What proves it
 
 Everything above is the output of a program that runs on the ISO at boot, not a
-description of intent. A stock boot prints 198 individual pass lines (`[tag] ok`
+description of intent. A stock boot prints 217 individual pass lines (`[tag] ok`
 in the serial log) and these numbered tallies:
 
 | program | result | what it covers |
@@ -98,6 +98,7 @@ in the serial log) and these numbered tallies:
 | `surftest` | 10/10 | surface mapping, present, damage, refusals |
 | `omirender` | 12/12 | glyphs, wrap, clipping and blending in a ring-3 rasteriser |
 | `surfexit` | — | a window and its surface are reaped when the process exits |
+| `ominet` | 19/19 | TLS, HTML parsing, layout and painting in a ring-3 process |
 | `tlsget` | 7/7 | real TLS handshakes from ring 3 |
 | `socktest` | 20/20 | musl's `socket`/`connect`/`send` over the BSD ABI |
 | `linux3` | 27/27 | Linux syscall surface |
@@ -117,7 +118,8 @@ Its colour bars are four pixels wide on purpose - a blit shifted by one pixel, o
 a downscale of one, does not survive that check.
 
 The surface tests park in a blocking wait rather than exiting, so the dump is
-taken with their windows alive; `surfexit` is the opposite test, filling a window
+taken with their windows alive; `ominet` fetches example.com over TLS and paints
+the page it received, and `surfexit` is the opposite test, filling a window
 with a colour nothing else uses and returning from `main` immediately. Nothing of
 that colour is left on screen afterwards, which is how the reaping is checked.
 
