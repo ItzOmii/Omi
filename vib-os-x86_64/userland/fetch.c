@@ -32,6 +32,10 @@
 #include "omi_roots.h"
 #include "fetch.h"
 
+#define SYS_RESOLVE 32   /* (host, ip_out[4]) -> 0 | -ENOENT */
+#define SYS_YIELD    3
+#define SYS_TICKS    4
+
 #define MAX_ROOTS 32
 #define DN_MAX    256
 #define EPOCH_YEAR0_DAYS 719528
@@ -70,6 +74,36 @@ static int load_roots(void) {
     n++;
   }
   return n;
+}
+
+static long sys3(long n, long a, long b, long c) {
+  long r;
+  __asm__ volatile("int $0x80" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "memory");
+  return r;
+}
+
+/* Name resolution is the kernel's: a process asks, the kernel answers with four
+ * bytes. Falling back to a pinned address would hide a broken resolver, so a
+ * failure here is a failure. */
+static int resolve_host(const char *host, char ip[16]) {
+  /* The resolver answers -ENOENT until the lease has given it a server to ask,
+   * and this program can be started before that. Waiting is the browser's job:
+   * a client that assumes the network is up is a client that fails on the boot
+   * where it is not, and looks like a broken resolver when it does. */
+  unsigned char b[4] = { 0, 0, 0, 0 };
+  long r = -1;
+  unsigned long deadline = 0;
+  for (int attempt = 0; attempt < 200; attempt++) {
+    r = sys3(SYS_RESOLVE, (long)host, (long)b, 0);
+    if (r == 0) break;
+    if (!deadline) deadline = (unsigned long)sys3(SYS_TICKS, 0, 0, 0) + 600;  /* ~10 s */
+    if ((unsigned long)sys3(SYS_TICKS, 0, 0, 0) > deadline) return -1;
+    sys3(SYS_YIELD, 0, 0, 0);
+    for (volatile long spin = 0; spin < 200000; spin++) { }
+  }
+  if (r != 0) return -1;
+  snprintf(ip, 16, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+  return 0;
 }
 
 static int dial(const char *addr, int port) {
@@ -180,12 +214,19 @@ static long exchange_all(int fd, const char *req, char *out, size_t cap) {
   return (long)total;
 }
 
-long https_get(const char *addr, int port, const char *sni, const char *path,
-               char *out, size_t cap, const char **why, long *body_len) {
+long https_get(const char *host, int port, const char *path,
+               char *out, size_t cap, const char **why, long *body_len,
+               char *ip_used) {
   *why = "ok";
   if (body_len) *body_len = 0;
+  if (ip_used) ip_used[0] = 0;
 
-  int fd = dial(addr, port);
+  char ip[16];
+  if (resolve_host(host, ip) != 0) { *why = "resolve"; return -1; }
+  if (ip_used) snprintf(ip_used, 16, "%s", ip);
+
+  const char *sni = host;
+  int fd = dial(ip, port);
   if (fd < 0) { *why = "connect"; return -1; }
 
   if (!handshake(fd, sni, why)) { close(fd); return -1; }
