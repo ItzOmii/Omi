@@ -4424,7 +4424,7 @@ int winipc_focused(void) {
 /* Pointer handling for foreign windows. A click anywhere on one of them, and
  * every move while a drag is in progress, is consumed here: the built-in apps
  * never see it. */
-int winipc_input(int mx, int my, int buttons, int pressed, int released) {
+int winipc_input(int mx, int my, int buttons, int pressed, int released, int wheel) {
   if (fwin_drag >= 0) {
     fwin_t *f = &fwin[fwin_drag];
     if (!f->used) {
@@ -4453,6 +4453,14 @@ int winipc_input(int mx, int my, int buttons, int pressed, int released) {
   fwin_t *f = &fwin[hit];
   int cxp = mx - f->x - 1;
   int cyp = my - f->y - APP_TITLE_H;
+
+  /* Wheel first: it is not a button event, so it must not fall through to the
+   * press path - and a client that only reacts to clicks would otherwise have no
+   * way to scroll at all. The owning window is woken by the push itself. */
+  if (wheel && cyp >= 0) {
+    fwin_push(f, WIN_EV_WHEEL, cxp, cyp, wheel);
+    return 1;
+  }
 
   if (pressed) {
     fwin_focus = hit;
@@ -5595,6 +5603,7 @@ static void gui_poll_input(void) {
   int new_x = ps2_get_mouse_x();
   int new_y = ps2_get_mouse_y();
   int buttons = ps2_get_mouse_buttons();
+  int wheel = ps2_get_mouse_wheel();
   int left_held = buttons & 1;
   int left_release = !(buttons & 1) && (prev_buttons & 1);
   int left_press = (buttons & 1) && !(prev_buttons & 1);
@@ -5626,7 +5635,7 @@ static void gui_poll_input(void) {
 
   /* A foreign window that owns the pointer consumes the click: the built-in
    * apps and the desktop never see it. */
-  if (winipc_input(new_x, new_y, buttons, left_press, left_release)) {
+  if (winipc_input(new_x, new_y, buttons, left_press, left_release, wheel)) {
     prev_buttons = buttons;
     needs_redraw = 1;
     return;

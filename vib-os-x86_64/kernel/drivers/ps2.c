@@ -4,6 +4,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/gui.h"   /* serial_puts: a driver that silently degrades is undebuggable */
 
 /* ===================================================================== */
 /* PS/2 Controller Ports                                                 */
@@ -46,6 +47,7 @@
 #define MOUSE_CMD_DEFAULTS 0xF6
 #define MOUSE_CMD_ENABLE 0xF4
 #define MOUSE_CMD_SET_RATE 0xF3
+#define MOUSE_CMD_GETID    0xF2
 
 /* ===================================================================== */
 /* Port I/O                                                              */
@@ -157,6 +159,12 @@ volatile int ps2_mouse_buttons = 0;
 /* Mouse packet buffer */
 static uint8_t mouse_packet[4];
 static int mouse_packet_index = 0;
+/* Wheel mice report a fourth byte. The device only sends it after the
+ * sample-rate knock below has put it in IntelliMouse mode; a plain three-byte
+ * mouse would treat that byte as the start of the next packet, so the packet
+ * length is decided once, at init, from the device ID. */
+static int mouse_packet_len = 3;
+static volatile int mouse_wheel;   /* z movement not yet consumed by a poll */
 
 /* Extended scancode state */
 static int extended_scancode = 0;
@@ -260,12 +268,21 @@ void ps2_poll(void) {
         continue;
       }
       
-      if (mouse_packet_index >= 3) {
+      if (mouse_packet_index >= mouse_packet_len) {
         mouse_packet_index = 0;
         
         uint8_t flags = mouse_packet[0];
         int dx = mouse_packet[1];
         int dy = mouse_packet[2];
+
+        /* Wheel: a signed four-bit nibble in the fourth byte, positive for
+         * away from the user. Accumulated rather than overwritten, because a
+         * fast flick can deliver several packets between two polls. */
+        if (mouse_packet_len == 4) {
+          int z = mouse_packet[3] & 0x0F;
+          if (z & 0x08) z -= 16;
+          mouse_wheel += z;
+        }
         
         /* Sign extension */
         if (flags & 0x10) dx -= 256;
@@ -544,7 +561,38 @@ int ps2_init(void) {
     ps2_mouse_write(100);
     for (int i = 0; i < 1000; i++) io_wait();
     ps2_flush_output();
-    
+
+    /* Ask for the wheel: the IntelliMouse knock is three sample rates in a row
+     * (200, 100, 80), after which the device reports a 4-byte packet and answers
+     * its ID as 3. A mouse that ignores the knock stays at ID 0 and keeps
+     * sending 3-byte packets - which is why the length is set from the ID rather
+     * than assumed. Every write's ack is drained before the next, or the ID read
+     * below returns a leftover 0xFA and the mouse is misconfigured for good. */
+    {
+      static const uint8_t knock[3] = { 200, 100, 80 };
+      for (int k = 0; k < 3; k++) {
+        ps2_mouse_write(MOUSE_CMD_SET_RATE);
+        for (int i = 0; i < 500; i++) io_wait();
+        ps2_flush_output();
+        ps2_mouse_write(knock[k]);
+        for (int i = 0; i < 500; i++) io_wait();
+        ps2_flush_output();
+      }
+      ps2_mouse_write(MOUSE_CMD_GETID);
+      for (int i = 0; i < 2000; i++) io_wait();
+      int id = -1, saw_ack = 0;
+      for (int i = 0; i < 4; i++) {
+        if (!(inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL)) break;
+        uint8_t b = inb(PS2_DATA_PORT);
+        if (b == 0xFA) { saw_ack = 1; continue; }
+        if (saw_ack) { id = b; break; }
+      }
+      mouse_packet_len = (id == 3 || id == 4) ? 4 : 3;
+      serial_puts("[ps2] mouse id=");
+      serial_puthex((uint64_t)(id < 0 ? 0xFF : id));
+      serial_puts(mouse_packet_len == 4 ? " wheel: 4-byte packets\n" : " no wheel: 3-byte packets\n");
+      ps2_flush_output();
+    }
     /* Enable data reporting */
     ps2_mouse_write(MOUSE_CMD_ENABLE);
     for (int i = 0; i < 1000; i++) io_wait();
@@ -578,6 +626,15 @@ int ps2_init(void) {
 int ps2_get_mouse_x(void) { return ps2_mouse_x; }
 int ps2_get_mouse_y(void) { return ps2_mouse_y; }
 int ps2_get_mouse_buttons(void) { return ps2_mouse_buttons; }
+
+/* Wheel movement since the last call, in notches, positive away from the user.
+ * Consuming rather than latching means a frame that arrives late still sees
+ * every notch once, and none twice. */
+int ps2_get_mouse_wheel(void) {
+  int v = mouse_wheel;
+  mouse_wheel = 0;
+  return v;
+}
 
 /* Keep old handler functions for compatibility */
 void ps2_keyboard_handler(void) { ps2_poll(); }

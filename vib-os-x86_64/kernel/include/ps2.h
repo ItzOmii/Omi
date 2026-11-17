@@ -61,6 +61,7 @@ void ps2_set_mouse_scale(int scale);
 int ps2_get_mouse_x(void);
 int ps2_get_mouse_y(void);
 int ps2_get_mouse_buttons(void);
+int ps2_get_mouse_wheel(void);   /* notches since last call, + = away */
 
 /* Ctrl+Alt+Del was pressed since the last call (latched, then cleared) */
 int ps2_take_ctrl_alt_del(void);

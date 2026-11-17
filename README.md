@@ -272,6 +272,11 @@ it a real engine rather than a tag stripper:
   are on screen from the first frame, so a slow or absent uplink is a browser saying what it is
   doing, not a black rectangle. A load that cannot be made says why in the strip, in the accent
   colour, and leaves the window open to be pointed somewhere else.
+- **The mouse works inside the window**: a click on a link follows it, and the wheel scrolls the
+  page a line a notch, both directions, the same step the arrow keys use. Wheel support is
+  negotiated at boot — the driver asks the mouse for IntelliMouse mode (200/100/80 knock) and reads
+  the fourth packet byte only if the device answers ID 3, so a three-byte mouse is unaffected.
+  `[ps2] mouse id=0x3 wheel: 4-byte packets` on the serial log says which one you have.
 - **The taskbar shows windows, not processes.** The `omi net` entry exists exactly as long as one of
   its windows does, and closing the window ends the process behind it; a process that outlived its
   window is ended on the next launch instead of leaving a button that raises nothing.

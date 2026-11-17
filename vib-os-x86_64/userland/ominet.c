@@ -134,6 +134,7 @@ static const char *find_title(GumboNode *n, char *out, size_t cap) {
 #define WIN_EV_DOWN 2
 #define WIN_EV_KEY  4
 #define WIN_EV_CLOSE 5
+#define WIN_EV_WHEEL 6
 #define KEY_UP   0x100
 #define KEY_DOWN 0x101
 #define KEY_ESC  0x107
@@ -532,6 +533,18 @@ int main(void) {
           text_glyph_pixels = 0;
           paint(win_id, scroll);
         }
+      }
+    } else if (ev.kind == WIN_EV_WHEEL) {
+      /* The wheel is the pointer's scroll: one notch is one line, the same step
+       * the arrow keys use, and positive is away from the user - up the page. */
+      int before = scroll;
+      scroll -= ev.code * step;
+      if (scroll < 0) scroll = 0;
+      if (scroll > vmax) scroll = vmax;
+      if (scroll != before) {
+        printf("[net] wheel %d/%d\n", scroll, vmax);
+        text_glyph_pixels = 0;
+        paint(win_id, scroll);
       }
     } else if (ev.kind == WIN_EV_DOWN) {
       const char *href = web_hit_link(ev.x - MARGIN, ev.y - CONTENT_TOP + scroll);

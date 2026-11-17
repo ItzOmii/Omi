@@ -38,6 +38,7 @@ typedef struct {
 #define WIN_EV_UP     3
 #define WIN_EV_KEY    4
 #define WIN_EV_CLOSE  5
+#define WIN_EV_WHEEL  6   /* code = notches, positive away from the user */
 
 typedef struct {
   int32_t kind;
@@ -88,7 +89,7 @@ void     surf_release_window(int win_id);
 
 /* input: called from the compositor's poll loop. Returns 1 when a foreign
  * window owns the pointer, so the built-in apps see nothing. */
-int  winipc_input(int mx, int my, int buttons, int pressed, int released);
+int  winipc_input(int mx, int my, int buttons, int pressed, int released, int wheel);
 int  winipc_key(int key);           /* 1 = consumed by the focused window */
 int  winipc_poll(int id, win_event_t *out);   /* 1 = event copied, 0 = empty */
 int  winipc_focused(void);          /* window id with keyboard focus, or 0 */
