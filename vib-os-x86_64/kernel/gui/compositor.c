@@ -3650,8 +3650,19 @@ static int ominet_running(void) {
   return 0;
 }
 
+/* The browser's window lives in the ring-3 window table, which is declared
+ * further down this file than the launcher: the lookup is defined there and
+ * only declared here. */
+static int fwin_focus_browser(void);
+
 static void ominet_launch(void) {
-  if (ominet_running()) { serial_puts("[gui] ominet is already running\n"); return; }
+  /* An app that is running has a window; clicking its entry again brings that
+   * window forward rather than starting a second copy - or doing nothing at
+   * all, which is what "already running" amounted to. */
+  if (ominet_running()) {
+    if (!fwin_focus_browser()) serial_puts("[gui] ominet is running with no window\n");
+    return;
+  }
   int pid = ring3_spawn_elf("ominet", "ominet.elf", 0);
   if (pid < 0) { serial_puts("[gui] ominet did not start: "); serial_puthex((uint64_t)pid); serial_puts("\n"); }
 }
@@ -3815,7 +3826,10 @@ static int tb_walk(int *ids, int *xs, int *ws) {
   int right_limit = (int)screen_width - UI_SCALE_VAL(150);   /* leave the clock clear */
   int n = 0;
   for (int id = 1; id < APP_COUNT; id++) {
-    if (!mapp[id].open) continue;
+    /* The browser is not one of mapp[]'s windows: it is a process with a
+     * surface, so "open" for it means "the process is alive". */
+    int is_open = (id == APP_BROWSER) ? ominet_running() : mapp[id].open;
+    if (!is_open) continue;
     int w = UI_SCALE_VAL(28) + meep_text_w(&meep_s130, app_title(id)) * s +
             UI_SCALE_VAL(14);
     if (cx + w > right_limit) break;
@@ -4332,6 +4346,18 @@ int winipc_poll(int id, win_event_t *out) {
   return 1;
 }
 
+/* The browser's window, if it has one: a ring-3 app owns its window, so the
+ * only way to find it is to ask each window who opened it. */
+static int fwin_focus_browser(void) {
+  for (int i = 0; i < WINIPC_MAX; i++) {
+    if (!fwin[i].used) continue;
+    int o = fwin[i].owner;
+    const char *n = o > 0 ? task_name(o) : 0;
+    if (n && !strcmp(n, "ominet")) { fwin_focus = i; needs_redraw = 1; return 1; }
+  }
+  return 0;
+}
+
 int winipc_owner(int id) {
   fwin_t *f = fwin_find(id);
   return f ? f->owner : 0;
@@ -4513,6 +4539,7 @@ void winipc_close(int id) {
     serial_puts(" dmg_px_all=");     serial_puthex(surf_dmg_px);
     serial_puts("\n");
   }
+  int owner = f->owner;
   surf_release_window(id);            /* the frames belong to the window */
   for (int i = 0; i < WINIPC_MAX; i++) {
     if (&fwin[i] == f) {
@@ -4522,6 +4549,12 @@ void winipc_close(int id) {
   f->used = 0;
   fwin_focus_topmost();
   needs_redraw = 1;
+  /* A client waits in SYS_WIN_WAIT by blocking until something wakes it, and
+   * closing a window is not an input event. Without this the process slept
+   * forever after a close: its task never went DEAD, so the launcher kept
+   * answering "ominet is already running" and the browser could not be
+   * started again for the rest of the boot. */
+  if (owner > 0) task_wake(owner);
 }
 
 /* A process that exits owns nothing any more. Closing its windows here is what
@@ -5443,7 +5476,9 @@ static void handle_mouse_click(int x, int y, int button) {
       int hit = -1;
       for (int i = 0; i < n; i++)
         if (x >= xs[i] && x < xs[i] + ws[i]) hit = ids[i];
-      if (hit > 0) {
+      if (hit == APP_BROWSER) {
+        ominet_launch();                     /* focuses the window if it is up */
+      } else if (hit > 0) {
         if (mapp[hit].min) mapp[hit].min = 0;      /* restore a minimized app */
         mapp_focus = hit;
         z_top(hit);

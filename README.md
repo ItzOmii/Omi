@@ -266,6 +266,10 @@ it a real engine rather than a tag stripper:
 - **Images** decoded system-wide by stb_image (PNG and JPEG), not just in the browser.
 - **Links are clickable** and resolved against the page they came from; **tables get genuine
   per-column widths** from their own layout pass.
+- **Typed URLs work**: `/` opens the address strip, Enter navigates, Esc drops it, and a 301/302/303/
+  307/308 is followed up to five hops — `iana.org` lands on `www.iana.org` instead of an error page.
+  A load that cannot be made says why in the strip, in the accent colour, rather than looking like a
+  freeze.
 
 ## The screens
 

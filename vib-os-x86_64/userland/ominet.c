@@ -60,6 +60,11 @@ static char cur_url[192] = "https://" HOST0 PATH0;
 static char page[MAX_PAGE];
 
 static long win_id;
+
+/* The address bar: '/' opens it, Enter loads, Esc drops it. */
+static int editing, edit_len;
+static char err_msg[96];      /* the last failure, shown in the chrome */
+static char edit[192];
 static int measure_w, content_h, scroll;
 
 /* After the surface and its size: the rasteriser works on the includer's pix,
@@ -120,6 +125,7 @@ static const char *find_title(GumboNode *n, char *out, size_t cap) {
 #define WIN_EV_CLOSE 5
 #define KEY_UP   0x100
 #define KEY_DOWN 0x101
+#define KEY_ESC  0x107
 
 /* 16 bytes, matching win_event_t in kernel/include/guiipc.h: kind, x, y, code. */
 typedef struct { int kind, x, y, code; } win_ev_user_t;
@@ -137,13 +143,17 @@ static int user_measure(int font, const char *s) {
 
 /* Fetch the current URL and lay it out. Returns the status, and leaves
  * content_h at 0 when there is nothing to paint. */
+const char *https_get_location(void);   /* fetch.c: the Location header, if any */
+
 static long load_page(void) {
   const char *why = "not tried";
   long blen = 0;
   char ip[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   /* A dropped SYN is not a bug in the browser, so it gets three tries before
    * the page is called dead - but every attempt is printed, and the checks run
-   * against the last one. */
+   * against the last one. The tries are back to back: an earlier version
+   * yielded twenty thousand times between them, which parked the browser for
+   * minutes with its keyboard dead, and looked exactly like a hang. */
   long status = -1;
   for (int attempt = 1; attempt <= 3; attempt++) {
     blen = 0;
@@ -151,15 +161,24 @@ static long load_page(void) {
     status = https_get(cur_host, 443, cur_path, page, sizeof page, &why, &blen, ip);
     printf("[net] https://%s%s -> %s attempt %d status=%ld body=%ld %s\n",
            cur_host, cur_path, ip[0] ? ip : "?", attempt, status, blen, why);
-    if (status == 200 && blen > 0) break;
-    for (int k = 0; k < 20000; k++) sys3(SYS_YIELD, 0, 0, 0);
+    if (status > 0 && blen > 0) break;   /* 200, or a redirect to follow */
+    sys3(SYS_YIELD, 0, 0, 0);
   }
   last_status = status; last_blen = blen;
   memcpy(last_ip, ip, sizeof ip);
   content_h = 0;
   if (status == 200 && blen > 0) {
+    err_msg[0] = 0;
     if (web_build(page, (int)blen, measure_w, user_measure) == 0) content_h = web_height();
     else printf("[net] the engine refused the page\n");
+  } else if (status > 0) {
+    /* A redirect with nowhere to go is the only 3xx that is an error. */
+    snprintf(err_msg, sizeof err_msg, "HTTP %ld from %s, nothing to follow", status, cur_host);
+  } else {
+    /* Said out loud, on screen: a page that will not load and a browser that
+     * has stopped working look the same if the failure is only on the serial
+     * console, and the one thing a reader must never do is lie about it. */
+    snprintf(err_msg, sizeof err_msg, "cannot load %s: %s", cur_host, why);
   }
   return status;
 }
@@ -168,7 +187,18 @@ static void paint(long win, int off) {
   fill(0, 0, CW, CH, C_BG);
   fill(0, 0, CW, 30, C_PANEL);
   text(MARGIN, 7, "Omi Net", C_TEXT);
-  {
+  if (editing) {
+    /* The field itself, drawn over the URL strip. The caret is a two-pixel bar
+     * rather than a blinking cursor: this paints on demand, not on a timer. */
+    int fx = MARGIN + 9 * GLYPH_W;
+    fill(fx - 4, 4, CW - fx + 2, 22, C_BG);
+    int room = (CW - (fx - MARGIN) - 4) / GLYPH_W;
+    if (room < 1) room = 1;
+    const char *show = edit;
+    if (edit_len > room) show = edit + (edit_len - room);   /* keep the caret in view */
+    text(fx, 7, show, C_TEXT);
+    fill(fx + (int)strlen(show) * GLYPH_W, 7, 2, GLYPH_H, C_ACCENT);
+  } else {
     /* The URL is the one thing in the chrome that can be any length. */
     int room = (CW - (MARGIN + 9 * GLYPH_W)) / GLYPH_W;
     char bar[128];
@@ -176,7 +206,8 @@ static void paint(long win, int off) {
     if (room > 126) room = 126;
     if (n <= room) { memcpy(bar, cur_url, n + 1); }
     else { memcpy(bar, cur_url, room - 3); memcpy(bar + room - 3, "...", 4); }
-    text(MARGIN + 9 * GLYPH_W, 7, bar, C_DIM);
+    text(MARGIN + 9 * GLYPH_W, 7, err_msg[0] ? err_msg : bar,
+         err_msg[0] ? C_ACCENT : C_DIM);
   }
   fill(0, 30, CW, 1, C_ACCENT);
   fill(0, 31, CW, 3, C_BG);
@@ -247,17 +278,46 @@ static void go(const char *href) {
   else { int j = 0; while (p[j] && j < 255) { path[j] = p[j]; j++; } path[j] = 0; }
 
   if (!strcmp(host, cur_host) && !strcmp(path, cur_path)) return;
-  printf("[net] clicked -> https://%s%s\n", host, path);
-  memcpy(cur_host, host, sizeof cur_host);
-  memcpy(cur_path, path, sizeof cur_path);
-  snprintf(cur_url, sizeof cur_url, "https://%s%s", cur_host, cur_path);
-  if (load_page() == 200) {
+
+  /* Typing "iana.org" lands in a 301 to "www.iana.org". A browser that stops at
+   * the 301 and shows an error is a browser that cannot be pointed at the web,
+   * which is the whole point of typing. Five hops, because that is what every
+   * other browser settled on. */
+  for (int hops = 0; hops <= 5; hops++) {
+    printf("[net] clicked -> https://%s%s\n", host, path);
+    memcpy(cur_host, host, sizeof cur_host);
+    memcpy(cur_path, path, sizeof cur_path);
+    snprintf(cur_url, sizeof cur_url, "https://%s%s", cur_host, cur_path);
+    long st = load_page();
     scroll = 0;
     text_glyph_pixels = 0;
     paint(win_id, 0);
-    printf("[net] followed: %d ops, content %d, viewport %d\n",
-           web_count(), content_h, CH - CONTENT_TOP - 4);
+    if (st == 200 && content_h > 0) {
+      printf("[net] followed: %d ops, content %d, viewport %d\n",
+             web_count(), content_h, CH - CONTENT_TOP - 4);
+      return;
+    }
+    const char *loc = https_get_location();
+    if (!(st == 301 || st == 302 || st == 303 || st == 307 || st == 308) || !loc[0]) return;
+    printf("[net] redirect %ld -> %s\n", st, loc);
+    /* Absolute, root-relative or relative: the three forms a server sends. */
+    const char *q = loc;
+    if (!strncmp(q, "https://", 8)) q += 8;
+    else if (!strncmp(q, "http://", 7)) q += 7;
+    if (*q == '/') {
+      int j = 0;
+      while (q[j] && j < 255) { path[j] = q[j]; j++; }
+      path[j] = 0;
+    } else if (*q) {
+      int i = 0;
+      while (q[i] && q[i] != '/' && i < 127) { host[i] = q[i]; i++; }
+      host[i] = 0;
+      q += i;
+      if (*q != '/') { path[0] = '/'; path[1] = 0; }
+      else { int j = 0; while (q[j] && j < 255) { path[j] = q[j]; j++; } path[j] = 0; }
+    } else return;
   }
+  snprintf(err_msg, sizeof err_msg, "too many redirects from %s", cur_host);
 }
 
 int main(void) {
@@ -389,16 +449,40 @@ int main(void) {
     long w = sys3(SYS_WIN_WAIT, win_id, (long)&ev, 0);
     if (w < 0) break;
     if (ev.kind == WIN_EV_CLOSE) break;
-    if (ev.kind == WIN_EV_KEY) {
-      int before = scroll;
-      if (ev.code == KEY_DOWN) scroll += step;
-      else if (ev.code == KEY_UP) scroll -= step;
-      if (scroll < 0) scroll = 0;
-      if (scroll > vmax) scroll = vmax;
-      if (scroll != before) {
-        printf("[net] scroll %d/%d\n", scroll, vmax);
-        text_glyph_pixels = 0;
+    if (ev.kind == WIN_EV_KEY && editing) {
+      int k = ev.code;
+      if (k == '\n' || k == '\r') {                     /* Enter: load it */
+        editing = 0;
+        if (edit_len) { printf("[net] typed -> %s\n", edit); go(edit); }
+        else paint(win_id, scroll);
+      } else if (k == 8 || k == 127) {                    /* Backspace */
+        if (edit_len > 0) edit[--edit_len] = 0;
         paint(win_id, scroll);
+      } else if (k == KEY_ESC) {
+        editing = 0;
+        paint(win_id, scroll);
+      } else if (k >= 32 && k < 127 && edit_len < (int)sizeof(edit) - 1) {
+        edit[edit_len++] = (char)k;
+        edit[edit_len] = 0;
+        paint(win_id, scroll);
+      }
+    } else if (ev.kind == WIN_EV_KEY) {
+      if (ev.code == '/') {                               /* open the address bar */
+        editing = 1;
+        edit_len = 0;
+        edit[0] = 0;
+        paint(win_id, scroll);
+      } else {
+        int before = scroll;
+        if (ev.code == KEY_DOWN) scroll += step;
+        else if (ev.code == KEY_UP) scroll -= step;
+        if (scroll < 0) scroll = 0;
+        if (scroll > vmax) scroll = vmax;
+        if (scroll != before) {
+          printf("[net] scroll %d/%d\n", scroll, vmax);
+          text_glyph_pixels = 0;
+          paint(win_id, scroll);
+        }
       }
     } else if (ev.kind == WIN_EV_DOWN) {
       const char *href = web_hit_link(ev.x - MARGIN, ev.y - CONTENT_TOP + scroll);

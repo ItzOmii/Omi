@@ -214,10 +214,18 @@ static long exchange_all(int fd, const char *req, char *out, size_t cap) {
   return (long)total;
 }
 
+/* The Location header, when the answer carried one. A redirect is not a
+ * failure and not a page: it is an instruction, and the caller has to be able
+ * to read it before the headers are overwritten. */
+static char last_location[256];
+
+const char *https_get_location(void) { return last_location; }
+
 long https_get(const char *host, int port, const char *path,
                char *out, size_t cap, const char **why, long *body_len,
                char *ip_used) {
   *why = "ok";
+  last_location[0] = 0;
   if (body_len) *body_len = 0;
   if (ip_used) ip_used[0] = 0;
 
@@ -249,6 +257,19 @@ long https_get(const char *host, int port, const char *path,
   if (strncmp(out, "HTTP/", 5) == 0) {
     const char *sp = strchr(out, ' ');
     if (sp) status = atoi(sp + 1);
+  }
+  /* Location, before the headers are overwritten by the body. */
+  {
+    const char *loc = strstr(out, "\r\nLocation:");
+    if (loc && loc < hdr_end) {
+      loc += 11;
+      while (*loc == ' ') loc++;
+      const char *e = loc;
+      while (*e && *e != '\r' && *e != '\n' && (size_t)(e - loc) < sizeof last_location - 1) e++;
+      size_t len = (size_t)(e - loc);
+      memcpy(last_location, loc, len);
+      last_location[len] = 0;
+    }
   }
   long hlen = (hdr_end + 4) - out;
   long blen = got - hlen;
