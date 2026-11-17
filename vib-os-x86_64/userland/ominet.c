@@ -64,8 +64,19 @@ static long win_id;
 /* The address bar: '/' opens it, Enter loads, Esc drops it. */
 static int editing, edit_len;
 static char err_msg[96];      /* the last failure, shown in the chrome */
+/* What the browser is doing right now: resolving, connecting, reading. A load
+ * takes seconds on a good day, and the window used to show nothing at all until
+ * it finished - a black rectangle that is indistinguishable from a dead
+ * process. This is drawn in the address strip while there is no page yet. */
+static char status_msg[64];
+/* Defined with the painter, called from the loader above it. */
+static void show_status(const char *s);
 static char edit[192];
 static int measure_w, content_h, scroll;
+/* While a load is in flight the engine still holds whatever was built last -
+ * the fixture at startup - and painting it would show a page that is not the one
+ * being fetched. The status frames suppress the display list entirely. */
+static int show_ops = 1;
 
 /* After the surface and its size: the rasteriser works on the includer's pix,
  * CW and CH, which is what makes it shareable by two clients. */
@@ -155,9 +166,12 @@ static long load_page(void) {
    * yielded twenty thousand times between them, which parked the browser for
    * minutes with its keyboard dead, and looked exactly like a hang. */
   long status = -1;
+  char sb[64];
   for (int attempt = 1; attempt <= 3; attempt++) {
     blen = 0;
     why = "not tried";
+    snprintf(sb, sizeof sb, "loading %s (%d/3)", cur_host, attempt);
+    show_status(sb);
     status = https_get(cur_host, 443, cur_path, page, sizeof page, &why, &blen, ip);
     printf("[net] https://%s%s -> %s attempt %d status=%ld body=%ld %s\n",
            cur_host, cur_path, ip[0] ? ip : "?", attempt, status, blen, why);
@@ -166,6 +180,7 @@ static long load_page(void) {
   }
   last_status = status; last_blen = blen;
   memcpy(last_ip, ip, sizeof ip);
+  status_msg[0] = 0;                  /* the strip goes back to the URL */
   content_h = 0;
   if (status == 200 && blen > 0) {
     err_msg[0] = 0;
@@ -206,8 +221,8 @@ static void paint(long win, int off) {
     if (room > 126) room = 126;
     if (n <= room) { memcpy(bar, cur_url, n + 1); }
     else { memcpy(bar, cur_url, room - 3); memcpy(bar + room - 3, "...", 4); }
-    text(MARGIN + 9 * GLYPH_W, 7, err_msg[0] ? err_msg : bar,
-         err_msg[0] ? C_ACCENT : C_DIM);
+    text(MARGIN + 9 * GLYPH_W, 7, err_msg[0] ? err_msg : status_msg[0] ? status_msg : bar,
+         err_msg[0] ? C_ACCENT : status_msg[0] ? C_TEXT : C_DIM);
   }
   fill(0, 30, CW, 1, C_ACCENT);
   fill(0, 31, CW, 3, C_BG);
@@ -217,7 +232,7 @@ static void paint(long win, int off) {
    * instead of re-running layout for every frame. */
   int vp = CH - CONTENT_TOP - 4;
   clip_rect(MARGIN, CONTENT_TOP, MARGIN + measure_w, CONTENT_TOP + vp);
-  int n = web_count();
+  int n = show_ops ? web_count() : 0;
   const web_op_t *ops = web_ops();
   for (int i = 0; i < n; i++) {
     const web_op_t *o = &ops[i];
@@ -254,6 +269,21 @@ static void paint(long win, int off) {
   fill(MARGIN, CH - 6, 24, 4, C_MARK);
 
   sys3(SYS_SURF_PRESENT, win, 0, ((long)CW << 16) | CH);
+}
+
+/* Say what is happening, and show it. Every phase of a load goes through here:
+ * the point is that the window is never a rectangle of nothing, whatever the
+ * network is doing. */
+static void show_status(const char *s) {
+  int i = 0;
+  while (s[i] && i < (int)sizeof status_msg - 1) { status_msg[i] = s[i]; i++; }
+  status_msg[i] = 0;
+  if (win_id > 0 && pix) {
+    int save = show_ops;
+    show_ops = 0;          /* status frames carry no page */
+    paint(win_id, 0);
+    show_ops = save;
+  }
 }
 
 /* Follow a link. The engine hands back the href as written, so resolve the two
@@ -334,6 +364,14 @@ int main(void) {
   if (s <= 0) { printf("[net] 0/%d\n", checks); return 1; }
   pix = (unsigned *)s;
   measure_w = CW - 2 * MARGIN;
+
+  /* First frame, before anything that can fail or take time. The window exists
+   * from SYS_WIN_OPEN onward, but its surface holds whatever the compositor last
+   * had there - black - until this process presents something. A fetch is
+   * seconds at best and unbounded at worst, so the browser used to be an
+   * unlit rectangle for that whole time: a reader cannot tell that apart from a
+   * process that died. Chrome and a status line go up first, always. */
+  show_status("starting");
 
   /* ---- the fixture page: what the engine has to do with CSS ----
    * A fetched page is whatever it is tomorrow, so the proof is compiled in: a
@@ -436,7 +474,18 @@ int main(void) {
   check(r == 0, "presenting the page succeeds", r, 0);
 
   printf("[net] %d/%d\n", checks - fails, checks);
-  if (fails) return 1;
+  if (fails) {
+    /* A page that did not load is not a reason to take the window away. The
+     * reader came for a browser; one that disappears on a bad response leaves
+     * them with an empty desktop and no explanation, and one that keeps its
+     * chrome can be pointed somewhere else without a relaunch. Drop the page,
+     * keep the failure in the strip, and go on listening for a typed URL. */
+    static const char *const blank = "<!doctype html><html><body></body></html>";
+    web_build(blank, (int)strlen(blank), measure_w, user_measure);
+    content_h = 0;
+    if (!err_msg[0]) snprintf(err_msg, sizeof err_msg, "the page did not load");
+    paint(win_id, 0);
+  }
 
   /* ---- input: arrows scroll, a click follows a link ---- */
   int vp = CH - CONTENT_TOP - 4;

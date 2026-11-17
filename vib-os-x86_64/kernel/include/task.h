@@ -142,6 +142,12 @@ typedef struct {
                          * nothing is ever delivered, so it can never stop one */
   uint64_t wait_addr;   /* futex word this thread sleeps on, 0 = not waiting */
   mm_t    *wait_mm;
+  /* Someone wants this task gone (the compositor, when the window it owned was
+   * closed and the process did not take the hint). Killing a task mid-syscall
+   * would leave its own state half-torn, so this is a request rather than an
+   * act: the syscall door checks it and the task exits itself, at a point where
+   * it is between calls and consistent. */
+  int      kill_req;
   uint64_t wake_at;     /* tick at which a timed sleep gives up, 0 = never */
   int      timed_out;
   /* Object this task is parked on (a socket today), 0 = not waiting. Paired with
@@ -170,6 +176,9 @@ void task_sleep_ticks(uint64_t ticks);   /* block until the tick passes */
 void mm_on_exit(task_t *t);              /* ring3.c: drop the mm reference */
 void mm_reap(void);                      /* ring3.c: free dead spaces */
 void task_kill_current(uint64_t code);   /* does not return */
+/* Ask a task to exit at its next syscall boundary. Refuses the kernel task: the
+ * scheduler cannot be killed from outside itself. */
+void task_request_kill(int id);
 void task_block_current(void);           /* sleep until task_wake() */
 void task_wake(int id);
 uint64_t task_total_ticks(void);

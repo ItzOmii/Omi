@@ -3101,6 +3101,19 @@ static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, 
 uint64_t r3_cur_syscall, r3_cur_arg0;
 
 long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
+  /* The door is where a pending kill is carried out. A task that was asked to
+   * stop - because its window is gone and nobody can reach it any other way -
+   * gets here as soon as the call it was parked in returns, which is why the
+   * requested exit is checked before the call is even looked at. Doing it here
+   * rather than in the scheduler means the task is between calls: its own stack,
+   * its descriptors and the window table are all in a state it can leave. */
+  task_t *me = task_at(task_current());
+  if (me && me->kill_req) {
+    serial_puts("[ring3] task ");
+    serial_puts(task_name(task_current()));
+    serial_puts(" was asked to stop and is exiting\n");
+    task_kill_current(0);
+  }
   if (abi == ABI_LINUX) {
     r3_cur_syscall = ~num;      /* distinguishable from our own numbers in a crash report */
     r3_cur_arg0 = a0;

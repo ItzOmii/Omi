@@ -3640,28 +3640,38 @@ static void draw_media(void) {
    with Gumbo, lays out with the engine this file used to own, and paints its own
    surface. What is left here is a dock entry that starts it - a window and a
    surface are the only things the kernel still provides. */
-static int ominet_running(void) {
-  for (int i = 0; i < task_count(); i++) {
+/* "Running" is the wrong question for a taskbar. A process can outlive its
+ * window - it was parked in a socket read when the user clicked the close box,
+ * so it never saw the event - and a button derived from the process then stays
+ * on the bar forever, raising nothing when clicked, because there is no window
+ * to raise. The window table answers the question that matters: is there
+ * something on screen? One entry exists exactly as long as one can be seen. */
+static int ominet_task(void) {
+  for (int i = 1; i < task_count(); i++) {
     task_t *t = task_at(i);
     if (!t || t->state == TASK_FREE || t->state == TASK_DEAD) continue;
     const char *n = task_name(i);
-    if (n && !strcmp(n, "ominet")) return 1;
+    if (n && !strcmp(n, "ominet")) return i;
   }
-  return 0;
+  return -1;
 }
 
 /* The browser's window lives in the ring-3 window table, which is declared
- * further down this file than the launcher: the lookup is defined there and
+ * further down this file than the launcher: the lookups are defined there and
  * only declared here. */
 static int fwin_focus_browser(void);
+static int fwin_browser_open(void);
 
 static void ominet_launch(void) {
-  /* An app that is running has a window; clicking its entry again brings that
-   * window forward rather than starting a second copy - or doing nothing at
-   * all, which is what "already running" amounted to. */
-  if (ominet_running()) {
-    if (!fwin_focus_browser()) serial_puts("[gui] ominet is running with no window\n");
-    return;
+  /* A window is the only thing worth focusing. A process without one is a
+   * leftover that never saw its own close: it is asked to stop, and a fresh copy
+   * starts, because the alternative is a browser the user cannot use again
+   * without rebooting. */
+  if (fwin_browser_open()) { fwin_focus_browser(); return; }
+  int stale = ominet_task();
+  if (stale > 0) {
+    serial_puts("[gui] ominet has no window; ending the leftover process\n");
+    task_request_kill(stale);
   }
   int pid = ring3_spawn_elf("ominet", "ominet.elf", 0);
   if (pid < 0) { serial_puts("[gui] ominet did not start: "); serial_puthex((uint64_t)pid); serial_puts("\n"); }
@@ -3827,8 +3837,9 @@ static int tb_walk(int *ids, int *xs, int *ws) {
   int n = 0;
   for (int id = 1; id < APP_COUNT; id++) {
     /* The browser is not one of mapp[]'s windows: it is a process with a
-     * surface, so "open" for it means "the process is alive". */
-    int is_open = (id == APP_BROWSER) ? ominet_running() : mapp[id].open;
+     * surface, so "open" for it means "there is a window to raise", not "a
+     * process with that name exists". */
+    int is_open = (id == APP_BROWSER) ? fwin_browser_open() : mapp[id].open;
     if (!is_open) continue;
     int w = UI_SCALE_VAL(28) + meep_text_w(&meep_s130, app_title(id)) * s +
             UI_SCALE_VAL(14);
@@ -4354,6 +4365,19 @@ static int fwin_focus_browser(void) {
     int o = fwin[i].owner;
     const char *n = o > 0 ? task_name(o) : 0;
     if (n && !strcmp(n, "ominet")) { fwin_focus = i; needs_redraw = 1; return 1; }
+  }
+  return 0;
+}
+
+/* The taskbar's question, answered by the window table rather than by the task
+ * table. Same test as the focus lookup without the side effect, because it runs
+ * on every frame. */
+static int fwin_browser_open(void) {
+  for (int i = 0; i < WINIPC_MAX; i++) {
+    if (!fwin[i].used) continue;
+    int o = fwin[i].owner;
+    const char *n = o > 0 ? task_name(o) : 0;
+    if (n && !strcmp(n, "ominet")) return 1;
   }
   return 0;
 }

@@ -325,6 +325,18 @@ void task_wake(int id) {
   if (tasks[id].state == TASK_BLOCKED) tasks[id].state = TASK_READY;
 }
 
+/* The compositor's only way to end a process it no longer has a window for. It
+ * cannot reach into the task's frame, so it leaves a flag; the syscall door in
+ * ring3.c turns the flag into an exit between calls. Waking a blocked task is
+ * what makes this work at all: a browser parked in SYS_WIN_WAIT or in a socket
+ * read would otherwise never reach a door to be killed at. */
+void task_request_kill(int id) {
+  if (id <= 0 || id >= ntasks) return;
+  if (tasks[id].state == TASK_FREE || tasks[id].state == TASK_DEAD) return;
+  tasks[id].kill_req = 1;
+  task_wake(id);
+}
+
 void task_block(int blocked) {
   if (cur <= 0) return;
   tasks[cur].state = blocked ? TASK_BLOCKED : TASK_RUN;
@@ -370,6 +382,7 @@ static task_t *task_alloc(const char *name) {
   t->wake_at = 0;
   t->timed_out = 0;
   t->wait_obj = 0;
+  t->kill_req = 0;
   t->parent = (cur > 0 && cur < ntasks) ? tasks[cur].id : 0;
   t->tgen = ++task_gen_counter;   /* a fresh slot is a new identity */
   int i = 0;

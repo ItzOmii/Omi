@@ -268,8 +268,13 @@ it a real engine rather than a tag stripper:
   per-column widths** from their own layout pass.
 - **Typed URLs work**: `/` opens the address strip, Enter navigates, Esc drops it, and a 301/302/303/
   307/308 is followed up to five hops — `iana.org` lands on `www.iana.org` instead of an error page.
-  A load that cannot be made says why in the strip, in the accent colour, rather than looking like a
-  freeze.
+- **The window comes up before the network does.** Chrome and a status line — `loading host (2/3)` —
+  are on screen from the first frame, so a slow or absent uplink is a browser saying what it is
+  doing, not a black rectangle. A load that cannot be made says why in the strip, in the accent
+  colour, and leaves the window open to be pointed somewhere else.
+- **The taskbar shows windows, not processes.** The `omi net` entry exists exactly as long as one of
+  its windows does, and closing the window ends the process behind it; a process that outlived its
+  window is ended on the next launch instead of leaving a button that raises nothing.
 
 ## The screens
 
