@@ -41,3 +41,7 @@ limine/
 
 # ISO staging: rebuilt from assets/, limine/ and limine.conf on every build.
 iso_root/
+
+# Written by the Makefile on every run: a timestamp changes with each build,
+# and a tracked timestamp means every build dirties the working tree.
+kernel/include/buildstamp.h
