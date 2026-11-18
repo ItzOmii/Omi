@@ -659,6 +659,25 @@ static void line_flush(void) {
   nsegs = 0; seg_w = 0; seg_maxh = 0;
 }
 
+/* Put one segment on the line. `w` is its width, already measured: the caller
+ * may have measured a string it still owns. */
+static void seg_put(const char *t, int len, const st_t *st, int w) {
+  if (nsegs >= MAX_SEGS) line_flush();
+  char *copy = dup_n(t, len);
+  if (!copy) return;
+  segs[nsegs].t = copy;
+  segs[nsegs].font = st->font;
+  segs[nsegs].color = st->color ? st->color : doc_fg;
+  segs[nsegs].bold = (uint8_t)st->bold;
+  segs[nsegs].underline = (uint8_t)st->underline;
+  segs[nsegs].w = w;
+  segs[nsegs].href = st->href;
+  nsegs++;
+  seg_w += w;
+  int lh = web_line_height(st->font);
+  if (lh > seg_maxh) seg_maxh = lh;
+}
+
 static void line_add(const char *word, int len, const st_t *st, int space_before) {
   if (nsegs >= MAX_SEGS) line_flush();
   /* The separating space belongs in front of the word it precedes: carrying it
@@ -678,17 +697,36 @@ static void line_add(const char *word, int len, const st_t *st, int space_before
     if (!copy) return;
     w = tw(st->font, copy);
   }
-  segs[nsegs].t = copy;
-  segs[nsegs].font = st->font;
-  segs[nsegs].color = st->color ? st->color : doc_fg;
-  segs[nsegs].bold = (uint8_t)st->bold;
-  segs[nsegs].underline = (uint8_t)st->underline;
-  segs[nsegs].w = w;
-  segs[nsegs].href = st->href;
-  nsegs++;
-  seg_w += w;
-  int lh = web_line_height(st->font);
-  if (lh > seg_maxh) seg_maxh = lh;
+  /* One word wider than the line - a URL, a long path, a hash - would be drawn
+   * past the right edge and clipped by the window, losing its end. Break it at
+   * the last character that fits and carry the rest to the next line. */
+  if (line_avail > 0 && w > line_avail) {
+    char *rest = copy;
+    int rem = (int)strlen(copy);
+    while (rem > 0) {
+      int fit = rem;
+      while (fit > 1) {
+        char save = rest[fit];
+        rest[fit] = 0;
+        int ok = tw(st->font, rest) <= line_avail;
+        rest[fit] = save;
+        if (ok) break;
+        fit--;
+      }
+      char save = rest[fit];
+      rest[fit] = 0;
+      int ww = tw(st->font, rest);
+      seg_put(rest, fit, st, ww);
+      rest[fit] = save;
+      rest += fit;
+      rem -= fit;
+      if (rem > 0) line_flush();
+    }
+    free(copy);
+    return;
+  }
+  seg_put(copy, (int)strlen(copy), st, w);
+  free(copy);
 }
 
 /* ------------------------------------------------------------------ layout */
@@ -1047,14 +1085,28 @@ static int text_lead_space(const char *s, int len) {
   return 0;
 }
 
+static int text_trail_space(const char *s, int len) {
+  for (int i = len - 1; i >= 0; i--) {
+    unsigned char c = (unsigned char)s[i];
+    if (c == ' ' || c == '\n' || c == '\t' || c == '\r') return 1;
+    return 0;
+  }
+  return 0;
+}
+
+/* Did the whitespace between the last text and the one about to be drawn really
+ * exist in the source? Runs are positioned by x, so a space is only ever wanted
+ * where the page had one: "<b>mathematics</b>, a" must not become "mathematics ,".
+ * clean_text eats the whitespace, so it is remembered here instead. */
+static int pending_space;
+
 static void layout_text(GumboText *t, st_t *st) {
   static char buf[4096];
   int raw = (int)t->original_text.length;
   int n = clean_text(t->text, raw, buf, (int)sizeof buf);
-  if (!n) return;
-  /* whitespace at the start of this node separates it from whatever inline
-   * content came before it, even though clean_text eats it */
   int lead = text_lead_space(t->text, raw);
+  int trail = text_trail_space(t->text, raw);
+  if (!n) { pending_space = pending_space || lead; return; }
   int first = 1;
   int i = 0;
   while (i < n) {
@@ -1062,9 +1114,12 @@ static void layout_text(GumboText *t, st_t *st) {
     if (i >= n) break;
     int s = i;
     while (i < n && buf[i] != ' ') i++;
-    line_add(buf + s, i - s, st, first ? (nsegs > 0 || lead) : 1);
+    int sep = first ? (pending_space || lead) : 1;
+    line_add(buf + s, i - s, st, sep);
+    if (sep) pending_space = 0;
     first = 0;
   }
+  pending_space = trail;
 }
 
 
@@ -1234,9 +1289,15 @@ static void layout_table(GumboNode *table, st_t *st, int x, int avail, int depth
     for (int c = 0; c < cols; c++) wcol[c] = natw[c];
   }
 
+  if (getenv("OMI_TBL_DEBUG"))
+    for (int c = 0; c < cols; c++) fprintf(stderr, "  col%d nat=%d w=%d\n", c, natw[c], wcol[c]);
+  /* Rules and the header band are the width of the table, not of the page: a
+   * narrow table used to get a band running out past its last column. */
+  int tblw = 0;
+  for (int c = 0; c < cols; c++) tblw += wcol[c];
   line_flush();
   cur_y += st->mt;
-  op_push(0, x, cur_y, avail, 1, 0xD8D3C9, 0, font, 0, 0);
+  op_push(0, x, cur_y, tblw, 1, 0xD8D3C9, 0, font, 0, 0);
   cur_y += 1;
 
   for (int r = 0; r < nr; r++) {
@@ -1246,7 +1307,7 @@ static void layout_table(GumboNode *table, st_t *st, int x, int avail, int depth
       if (l > lines) lines = l;
     }
     int rowh = lines * lh + 2 * TBL_PAD;
-    if (tbl[r][0].head) op_push(0, x, cur_y, avail, rowh, 0xF4F0E7, 0, font, 0, 0);
+    if (tbl[r][0].head) op_push(0, x, cur_y, tblw, rowh, 0xF4F0E7, 0, font, 0, 0);
     int cx = x;
     for (int c = 0; c < cols; c++) {
       draw_wrapped(tbl[r][c].txt, font, st->color ? st->color : doc_fg,
@@ -1255,7 +1316,7 @@ static void layout_table(GumboNode *table, st_t *st, int x, int avail, int depth
       cx += wcol[c];
     }
     cur_y += rowh;
-    op_push(0, x, cur_y, avail, 1, 0xE3DED4, 0, font, 0, 0);
+    op_push(0, x, cur_y, tblw, 1, 0xE3DED4, 0, font, 0, 0);
     cur_y += 1;
   }
   cur_y += st->mb > 0 ? st->mb : 10;
@@ -1353,13 +1414,9 @@ static void layout_node(GumboNode *node, st_t st, int x, int avail, int depth) {
     st.form = form_add(act ? act->value : 0, mth ? mth->value : 0);
   }
 
-  /* A list item gets a marker. The face has no bullet glyph, so it is a small
-   * filled square: at this size a square and a round dot are the same shape
-   * anyway, and a square is what the rasteriser can draw exactly. */
-  if (tag == GUMBO_TAG_LI) {
-    line_flush();
-    op_push(0, x - 12, cur_y + 6, 4, 4, st.color, 0, 0, 0, 0);
-  }
+  /* The marker is drawn by the block walker, which is the only place that can
+   * see whether the list is ordered. Drawing one here as well put a square and a
+   * dash on every item. */
 
   if (tag == GUMBO_TAG_INPUT) { layout_input(node, &st, x, avail); return; }
 
@@ -1545,16 +1602,21 @@ static void layout_node(GumboNode *node, st_t st, int x, int avail, int depth) {
       }
       ordered = 1;
     } else ordered = 0;
-    char mk[12];
-    if (ordered) { snprintf(mk, sizeof mk, "%d.", num); }
-    else { mk[0] = '-'; mk[1] = 0; }
     st_t ms = st;
     ms.font = st.font;
     ms.color = st.color ? st.color : doc_fg;
-    /* marker sits in the list's padding, one text row above the item's first line */
-    int mw = tw(ms.font, mk);
-    op_push(1, cx - 14 + (ordered ? 0 : 4), cur_y, mw, web_line_height(ms.font), ms.color, dup_n(mk, (int)strlen(mk)), ms.font, 0, 0);
-    cw -= 0;
+    /* The marker sits in the list's padding. An ordered item needs its number as
+     * text; an unordered one is a small filled square, because the face has no
+     * bullet glyph and a square is what the rasteriser draws exactly. */
+    if (ordered) {
+      char mk[12];
+      snprintf(mk, sizeof mk, "%d.", num);
+      int mw = tw(ms.font, mk);
+      op_push(1, cx - 14, cur_y, mw, web_line_height(ms.font), ms.color,
+              dup_n(mk, (int)strlen(mk)), ms.font, 0, 0);
+    } else {
+      op_push(0, cx - 12, cur_y + 6, 4, 4, ms.color, 0, 0, 0, 0);
+    }
   }
 
   GumboVector *kids = &node->v.element.children;
