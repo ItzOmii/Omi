@@ -511,12 +511,18 @@ void task_system_start(void) {
   pic_clear_mask(0);
 }
 
-/* Two worker tasks, so the scheduler has something to charge time to. */
+/* Two worker tasks, so the scheduler has something to charge time to. They used
+ * to prove it by spinning - twenty thousand pause instructions per pass, forever,
+ * in every boot - which pinned a core on an otherwise idle desktop and left
+ * whatever was actually on screen with a share of the machine. They only have to
+ * exist and be scheduled, so one pass per timer tick is enough: hlt returns on
+ * the next interrupt and the 100Hz tick charges each task a slice. */
 static void worker_body(unsigned spins) {
+  (void)spins;
   for (;;) {
     int me = cur;
     if (me > 0 && me < ntasks) tasks[me].work++;
-    for (volatile unsigned i = 0; i < spins; i++) __asm__ volatile("pause");
+    __asm__ volatile("hlt");
     task_yield();
   }
 }

@@ -738,6 +738,7 @@ static void submit_form(int form) {
 }
 
 static void paint(long win, int off) {
+  long t_paint = sys3(SYS_TICKS, 0, 0, 0);
   sync_geometry();
   pix = shadow ? shadow : surf;
   fill(0, 0, cw, ch, C_BG);
@@ -797,11 +798,13 @@ static void paint(long win, int off) {
   clip_rect(px0, CONTENT_TOP, px0 + measure_w, CONTENT_TOP + vp);
   int n = show_ops ? web_count() : 0;
   const web_op_t *ops = web_ops();
+  unsigned long np_drawn = 0, np_chars = 0;
   for (int i = 0; i < n; i++) {
     const web_op_t *o = &ops[i];
     int oy = CONTENT_TOP + o->y - off;
     int oh = o->h > 0 ? o->h : GLYPH_H;
     if (oy > CONTENT_TOP + vp || oy + oh < CONTENT_TOP) continue;
+    np_drawn++;
     if (o->kind == 0) {
       if (o->h > 0) fill(px0 + o->x, oy, o->w, o->h, o->color);
     } else if (o->kind == 2) {
@@ -824,6 +827,7 @@ static void paint(long win, int off) {
         }
       }
     } else if (o->text) {
+      np_chars += (unsigned long)strlen(o->text);
       int sc = web_font_scale(o->font);
       text_scaled(px0 + o->x, oy, o->text, o->color, sc);
       if (o->bold) text_scaled(px0 + o->x + sc, oy, o->text, o->color, sc);
@@ -889,6 +893,20 @@ static void paint(long win, int off) {
 
   /* the exact-pixel marker: chrome, so it does not move with the page */
   fill(MARGIN, ch - 6, 24, 4, C_MARK);
+
+  /* What one frame costs. Printed when the scroll position changes, because that
+   * is the moment someone notices a frame, and a number beats an impression of
+   * one. ops is the size of the display list walked; drawn is how much of it was
+   * on screen; ms is the whole paint, rounded up to the 10ms tick. */
+  {
+    static int last_off = -1;
+    if (off != last_off) {
+      long dt = sys3(SYS_TICKS, 0, 0, 0) - t_paint;
+      last_off = off;
+      printf("[net] paint off=%d ops=%d drawn=%lu chars=%lu ms=%ld\n",
+             off, n, np_drawn, np_chars, (dt + 1) * 10);
+    }
+  }
 
   /* The frame is complete: hand it over in one copy, with nothing in between that
    * could let the compositor draw. */

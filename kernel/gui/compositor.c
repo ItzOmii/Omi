@@ -6541,6 +6541,17 @@ void gui_main_loop(void) {
 
     task_yield();   /* let any other runnable task have the cpu */
 
+    /* Nothing to draw, nothing playing: stop spinning. hlt returns on the next
+     * interrupt, and the 100Hz tick guarantees one within 10ms, so input is
+     * still polled at worst every 10ms - faster than a key can repeat, and the
+     * difference between an idle desktop and a core pinned at 100% forever. This
+     * loop used to poll PS/2 and USB twenty times around a pause spin and never
+     * halt, so an idle Omi held a full core, ran hot on real hardware, and left
+     * every ring-3 client with a fraction of the machine. */
+    if (!needs_redraw && !dmg_pending_n && !mp_playing) {
+      __asm__ volatile("hlt");
+    }
+
     /* Minimal yield - just a few pause instructions */
     for (volatile int i = 0; i < 50; i++) {
       __asm__ volatile("pause");
