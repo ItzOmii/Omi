@@ -235,13 +235,15 @@ $(BUILD_DIR)/lib/bearssl/%.o: $(BEARSSL)/src/%.c | $(BUILD_DIR)
 $(KERNEL): $(OBJECTS)
 	$(LD) $(LDFLAGS) $(OBJECTS) $(BUILTINS) -o $@
 
-# Download and build Limine
+# Fetch and build Limine (x86_64 UEFI only). The 8.6.0 release ships source, not
+# binaries, so this compiles: it needs nasm, and the result is not committed —
+# the last committed copy of this directory is what hid that requirement.
 $(LIMINE_DIR):
 	curl -L $(LIMINE_URL) -o limine.tar.xz
 	mkdir -p $(LIMINE_DIR)
 	tar -xf limine.tar.xz -C $(LIMINE_DIR) --strip-components=1
 	rm limine.tar.xz
-	cd $(LIMINE_DIR) && ./configure --enable-uefi-x86-64 && make
+	cd $(LIMINE_DIR) && ./configure --enable-bios --enable-bios-cd --enable-uefi-x86-64 --enable-uefi-cd && make
 
 # Create ISO
 # limine.conf is a prerequisite: its module list is part of the ISO's contents,

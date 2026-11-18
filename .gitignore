@@ -35,3 +35,9 @@ tests/
 # time, not vendored: keeping a 715 KB libc in the tree would tie the repository
 # to one distribution's build of it.
 iso_root/lib/
+
+# Limine is downloaded and built by the Makefile (x86_64 UEFI only).
+limine/
+
+# ISO staging: rebuilt from assets/, limine/ and limine.conf on every build.
+iso_root/
