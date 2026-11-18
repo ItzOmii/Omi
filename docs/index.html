@@ -192,7 +192,7 @@
       <a class="btn ghost" href="#inside">See the screens</a>
     </div>
     <div class="facts">
-      <div class="fact"><b>147,000</b><span>lines of our own</span></div>
+      <div class="fact"><b>66,000</b><span>lines of our own</span></div>
       <div class="fact"><b>12 MB</b><span>bootable ISO</span></div>
       <div class="fact"><b>34</b><span>syscalls</span></div>
       <div class="fact"><b>20</b><span>programs on the ISO</span></div>
@@ -212,14 +212,14 @@
     <span><b>dhcp</b> lease 10.0.2.15</span><span><b>dns</b> A records</span>
     <span><b>tcp</b> handshake + retries</span><span><b>http/1.1</b> client</span>
     <span><b>minimp3</b> decoder</span><span><b>hda</b> 48 khz stereo</span>
-    <span><b>tls 1.2</b> · bearssl</span><span><b>ring 3</b> · 34 syscalls</span>
+    <span><b>tls 1.2</b> · bearssl</span><span><b>ring 3</b> · 41 syscalls</span>
     <span><b>elf</b> programs from the ISO</span><span><b>pit</b> 100 hz · preempt</span>
     <span><b>shm</b> between processes</span><span><b>limine</b> timeout 0</span>
     <span>·</span><span><b>e1000</b> driver</span><span><b>arp</b> · ipv4 · icmp · udp</span>
     <span><b>dhcp</b> lease 10.0.2.15</span><span><b>dns</b> A records</span>
     <span><b>tcp</b> handshake + retries</span><span><b>http/1.1</b> client</span>
     <span><b>minimp3</b> decoder</span><span><b>hda</b> 48 khz stereo</span>
-    <span><b>tls 1.2</b> · bearssl</span><span><b>ring 3</b> · 34 syscalls</span>
+    <span><b>tls 1.2</b> · bearssl</span><span><b>ring 3</b> · 41 syscalls</span>
     <span><b>elf</b> programs from the ISO</span><span><b>pit</b> 100 hz · preempt</span>
     <span><b>shm</b> between processes</span><span><b>limine</b> timeout 0</span>
   </div>
@@ -253,7 +253,7 @@
           <p>An address bar, tabs, scrolling and a status strip — over real Gumbo HTML, a CSS box
             model of our own, stb_truetype text, decoded images, clickable links and tables with
             per-column widths. Over TLS, too.</p>
-          <div class="meta"><span>kernel/gui/</span> omiweb.c · net/http.c · net/tls</div>
+          <div class="meta"><span>userland/</span> ominet.c · omilayout.c · fetch.c</div>
         </div>
       </article>
 
@@ -413,12 +413,11 @@
       </div>
       <div class="hole">
         <div class="n">03</div>
-        <h4>The network stops at one connection's lifetime</h4>
-        <p>A ring-3 process can open a socket, <span class="mono">poll</span> it and read from it,
-          but a connection ends with a single FIN: no <span class="mono">RST</span>, no
-          <span class="mono">TIME_WAIT</span>, no retransmission. There are no server sockets, no UDP
-          socket API, and TLS lives in the kernel — so a program gets <span class="mono">http://</span>
-          but not <span class="mono">https://</span>.</p>
+        <h4>The window server is in the kernel</h4>
+        <p>The kernel composites every window and owns the frame's last pixels: a client cannot draw
+          its own furniture, every glyph crosses the syscall boundary, and a visual fix costs a kernel
+          rebuild. A userspace compositor with client-owned buffers is the next structural change, and
+          the precondition for hosting a modern browser engine.</p>
       </div>
     </div>
   </div>
@@ -429,8 +428,7 @@
     <span class="eyebrow">take it for a spin</span>
     <h2>Sixty seconds<br>to a desktop.</h2>
     <div class="run">
-      <pre class="shell"><span class="cmt"># build (needs gcc, nasm, xorriso, mtools)</span>
-cd vib-os-x86_64
+      <pre class="shell"><span class="cmt"># build (needs clang, lld, xorriso)</span>
 make
 
 <span class="cmt"># boot it — the e1000 device is what gives Omi a network</span>
@@ -445,7 +443,7 @@ sudo dd if=omi.iso of=/dev/sdX bs=4M status=progress</pre>
         <dl class="kv">
           <dt>base</dt><dd>viralcode/vib-OS @ 73b6429</dd>
           <dt>target</dt><dd>x86_64, BIOS + UEFI via Limine</dd>
-          <dt>diff</dt><dd>147,000 lines of our own code, plus vendored gumbo, bearssl, stb, minimp3</dd>
+          <dt>diff</dt><dd>66,000 lines of our own code, plus vendored gumbo, bearssl, stb, minimp3</dd>
           <dt>iso</dt><dd>12 MB, boots straight to midnight</dd>
           <dt>media</dt><dd>generated placeholders, not licensed music</dd>
           <dt>license</dt><dd>same as upstream</dd>
