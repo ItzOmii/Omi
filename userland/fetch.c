@@ -345,8 +345,15 @@ long https_get(const char *host, int port, const char *path,
   const char *sni = host;
   int fd = ka_fd;
   if (!reused) {
+    /* A dial that fails is usually the network dropping the SYN, not the host
+     * being gone - the same request a moment later works. One retry, after a
+     * tick, turns a blank page into a page; a second failure is reported. */
     fd = dial(ip, port);
-    if (fd < 0) { *why = "connect"; return -1; }
+    if (fd < 0) {
+      while ((long)sys3(SYS_TICKS, 0, 0, 0) == t1) { }   /* let a tick pass */
+      fd = dial(ip, port);
+      if (fd < 0) { *why = "connect"; return -1; }
+    }
   }
 
   long t2 = sys3(SYS_TICKS, 0, 0, 0);

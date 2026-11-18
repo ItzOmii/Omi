@@ -396,6 +396,9 @@ static char status_msg[64];
 static void show_status(const char *s);
 static char edit[192];
 static int measure_w, content_h, scroll, vmax;
+/* Which build of the display list is in the frame buffer. A scroll can copy
+ * pixels only while both frames were produced from the same display list. */
+static unsigned page_gen;
 
 /* Where the page's left edge sits inside the window. paint() centres the column,
  * and the hit tests have to subtract the same thing or every click lands left of
@@ -533,7 +536,7 @@ static long load_page(void) {
     int clipped = fetch_clipped;
     img_cache_reset();
     if (web_build(page, (int)blen, measure_w, user_measure) == 0) {
-      content_h = web_height();
+      content_h = web_height(); page_gen++;
       fields_reset();
       int full = web_ops_full();
       if (clipped && full)
@@ -556,6 +559,9 @@ static long load_page(void) {
      * has stopped working look the same if the failure is only on the serial
      * console, and the one thing a reader must never do is lie about it. */
     snprintf(err_msg, sizeof err_msg, "cannot load %s: %s", cur_host, why);
+    /* And in the log, with the reason: a fetch that fails once in a while is
+     * worth being able to name, and "it was flaky" is not a reason. */
+    printf("[net] load failed: %s (%s)\n", cur_host, why);
   }
   return status;
 }
@@ -593,7 +599,7 @@ static int sync_geometry(void) {
   }
   measure_w = page_measure();
   if (last_blen > 0 && web_build(page, (int)last_blen, measure_w, user_measure) == 0) {
-    content_h = web_height();
+    content_h = web_height(); page_gen++;
     fields_reset();
   }
   int vp2 = ch - CONTENT_TOP - 4;
@@ -737,11 +743,71 @@ static void submit_form(int form) {
   go(url);
 }
 
+/* Which build of the display list is in the frame buffer. A scroll can copy
+ * pixels only while both were produced from the same list. */
+static unsigned page_gen;
+
 static void paint(long win, int off) {
   long t_paint = sys3(SYS_TICKS, 0, 0, 0);
   sync_geometry();
   pix = shadow ? shadow : surf;
-  fill(0, 0, cw, ch, C_BG);
+
+  /* Scroll by copying, not by rasterising. Everything above the fold that stays
+   * on screen after a scroll is the same pixels one step up or down, so the rows
+   * that move are a memmove and only the strip that came into view is drawn. The
+   * alternative - re-walking the display list and re-blitting every glyph - was
+   * most of the 10ms a scroll frame took here. Safe only when the frame being
+   * replaced came from the same display list (page_gen) at the same geometry, so
+   * a new page or a resize falls back to a full paint. */
+  int vp = ch - CONTENT_TOP - 4;
+  /* The build stamp, the status line and the exact-pixel marker are chrome drawn
+   * over the page. They must not travel with a scroll or the copied frame keeps a
+   * ghost of them halfway up the page, so the rows they live in are never moved -
+   * they are redrawn every frame as a band of their own. */
+  const int strip = 24;
+  int svp = vp - strip;                  /* rows a scroll may copy */
+  int bt[2], bb[2], nb = 0;              /* the bands that have to be drawn */
+  int blit = 0;
+  {
+    static int bl_off = 0, bl_cw = -1, bl_ch = -1, bl_cont = -1;
+    static unsigned bl_gen = 0;
+    static const void *bl_ops;
+    int step = off - bl_off;
+    int d = step > 0 ? step : -step;
+#ifdef OMI_NO_BLIT
+#warning "blit disabled for verification"
+    /* Verification switch: same build, frames always fully drawn, so a frame the
+     * copy path produced can be compared pixel for pixel with one the renderer
+     * produced. Nothing should set this in a shipped build. */
+    const int blit_ok = 0;
+#else
+    const int blit_ok = 1;
+#endif
+    if (blit_ok && shadow && !editing && step != 0 && bl_cw == cw && bl_ch == ch &&
+        bl_cont == content_h && bl_gen == page_gen &&
+        bl_ops == (const void *)web_ops() && d < svp) {
+      if (step > 0) {
+        /* scrolled down: content moves up */
+        memmove(shadow + (size_t)CONTENT_TOP * cw,
+                shadow + (size_t)(CONTENT_TOP + d) * cw,
+                (size_t)(svp - d) * cw * sizeof *shadow);
+        /* what came into view, and the chrome strip under it */
+        bt[nb] = CONTENT_TOP + svp - d; bb[nb] = CONTENT_TOP + vp; nb++;
+      } else {
+        memmove(shadow + (size_t)(CONTENT_TOP + d) * cw,
+                shadow + (size_t)CONTENT_TOP * cw,
+                (size_t)(svp - d) * cw * sizeof *shadow);
+        bt[nb] = CONTENT_TOP; bb[nb] = CONTENT_TOP + d; nb++;
+        bt[nb] = CONTENT_TOP + svp; bb[nb] = CONTENT_TOP + vp; nb++;
+      }
+      for (int i = 0; i < nb; i++)
+        fill(0, bt[i], cw, bb[i] - bt[i], show_ops ? web_bg() : C_BG);
+      blit = 1;
+    }
+    bl_off = off; bl_cw = cw; bl_ch = ch; bl_cont = content_h;
+    bl_gen = page_gen; bl_ops = (const void *)web_ops();
+  }
+  if (!blit) { bt[0] = CONTENT_TOP; bb[0] = CONTENT_TOP + vp; nb = 1; fill(0, 0, cw, ch, C_BG); }
   fill(0, 0, cw, 30, C_PANEL);
   /* Four buttons, left of the address: back, forward, home, reload. Drawn as
    * glyphs rather than an icon sheet - the face has '<', '>' and friends. */
@@ -788,22 +854,24 @@ static void paint(long win, int off) {
   /* The display list is in page coordinates, origin at the content's top left.
    * Scrolling is a subtraction - which is the reason to keep a display list
    * instead of re-running layout for every frame. */
-  int vp = ch - CONTENT_TOP - 4;
   int page_dx = (cw - 2 * MARGIN - measure_w) / 2;
   if (page_dx < 0) page_dx = 0;
   int px0 = MARGIN + page_dx;
   /* The document's paper, not the window's: the chrome is dark so the window
    * reads as a window, and the page is whatever colour the page says it is. */
-  fill(0, CONTENT_TOP, cw, ch - CONTENT_TOP, show_ops ? web_bg() : C_BG);
-  clip_rect(px0, CONTENT_TOP, px0 + measure_w, CONTENT_TOP + vp);
+  if (!blit) fill(0, CONTENT_TOP, cw, ch - CONTENT_TOP, show_ops ? web_bg() : C_BG);
   int n = show_ops ? web_count() : 0;
   const web_op_t *ops = web_ops();
   unsigned long np_drawn = 0, np_chars = 0;
+  unsigned long long cyc0 = __builtin_ia32_rdtsc();
+  for (int bi = 0; bi < nb; bi++) {
+  const int band_top = bt[bi], band_bot = bb[bi];
+  clip_rect(px0, band_top, px0 + measure_w, band_bot);
   for (int i = 0; i < n; i++) {
     const web_op_t *o = &ops[i];
     int oy = CONTENT_TOP + o->y - off;
     int oh = o->h > 0 ? o->h : GLYPH_H;
-    if (oy > CONTENT_TOP + vp || oy + oh < CONTENT_TOP) continue;
+    if (oy > band_bot || oy + oh < band_top) continue;
     np_drawn++;
     if (o->kind == 0) {
       if (o->h > 0) fill(px0 + o->x, oy, o->w, o->h, o->color);
@@ -832,6 +900,7 @@ static void paint(long win, int off) {
       text_scaled(px0 + o->x, oy, o->text, o->color, sc);
       if (o->bold) text_scaled(px0 + o->x + sc, oy, o->text, o->color, sc);
     }
+  }
   }
   clip_none();
   if (dbg_ink) {
@@ -902,9 +971,11 @@ static void paint(long win, int off) {
     static int last_off = -1;
     if (off != last_off) {
       long dt = sys3(SYS_TICKS, 0, 0, 0) - t_paint;
+      unsigned long long cyc = __builtin_ia32_rdtsc() - cyc0;
       last_off = off;
-      printf("[net] paint off=%d ops=%d drawn=%lu chars=%lu ms=%ld\n",
-             off, n, np_drawn, np_chars, (dt + 1) * 10);
+      printf("[net] paint off=%d ops=%d drawn=%lu chars=%lu ms=%ld %s bands=%d %d..%d cyc=%llu\n",
+             off, n, np_drawn, np_chars, (dt + 1) * 10,
+             blit ? "blit" : "full", nb, bt[0], bb[0], cyc);
     }
   }
 
@@ -1215,7 +1286,7 @@ int main(void) {
   /* put the fetched page back: the fixture proved the engine, it is not what the
    * reader asked for */
   if (last_blen > 0 && web_build(page, (int)last_blen, measure_w, user_measure) == 0) {
-    content_h = web_height();
+    content_h = web_height(); page_gen++;
     paint(win_id, 0);
   }
 
@@ -1228,7 +1299,7 @@ int main(void) {
      * keep the failure in the strip, and go on listening for a typed URL. */
     static const char *const blank = "<!doctype html><html><body></body></html>";
     web_build(blank, (int)strlen(blank), measure_w, user_measure);
-    content_h = 0;
+    content_h = 0; page_gen++;
     if (!err_msg[0]) snprintf(err_msg, sizeof err_msg, "the page did not load");
     paint(win_id, 0);
   }
@@ -1390,7 +1461,7 @@ int main(void) {
           measure_w = page_measure();
           scroll = 0;
           if (last_blen > 0 && web_build(page, (int)last_blen, measure_w, user_measure) == 0) {
-            content_h = web_height();
+            content_h = web_height(); page_gen++;
             fields_reset();
           }
           int vp = ch - CONTENT_TOP - 4;
