@@ -154,10 +154,11 @@ next year.
 
 ## Build
 
-Needs clang/LLD, xorriso, and QEMU for testing. Limine is downloaded on the first build.
+Needs clang/LLD, nasm, xorriso, and QEMU for testing. Limine is fetched and built on the first
+build — that is what nasm is for — and its output stays in `limine/`, which is not committed.
 
 ```bash
-sudo apt install clang lld xorriso qemu-system-x86
+sudo apt install clang lld nasm xorriso qemu-system-x86
 make                 # -> omi.iso
 ```
 
