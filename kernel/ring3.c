@@ -844,17 +844,23 @@ int surf_present(int win_id, int x, int y, int w, int h) {
     surf[slot].dam_x = x; surf[slot].dam_y = y;
     surf[slot].dam_w = w; surf[slot].dam_h = h;
     surf[slot].has_damage = 1;
-    return 0;
+  } else {
+    int x0 = x < surf[slot].dam_x ? x : surf[slot].dam_x;
+    int y0 = y < surf[slot].dam_y ? y : surf[slot].dam_y;
+    int x1 = x + w, y1 = y + h;
+    int dx1 = surf[slot].dam_x + surf[slot].dam_w;
+    int dy1 = surf[slot].dam_y + surf[slot].dam_h;
+    if (x1 > dx1) dx1 = x1;
+    if (y1 > dy1) dy1 = y1;
+    surf[slot].dam_x = x0; surf[slot].dam_y = y0;
+    surf[slot].dam_w = dx1 - x0; surf[slot].dam_h = dy1 - y0;
   }
-  int x0 = x < surf[slot].dam_x ? x : surf[slot].dam_x;
-  int y0 = y < surf[slot].dam_y ? y : surf[slot].dam_y;
-  int x1 = x + w, y1 = y + h;
-  int dx1 = surf[slot].dam_x + surf[slot].dam_w;
-  int dy1 = surf[slot].dam_y + surf[slot].dam_h;
-  if (x1 > dx1) dx1 = x1;
-  if (y1 > dy1) dy1 = y1;
-  surf[slot].dam_x = x0; surf[slot].dam_y = y0;
-  surf[slot].dam_w = dx1 - x0; surf[slot].dam_h = dy1 - y0;
+
+  /* Tell the compositor there are pixels to collect. Without this a surface
+   * present only recorded a rectangle and nothing ever asked for a frame, so
+   * the screen updated when some unrelated shell event happened to schedule a
+   * redraw - which is why a scroll looked like it repainted in pieces. */
+  winipc_present(win_id);
   return 0;
 }
 
@@ -917,6 +923,19 @@ int surf_take_damage(int win_id, int *x, int *y, int *w, int *h) {
   if (w) *w = surf[slot].dam_w;
   if (h) *h = surf[slot].dam_h;
   surf[slot].has_damage = 0;
+  return 1;
+}
+
+/* The same rectangle without clearing it. The compositor asks this when a
+ * client presents, to decide whether the frame can be a patch instead of a
+ * rebuild; the copy that follows takes the damage for real. */
+int surf_peek_damage(int win_id, int *x, int *y, int *w, int *h) {
+  int slot = surf_slot_for_win(win_id);
+  if (slot < 0 || !surf[slot].has_damage) return 0;
+  if (x) *x = surf[slot].dam_x;
+  if (y) *y = surf[slot].dam_y;
+  if (w) *w = surf[slot].dam_w;
+  if (h) *h = surf[slot].dam_h;
   return 1;
 }
 

@@ -4336,6 +4336,10 @@ typedef struct {
  * a damage-aware path would copy, against a blit that today covers the client
  * rect every frame. */
 static uint64_t surf_blit_frames, surf_dmg_rects, surf_dmg_px;
+/* Frames composed as a patch of presented rectangles, and the pixels those
+ * patches put on screen. Against `surf_blit_frames` this is the measurement of
+ * what damage-limited compositing actually saved. */
+static uint64_t dmg_patch_frames, dmg_patch_px;
 static uint32_t surf_blit_logged;   /* one blit line per window, not per frame */
 /* Set while a dying task's windows are closed. The exit path must not busy-wait
  * on the serial port before the zombie is published: the timer can preempt the
@@ -4646,7 +4650,12 @@ int winipc_key(int key) {
    * layout every program already compiles against. */
   int mods = (kb_shift_down() ? 1 : 0) | (kb_ctrl_down() ? 2 : 0);
   fwin_push(f, WIN_EV_KEY, mods, 0, key);
-  needs_redraw = 1;
+  /* No needs_redraw here. A key delivered to a client changes nothing on the
+   * screen until that client paints, and it will paint: it owns the pixels it
+   * is about to change and presents them. Asking for a scene rebuild on every
+   * keystroke meant an arrow-key scroll cost a supersampled rebuild and a
+   * full-screen blit on top of the strip the client was going to send anyway.
+   * Shell-level keys - menus, focus, window moves - set their own redraw. */
   return 1;
 }
 
@@ -4727,6 +4736,8 @@ void winipc_close(int id) {
     serial_puts(" blits_all=");      serial_puthex(surf_blit_frames);
     serial_puts(" dmg_rects_all=");  serial_puthex(surf_dmg_rects);
     serial_puts(" dmg_px_all=");     serial_puthex(surf_dmg_px);
+    serial_puts(" patch_frames=");   serial_puthex(dmg_patch_frames);
+    serial_puts(" patch_px=");       serial_puthex(dmg_patch_px);
     serial_puts("\n");
   }
   int owner = f->owner;
@@ -4791,9 +4802,169 @@ int winipc_add(int id, const win_cmd_u *cmd, const char *text) {
   return 0;
 }
 
+/* A client that presents new pixels does not invalidate the scene. The
+ * backbuffer still holds the frame that is on screen, and the only pixels that
+ * differ are the rectangle the process says it changed - so the frame is a
+ * patch, not a rebuild: copy that rectangle out of the surface into the frame
+ * buffer and put that rectangle on the screen.
+ *
+ * This is the difference between scrolling a page costing a full supersampled
+ * scene rebuild, a downsample and a full-screen blit, and costing one strip.
+ *
+ * Two cases fall back to the old path, both for correctness rather than
+ * convenience: a window that is not the topmost one cannot be patched, because
+ * whatever covers it is still valid on screen and a blind copy would paint
+ * through it; and a second window presenting before the frame is composed means
+ * the patches would have to be ordered, which is a region list rather than a
+ * rectangle. */
+#define DMG_PENDING_MAX WINIPC_MAX
+static struct { int used, id; } dmg_pending[DMG_PENDING_MAX];
+static int dmg_pending_n;
+static void blit_region(int x, int y, int w, int h);   /* below */
+static int  fwin_top_id(void);
+
+/* Is anything drawn above window `idx` over this rectangle? A patch writes
+ * straight into the frame buffer, so it is only sound where nothing else owns
+ * those pixels. The test is overlap, not "is it the top window": a widget that
+ * happens to be later in the list but sits on the other side of the screen does
+ * not block a patch, and that is the common case once the clock and the weather
+ * report are on the desktop. */
+static int fwin_above_covers(int idx, int x, int y, int w, int h) {
+  for (int j = idx + 1; j < WINIPC_MAX; j++) {
+    if (!fwin[j].used || fwin[j].minimized) continue;
+    if (x < fwin[j].x + fwin[j].w && fwin[j].x < x + w &&
+        y < fwin[j].y + fwin[j].h && fwin[j].y < y + h) return 1;
+  }
+  return 0;
+}
+
+static int fwin_index(int id) {
+  for (int i = 0; i < WINIPC_MAX; i++) if (fwin[i].used && fwin[i].id == id) return i;
+  return -1;
+}
+
+static void dmg_forget_all(void) {
+  for (int i = 0; i < dmg_pending_n; i++) dmg_pending[i].used = 0;
+  dmg_pending_n = 0;
+}
+
 void winipc_present(int id) {
-  if (!fwin_find(id)) return;
+  fwin_t *f = fwin_find(id);
+  if (!f) return;
+  if (f->minimized) { needs_redraw = 1; return; }
+
+  int dx, dy, dw, dh;
+  if (!surf_peek_damage(id, &dx, &dy, &dw, &dh)) return;   /* nothing new */
+  if (dw <= 0 || dh <= 0) return;
+
+  /* Already queued: nothing to add, and the patch will read the union anyway. */
+  for (int i = 0; i < dmg_pending_n; i++)
+    if (dmg_pending[i].used && dmg_pending[i].id == id) return;
+
+  /* the client rect this damage lands in, in screen coordinates */
+  int idx = fwin_index(id);
+  int cx = f->x + 1, cy = f->y + APP_TITLE_H;
+  int cw = f->w - 2, ch = f->h - APP_TITLE_H - 1;
+  int px = cx + dx, py = cy + dy;
+  int pw = dw < cw - dx ? dw : cw - dx;
+  int ph = dh < ch - dy ? dh : ch - dy;
+  /* The pointer is drawn into the frame buffer, not into the client's surface,
+   * so a patch that lands on it would erase it until the next full frame. */
+  int cs = UI_SCALE_VAL(20);
+  int cursor_hit = (px < mouse_x + cs && mouse_x < px + pw &&
+                    py < mouse_y + cs && mouse_y < py + ph);
+  if (idx < 0 || pw <= 0 || ph <= 0 || cursor_hit ||
+      dmg_pending_n >= DMG_PENDING_MAX - 1 ||
+      fwin_above_covers(idx, px, py, pw, ph)) {
+    needs_redraw = 1;
+    return;
+  }
+  dmg_pending[dmg_pending_n].used = 1;
+  dmg_pending[dmg_pending_n].id = id;
+  dmg_pending_n++;
+}
+
+/* Copy one window's presented rectangle into the frame buffer and put it on
+ * screen. Returns the number of pixels that reached the display. */
+static int dmg_patch_one(int id) {
+  fwin_t *f = fwin_find(id);
+  if (!f || f->minimized) return 0;
+
+  int sw, sh;
+  if (!surf_size(id, &sw, &sh)) return 0;
+
+  int dx, dy, dw, dh;
+  if (!surf_take_damage(id, &dx, &dy, &dw, &dh)) return 0;
+
+  /* the client area, exactly as winipc_draw_all defines it */
+  int cx = f->x + 1, cy = f->y + APP_TITLE_H;
+  int cw = f->w - 2, ch = f->h - APP_TITLE_H - 1;
+  if (cw <= 0 || ch <= 0) return 0;
+
+  /* clip to the surface, then to the client rect */
+  if (dx < 0) { dw += dx; dx = 0; }
+  if (dy < 0) { dh += dy; dy = 0; }
+  if (dx + dw > sw) dw = sw - dx;
+  if (dy + dh > sh) dh = sh - dy;
+  if (dw <= 0 || dh <= 0) return 0;
+  if (dx >= cw || dy >= ch) return 0;
+  int cols = dw < cw - dx ? dw : cw - dx;
+  int rows = dh < ch - dy ? dh : ch - dy;
+  if (cols <= 0 || rows <= 0) return 0;
+
+  for (int y = 0; y < rows; y++) {
+    uint32_t *dst = backbuffer + (size_t)(cy + dy + y) * (size_t)screen_width
+                              + (size_t)(cx + dx);
+    if (surf_copy_row(id, dy + y, dst, cols) != cols) break;
+  }
+
+  blit_region(cx + dx, cy + dy, cols, rows);
+  /* One line, the first time a client's frame is patched: the rectangle is the
+   * whole story of the saving, against a client rect and a screen that used to
+   * be copied in full. */
+  {
+    static int logged;
+    if (!logged) {
+      logged = 1;
+      serial_puts("[dmg] patch win=");   serial_puthex((uint64_t)id);
+      serial_puts(" rect=");             serial_puthex((uint64_t)cols);
+      serial_puts("x");                  serial_puthex((uint64_t)rows);
+      serial_puts(" client=");           serial_puthex((uint64_t)cw);
+      serial_puts("x");                  serial_puthex((uint64_t)ch);
+      serial_puts(" screen=");           serial_puthex((uint64_t)screen_width);
+      serial_puts("x");                  serial_puthex((uint64_t)screen_height);
+      serial_puts("\n");
+    }
+  }
+  surf_dmg_rects++;
+  surf_dmg_px += (uint64_t)cols * (uint64_t)rows;
+  dmg_patch_frames++;
+  dmg_patch_px += (uint64_t)cols * (uint64_t)rows;
+  return cols * rows;
+}
+
+/* Compose a frame made only of presented rectangles. Returns 1 if it did. */
+static int dmg_try_patch_frame(void) {
+#ifdef OMI_NO_DMG_PATCH
+  /* Verification switch: same build, patches off. A present must still reach the
+   * screen, so ask for the full redraw that used to follow every present - the
+   * point is to compare the pixels a patch produced against the pixels a full
+   * redraw of the same content produces. Nothing should set this in a shipped
+   * build. */
+  if (!dmg_pending_n) return 0;
+  dmg_forget_all();
   needs_redraw = 1;
+  return 0;
+#endif
+  if (!dmg_pending_n || needs_redraw) { dmg_forget_all(); return 0; }
+  int did = 0;
+  for (int i = 0; i < dmg_pending_n; i++) {
+    if (!dmg_pending[i].used) continue;
+    did |= (dmg_patch_one(dmg_pending[i].id) > 0);
+    dmg_pending[i].used = 0;
+  }
+  dmg_pending_n = 0;
+  return did;
 }
 
 void winipc_draw_all(void) {
@@ -5802,7 +5973,13 @@ static void gui_poll_input(void) {
    * apps and the desktop never see it. */
   if (winipc_input(new_x, new_y, buttons, left_press, left_release, wheel)) {
     prev_buttons = buttons;
-    needs_redraw = 1;
+    /* A client owning the pointer is not a reason to repaint the desktop. This
+     * used to set needs_redraw unconditionally, and because the check runs on
+     * every poll, a still pointer over any client window kept the compositor in
+     * a full-scene rebuild for as long as the pointer sat there - a permanent
+     * redraw loop that also made every client present look "late". Motion was
+     * already handled above; only a real event needs a frame here. */
+    if (left_press || left_release || wheel) needs_redraw = 1;
     return;
   }
   
@@ -6308,10 +6485,24 @@ void gui_compose(void) {
   }
 
   if (wallpaper_cache_dirty) {
+    /* This flag means "force one full frame". It used to be a cache-invalidation
+     * flag for the old wallpaper buffer, which draw_wallpaper() no longer reads -
+     * it keeps its own cache - so nothing ever cleared it. Starting at 1 and
+     * never being reset meant every single compositor iteration asked for a full
+     * scene rebuild and a full-screen blit, whether anything had changed or not.
+     * Clearing it here is what lets the desktop idle at all. */
+    wallpaper_cache_dirty = 0;
     full_redraw = 1;
     needs_redraw = 1;
   }
-  
+
+  /* A frame caused only by clients presenting pixels does not need the scene
+   * rebuilt: patch the rectangles and put them on the screen. */
+  if (dmg_try_patch_frame()) {
+    frame_count++;
+    return;
+  }
+
   if (needs_redraw) {
     gui_draw_all();
     smart_swap_buffers();

@@ -95,6 +95,9 @@ int surf_copy_row(int win_id, int y, uint32_t *dst, int cols);
 /* The rectangle presented since the last frame (client coordinates), cleared
  * by the read. 0 when nothing new was presented. */
 int       surf_take_damage(int win_id, int *x, int *y, int *w, int *h);
+/* The same rectangle without clearing it, so the compositor can decide whether
+ * a frame is a patch before committing to copying it. */
+int       surf_peek_damage(int win_id, int *x, int *y, int *w, int *h);
 void     surf_release_window(int win_id);
 
 /* input: called from the compositor's poll loop. Returns 1 when a foreign

@@ -45,3 +45,4 @@ iso_root/
 # Written by the Makefile on every run: a timestamp changes with each build,
 # and a tracked timestamp means every build dirties the working tree.
 kernel/include/buildstamp.h
+kernel/include/devboot.h
