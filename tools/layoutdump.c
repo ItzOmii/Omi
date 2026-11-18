@@ -50,8 +50,16 @@ int main(int argc, char **argv) {
   int prev_bottom = 0;
   for (int i = 0; i < count; i++) {
     const web_op_t *o = &ops[i];
-    if (o->x + o->w > width + 1) over++;
-    if (o->x < 0 || o->y < 0) neg++;
+    if (o->x + o->w > width + 1) {
+      over++;
+      if (over <= 5) printf("[dump] overflow op %d: kind=%d x=%d w=%d end=%d \"%s\"\n",
+                            i, o->kind, o->x, o->w, o->x + o->w, o->text ? o->text : "");
+    }
+    if (o->x < 0 || o->y < 0) {
+      neg++;
+      if (neg <= 5) printf("[dump] negative op %d: kind=%d x=%d y=%d w=%d h=%d \"%s\"\n",
+                           i, o->kind, o->x, o->y, o->w, o->h, o->text ? o->text : "");
+    }
     if (o->kind == 1 && (!o->text || !o->text[0])) empty++;
     if (o->w > width * 2) tall++;
     if (!check_only) {
@@ -70,6 +78,9 @@ int main(int argc, char **argv) {
 
   printf("[dump] width=%d height=%d ops=%d last_bottom=%d overflow_x=%d\n",
          width, h, count, prev_bottom, over);
+  /* the engine reports the table width it drew; a table wider than the page is
+   * what puts a cell's text past the edge, so name it */
+  if (getenv("OMI_TBL_DEBUG")) { }
   if (web_ops_full()) printf("[dump] FAIL display list full - page truncated\n");
   if (neg) printf("[dump] FAIL %d ops at negative coordinates\n", neg);
   if (empty) printf("[dump] FAIL %d empty text runs\n", empty);

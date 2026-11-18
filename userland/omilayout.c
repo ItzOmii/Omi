@@ -24,7 +24,12 @@ static void *krealloc(void *p, size_t n) { return realloc(p, n); }
 
 /* ------------------------------------------------------------------ state */
 
-#define MAX_OPS   9000
+/* The display list grows on demand (see op_push), so this is only a ceiling on
+ * what one page may turn into, not a cost paid up front. A reference page like
+ * docs.python.org/3/library/stdtypes.html needs about 37k ops to the end; 9000
+ * cut it off a quarter of the way down. At 64 bytes an op, a page that reaches
+ * the ceiling costs 2.5 MB, against the 32 MB a process is tested to hold. */
+#define MAX_OPS  40000
 /* 2048 rules, not 96. A real theme's stylesheet is a few thousand rules, and 96
  * kept only the first few percent of one: the page looked unstyled because it
  * was, not because the engine could not apply what it had. Each rule is a pointer
@@ -1191,6 +1196,28 @@ static void tbl_rows(GumboNode *n, GumboNode **rows, int *nr, int depth) {
 }
 
 /* how many lines this text needs in `width` */
+/* How many lines a single word needs when it is wider than the column. A cell
+ * holds text, not words: "documentation" in a 66px column has to break, or it is
+ * drawn past the table's edge and clipped by the window. */
+static int word_chunks(int font, const char *word, int width) {
+  int len = (int)strlen(word), n = 1, i = 0;
+  while (i < len) {
+    char tmp[64];
+    int fit = 0;
+    while (i + fit < len) {
+      int take = fit + 1;
+      memcpy(tmp, word + i, (size_t)take);
+      tmp[take] = 0;
+      if (tw(font, tmp) > width) break;
+      fit = take;
+    }
+    if (!fit) fit = 1;                     /* narrower than one glyph: take it */
+    i += fit;
+    if (i < len) n++;
+  }
+  return n;
+}
+
 static int wrap_count(const char *s, int font, int width) {
   if (width < 8) width = 8;
   int lines = 1, w = 0, sp = tw(font, " ");
@@ -1204,6 +1231,11 @@ static int wrap_count(const char *s, int font, int width) {
     int ww = tw(font, word);
     if (w && w + sp + ww > width) { lines++; w = ww; }
     else w += (w ? sp : 0) + ww;
+    if (ww > width) {
+      /* it breaks over several lines by itself, and the next word starts fresh */
+      lines += word_chunks(font, word, width) - 1;
+      w = width;
+    }
   }
   return lines;
 }
@@ -1221,6 +1253,32 @@ static void draw_wrapped(const char *s, int font, uint32_t color, int x, int y,
     word[len] = 0;
     int ww = tw(font, word);
     if (cx > x && cx + ww > x + width) { cx = x; cy += lh; }
+    if (ww > width && cx == x) {
+      /* the word is wider than the column on its own: break it, same as
+       * word_chunks counts it */
+      int i = 0;
+      while (i < len) {
+        char tmp[64];
+        int fit = 0;
+        while (i + fit < len) {
+          int take = fit + 1;
+          memcpy(tmp, word + i, (size_t)take);
+          tmp[take] = 0;
+          if (tw(font, tmp) > width) break;
+          fit = take;
+        }
+        if (!fit) fit = 1;
+        memcpy(tmp, word + i, (size_t)fit);
+        tmp[fit] = 0;
+        char *part = dup_n(tmp, fit);
+        if (part) op_push(1, cx, cy, tw(font, tmp), lh, color, part, font, bold, 0);
+        i += fit;
+        if (i < len) cy += lh;
+      }
+      cx = x;
+      cy += lh;                          /* the next word starts a fresh line */
+      continue;
+    }
     /* op_push keeps the pointer, so every op needs its own copy */
     char *keep = dup_n(word, len);
     if (keep) op_push(1, cx, cy, ww, lh, color, keep, font, bold, 0);
@@ -1278,12 +1336,19 @@ static void layout_table(GumboNode *table, st_t *st, int x, int avail, int depth
       if (wcol[c] < 44) wcol[c] = 44;
       acc += wcol[c];
     }
+    /* Take the deficit from the widest column, a step at a time. The 44px floor
+     * keeps a column readable, but when several columns are floored it puts the
+     * table back over the page - and a table that runs off the edge loses the
+     * end of its right column, which is worse than a narrow column. So the floor
+     * gives way: 44 at first, then anything down to 8. */
     while (acc > availw) {
       int big = 0;
       for (int c = 1; c < cols; c++) if (wcol[c] > wcol[big]) big = c;
+      if (wcol[big] <= 8) break;
       int d = acc - availw; if (d > 8) d = 8;
-      if (wcol[big] - d < 44) break;
-      wcol[big] -= d; acc -= d;
+      int take = wcol[big] - 8; if (take > d) take = d;
+      if (take < 1) break;
+      wcol[big] -= take; acc -= take;
     }
   } else {
     for (int c = 0; c < cols; c++) wcol[c] = natw[c];
@@ -1602,6 +1667,17 @@ static void layout_node(GumboNode *node, st_t st, int x, int avail, int depth) {
       }
       ordered = 1;
     } else ordered = 0;
+    /* An item at the very left edge has no room for a marker in front of it, and
+     * drawing one at a negative x puts it off the window. Move the item in by
+     * what the marker needs instead - the text keeps its own left edge, it just
+     * starts a little further right. */
+    if (cx < 14) {
+      int push = 14 - cx;
+      cx += push;
+      cw -= push;
+      line_x = cx;
+      line_avail = cw;
+    }
     st_t ms = st;
     ms.font = st.font;
     ms.color = st.color ? st.color : doc_fg;
