@@ -1,92 +1,59 @@
 /*
- * UnixOS Kernel Linker Script
- * ARM64 (AArch64) kernel linking configuration
+ * UEFI Demo OS - Linker Script
+ * Higher-half kernel for x86_64 with Limine bootloader
  */
 
-/* Entry point - where execution begins after bootloader */
+/* Virtual base at -2GB (canonical higher half) */
+KERNEL_VIRT = 0xFFFFFFFF80000000;
+KERNEL_PHYS = 0x100000;  /* 1MB physical load address */
+
 ENTRY(_start)
 
-/* Kernel base address - standard for ARM64 */
-KERNEL_BASE = 0xFFFF000000000000;
-KERNEL_PHYS = 0x40000000;  /* Physical load address for QEMU virt */
+PHDRS {
+    limine   PT_LOAD FLAGS(4);  /* r-- (read-only requests) */
+    text     PT_LOAD FLAGS(5);  /* r-x (code) */
+    rodata   PT_LOAD FLAGS(4);  /* r-- (read-only data) */
+    data     PT_LOAD FLAGS(6);  /* rw- (read-write data) */
+}
 
-SECTIONS
-{
-    /* Start at kernel physical address */
-    . = KERNEL_PHYS;
-    
-    /* Keep track of kernel start */
-    __kernel_start = .;
-    
-    /* =================================================================== */
-    /* Code Section (.text) */
-    /* =================================================================== */
-    .text ALIGN(4K) : {
-        __text_start = .;
-        
-        /* Boot code must come first */
-        *(.text.boot)
-        
-        /* Then the rest of the kernel code */
+SECTIONS {
+    . = KERNEL_VIRT;
+
+    /* Limine requests section - must be first for bootloader scanning */
+    .limine_requests ALIGN(4K) : AT(ADDR(.limine_requests) - KERNEL_VIRT + KERNEL_PHYS) {
+        KEEP(*(.limine_requests))
+    } :limine
+
+    /* Code section */
+    .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_VIRT + KERNEL_PHYS) {
         *(.text .text.*)
-        
-        __text_end = .;
-    }
-    
-    /* =================================================================== */
-    /* Read-Only Data Section (.rodata) */
-    /* =================================================================== */
-    .rodata ALIGN(4K) : {
-        __rodata_start = .;
-        
+    } :text
+
+    /* Read-only data */
+    .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_VIRT + KERNEL_PHYS) {
         *(.rodata .rodata.*)
-        
-        __rodata_end = .;
-    }
-    
-    /* =================================================================== */
-    /* Data Section (.data) */
-    /* =================================================================== */
-    .data ALIGN(4K) : {
-        __data_start = .;
-        
+    } :rodata
+
+    /* Data section */
+    .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_VIRT + KERNEL_PHYS) {
         *(.data .data.*)
-        
-        __data_end = .;
-    }
-    
-    /* =================================================================== */
-    /* BSS Section (Uninitialized Data) */
-    /* =================================================================== */
-    .bss ALIGN(4K) : {
+    } :data
+
+    /* BSS section (uninitialized data) */
+    .bss ALIGN(4K) : AT(ADDR(.bss) - KERNEL_VIRT + KERNEL_PHYS) {
         __bss_start = .;
-        
         *(.bss .bss.*)
         *(COMMON)
-        
         __bss_end = .;
-    }
-    
-    /* =================================================================== */
-    /* Kernel Stack */
-    /* =================================================================== */
+    } :data
+
+    /* Stack */
     . = ALIGN(16);
     __stack_bottom = .;
     . += 64K;  /* 64KB kernel stack */
     __stack_top = .;
-    
-    /* =================================================================== */
-    /* End of Kernel */
-    /* =================================================================== */
-    . = ALIGN(4K);
-    __kernel_end = .;
-    
-    /* Calculate kernel size */
-    __kernel_size = __kernel_end - __kernel_start;
-    
-    /* =================================================================== */
-    /* Debug Sections (stripped in release) */
-    /* =================================================================== */
+
+    /* Discard unwanted sections */
     /DISCARD/ : {
         *(.comment)
         *(.note*)

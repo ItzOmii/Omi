@@ -1,12 +1,12 @@
 /*
- * Toolbar Icons for vib-OS Image Viewer
+ * Toolbar Icons for MeepOS Image Viewer
  * Generated from Feather Icons (MIT Licensed)
  */
 
 #ifndef TOOLBAR_ICONS_H
 #define TOOLBAR_ICONS_H
 
-#include "types.h"
+#include "../include/types.h"
 
 #define TOOLBAR_ICON_SIZE 24
 

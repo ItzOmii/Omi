@@ -1,62 +1,38 @@
 /*
- * Vib-OS - Media helpers (JPEG/MP3 decoding)
+ * MeepOS x86_64 - Media Library
+ * JPEG decoding support for wallpapers
  */
 
-#include "media/media.h"
-#include "fs/vfs.h"
-#include "mm/kmalloc.h"
-#include "printk.h"
-#include "types.h"
-#include "sandbox/sandbox.h"
+#include "../include/media.h"
+#include "../include/string.h"
+#include "picojpeg.h"
 
-/* --------------------------------------------------------------------- */
-/* File loading                                                          */
-/* --------------------------------------------------------------------- */
+/* Simple memory allocator for media - uses static buffer */
+#define MEDIA_HEAP_SIZE (4 * 1024 * 1024) /* 4MB for images */
+static uint8_t media_heap[MEDIA_HEAP_SIZE];
+static size_t media_heap_used = 0;
 
-int media_load_file(const char *path, uint8_t **out_data, size_t *out_size) {
-  if (!path || !out_data || !out_size)
-    return -EINVAL;
-
-  struct file *f = vfs_open(path, O_RDONLY, 0);
-  if (!f)
-    return -ENOENT;
-
-  struct inode *inode = f->f_dentry ? f->f_dentry->d_inode : NULL;
-  if (!inode || inode->i_size <= 0) {
-    vfs_close(f);
-    return -EINVAL;
+static void *media_alloc(size_t size) {
+  /* Align to 8 bytes */
+  size = (size + 7) & ~7;
+  if (media_heap_used + size > MEDIA_HEAP_SIZE) {
+    return (void *)0;
   }
-
-  size_t size = (size_t)inode->i_size;
-  uint8_t *buf = (uint8_t *)kmalloc(size, GFP_KERNEL);
-  if (!buf) {
-    vfs_close(f);
-    return -ENOMEM;
-  }
-
-  ssize_t read_bytes = vfs_read(f, (char *)buf, size);
-  vfs_close(f);
-
-  if (read_bytes < 0) {
-    kfree(buf);
-    return (int)read_bytes;
-  }
-
-  *out_data = buf;
-  *out_size = (size_t)read_bytes;
-  return 0;
+  void *ptr = &media_heap[media_heap_used];
+  media_heap_used += size;
+  return ptr;
 }
 
-void media_free_file(uint8_t *data) {
-  if (data)
-    kfree(data);
+static void media_free(void *ptr) {
+  /* Simple bump allocator - no individual free support */
+  (void)ptr;
 }
+
+static void media_reset(void) { media_heap_used = 0; }
 
 /* --------------------------------------------------------------------- */
 /* JPEG decoding (picojpeg)                                               */
 /* --------------------------------------------------------------------- */
-
-#include "picojpeg.h"
 
 typedef struct {
   const uint8_t *data;
@@ -89,50 +65,39 @@ int media_decode_jpeg_buffer(const uint8_t *data, size_t size,
                              media_image_t *out, uint32_t *buffer,
                              size_t buffer_size) {
   if (!data || !size || !out)
-    return -EINVAL;
+    return -1;
 
   jpeg_mem_t mem = {data, size, 0};
   pjpeg_image_info_t info;
   unsigned char status = pjpeg_decode_init(&info, jpeg_need_bytes, &mem, 0);
   if (status) {
-    printk(KERN_ERR "JPEG: decode_init failed (%u)\n", status);
-    return -EINVAL;
+    return -1;
   }
 
   if (info.m_width <= 0 || info.m_height <= 0)
-    return -EINVAL;
+    return -1;
 
-  /* Check for integer overflow in pixel count calculation */
-  if ((size_t)info.m_width > SIZE_MAX / (size_t)info.m_height) {
-    printk(KERN_ERR "JPEG: dimensions too large (integer overflow)\n");
-    return -EINVAL;
-  }
-
+  /* Check for excessively large images */
   size_t pixel_count = (size_t)info.m_width * (size_t)info.m_height;
-
-  /* Prevent excessively large allocations (64MB max image - 4K support) */
-  if (pixel_count > 16 * 1024 * 1024) {
-    printk(KERN_ERR "JPEG: image too large (%zu pixels)\n", pixel_count);
-    return -EINVAL;
+  if (pixel_count > 4 * 1024 * 1024) { /* 4M pixels max for kernel */
+    return -1;
   }
 
   size_t required_bytes = pixel_count * sizeof(uint32_t);
 
-  uint32_t *pixels = NULL;
-  bool allocated = false;
+  uint32_t *pixels = (void *)0;
+  int allocated = 0;
 
   if (buffer) {
     if (buffer_size < required_bytes) {
-      printk(KERN_ERR "JPEG: buffer too small (need %d, got %d)\n",
-             (int)required_bytes, (int)buffer_size);
-      return -ENOMEM;
+      return -1;
     }
     pixels = buffer;
   } else {
-    pixels = (uint32_t *)kmalloc(required_bytes, GFP_KERNEL);
+    pixels = (uint32_t *)media_alloc(required_bytes);
     if (!pixels)
-      return -ENOMEM;
-    allocated = true;
+      return -1;
+    allocated = 1;
   }
 
   int mcu_x = 0;
@@ -142,10 +107,9 @@ int media_decode_jpeg_buffer(const uint8_t *data, size_t size,
     if (status) {
       if (status == PJPG_NO_MORE_BLOCKS)
         break;
-      printk(KERN_ERR "JPEG: decode_mcu failed (%u)\n", status);
       if (allocated)
-        kfree(pixels);
-      return -EINVAL;
+        media_free(pixels);
+      return -1;
     }
 
     int mcu_width = info.m_MCUWidth;
@@ -189,114 +153,16 @@ int media_decode_jpeg_buffer(const uint8_t *data, size_t size,
 }
 
 int media_decode_jpeg(const uint8_t *data, size_t size, media_image_t *out) {
-  return media_decode_jpeg_buffer(data, size, out, NULL, 0);
+  return media_decode_jpeg_buffer(data, size, out, (void *)0, 0);
 }
 
 void media_free_image(media_image_t *image) {
   if (!image)
     return;
   if (image->pixels) {
-    kfree(image->pixels);
-    image->pixels = NULL;
+    media_free(image->pixels);
+    image->pixels = (void *)0;
   }
   image->width = 0;
   image->height = 0;
-}
-
-/* --------------------------------------------------------------------- */
-/* MP3 decoding (minimp3)                                                 */
-/* --------------------------------------------------------------------- */
-
-#define MINIMP3_IMPLEMENTATION
-#define MINIMP3_NO_STDIO
-#define MINIMP3_NO_SIMD
-#define malloc(sz) kmalloc((sz))
-#define free(ptr) kfree((ptr))
-#define realloc(ptr, sz) krealloc((ptr), (sz), 0)
-#include "minimp3_ex.h"
-#undef malloc
-#undef free
-#undef realloc
-
-int media_decode_mp3(const uint8_t *data, size_t size, media_audio_t *out) {
-  if (!data || !size || !out)
-    return -EINVAL;
-
-  mp3dec_t dec;
-  mp3dec_file_info_t info;
-  int ret = mp3dec_load_buf(&dec, data, size, &info, NULL, NULL);
-  if (ret < 0 || !info.buffer || !info.samples) {
-    return -EINVAL;
-  }
-
-  out->samples = (int16_t *)info.buffer;
-  out->sample_count =
-      (uint32_t)(info.samples / (info.channels ? info.channels : 1));
-  out->sample_rate = (uint32_t)info.hz;
-  out->channels = (uint8_t)info.channels;
-  return 0;
-}
-
-void media_free_audio(media_audio_t *audio) {
-  if (!audio)
-    return;
-  if (audio->samples) {
-    kfree(audio->samples);
-    audio->samples = NULL;
-  }
-  audio->sample_count = 0;
-  audio->sample_rate = 0;
-  audio->channels = 0;
-}
-
-/* --------------------------------------------------------------------- */
-/* PNG decoding (tPNG)                                                    */
-/* --------------------------------------------------------------------- */
-
-#include "tpng.h"
-
-int media_decode_png(const uint8_t *data, size_t size, media_image_t *out) {
-  if (!data || !size || !out)
-    return -EINVAL;
-
-  uint32_t width = 0, height = 0;
-  uint8_t *rgba = tpng_decode(data, (uint32_t)size, &width, &height);
-
-  if (!rgba || width == 0 || height == 0) {
-    printk(KERN_ERR "PNG: decode failed\n");
-    if (rgba)
-      kfree(rgba);
-    return -EINVAL;
-  }
-
-  /* Check for excessively large images (16M pixels max, same as JPEG) */
-  size_t pixel_count = (size_t)width * (size_t)height;
-  if (pixel_count > 16 * 1024 * 1024) {
-    printk(KERN_ERR "PNG: image too large (%zu pixels)\n", pixel_count);
-    kfree(rgba);
-    return -EINVAL;
-  }
-
-  /* Convert RGBA (uint8_t*) to 0x00RRGGBB (uint32_t*) format */
-  uint32_t *pixels =
-      (uint32_t *)kmalloc(pixel_count * sizeof(uint32_t), GFP_KERNEL);
-  if (!pixels) {
-    kfree(rgba);
-    return -ENOMEM;
-  }
-
-  for (size_t i = 0; i < pixel_count; i++) {
-    uint8_t r = rgba[i * 4 + 0];
-    uint8_t g = rgba[i * 4 + 1];
-    uint8_t b = rgba[i * 4 + 2];
-    /* Alpha is in rgba[i * 4 + 3] but we ignore it for now */
-    pixels[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
-  }
-
-  kfree(rgba);
-
-  out->width = width;
-  out->height = height;
-  out->pixels = pixels;
-  return 0;
 }

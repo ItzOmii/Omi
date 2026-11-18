@@ -1,18 +1,37 @@
-test/
+# Build artifacts
 build/
-image/
+*.iso
+*.o
+*.elf
+
+# Limine temp files
+limine.tar.xz
+limine-uefi.zip
+
+# Logs and temp files
+serial.log
+*.log
+
+# macOS
 .DS_Store
-BUILD_FIXES_COMPLETE.md
-BUILD_STATUS.md
-FINAL_STATUS.md
-IMPLEMENTATION_COMPLETE.md
-KNOWN_ISSUES.md
-MULTIARCH_QUICKSTART.md
-.gitignore
-docs/MULTIARCH_IMPLEMENTATION.md
-docs/MULTIARCH_BUILD.md
-docs/BOOT_SUPPORT.md
-MULTIARCH_COMPLETE.md
-BUILD_ALL.md
-working-os/
-.github/workflows/README.md
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test files
+test/
+tests/
+
+# build artifacts: the ISO carries the shared object, the Makefile builds it
+*.so
+
+# The interpreter the ISO carries is copied from the build host's musl at build
+# time, not vendored: keeping a 715 KB libc in the tree would tie the repository
+# to one distribution's build of it.
+iso_root/lib/

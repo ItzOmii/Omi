@@ -1,344 +1,417 @@
-# Vib-OS Master Makefile
-# ARM64 OS for Apple Silicon and Raspberry Pi
+# UEFI Demo OS Makefile
+# Builds a bootable x86_64 kernel using Limine bootloader
 
-# ============================================================================
-# Configuration
-# ============================================================================
+# Toolchain - use cross compiler if available, otherwise try clang
+CC := clang
+LD := ld.lld
 
-# Target architecture
-ARCH := arm64
-TARGET := aarch64-elf
-
-# Directories
-ROOT_DIR := $(shell pwd)
-BUILD_DIR := $(ROOT_DIR)/build
-BOOT_DIR := $(ROOT_DIR)/boot
-KERNEL_DIR := $(ROOT_DIR)/kernel
-DRIVERS_DIR := $(ROOT_DIR)/drivers
-LIBC_DIR := $(ROOT_DIR)/libc
-USERSPACE_DIR := $(ROOT_DIR)/userspace
-RUNTIMES_DIR := $(ROOT_DIR)/runtimes
-IMAGE_DIR := $(ROOT_DIR)/image
-SYSROOT := $(BUILD_DIR)/sysroot
-
-# Detect OS
-UNAME_S := $(shell uname -s)
-
-# Toolchain - Support both macOS (Homebrew) and Linux (system/apt)
-ifeq ($(UNAME_S),Darwin)
-    # macOS with Homebrew
-    LLVM_PATH ?= /opt/homebrew/opt/llvm/bin
-    BREW_PATH ?= /opt/homebrew/bin
-    export PATH := $(LLVM_PATH):$(BREW_PATH):$(PATH)
-    CC := $(LLVM_PATH)/clang
-    AS := $(LLVM_PATH)/clang
-    LD := $(BREW_PATH)/ld.lld
-    AR := $(LLVM_PATH)/llvm-ar
-    OBJCOPY := $(LLVM_PATH)/llvm-objcopy
-    OBJDUMP := $(LLVM_PATH)/llvm-objdump
-else
-    # Linux (Ubuntu/Debian/etc.) - use system LLVM or allow override
-    LLVM_PATH ?= /usr/bin
-    # Check if clang exists, otherwise use it with full path
-    ifeq ($(shell which clang 2>/dev/null),)
-        $(error "Clang not found! Run: sudo apt install clang lld")
-    endif
-    CC := clang
-    AS := clang
-    LD := ld.lld
-    AR := llvm-ar
-    OBJCOPY := llvm-objcopy
-    OBJDUMP := llvm-objdump
+# Check for x86_64-elf-gcc
+CROSS_CC := $(shell which x86_64-elf-gcc 2>/dev/null)
+CROSS_LD := $(shell which x86_64-elf-ld 2>/dev/null)
+ifneq ($(CROSS_CC),)
+    CC := x86_64-elf-gcc
+    LD := x86_64-elf-ld
 endif
 
-# Cross-compilation target
-CROSS_TARGET := --target=aarch64-unknown-none-elf
+# Directories
+KERNEL_DIR := kernel
+BUILD_DIR := build
+ISO_ROOT := iso_root
+
+# Output files
+# A build stamp, regenerated each build and shown in the browser's chrome: the
+# question "is that the build with the fix?" cost a whole round trip once, because
+# the only way to tell two ISOs apart was the file's md5.
+$(shell mkdir -p $(KERNEL_DIR)/include; printf '#define OMI_BUILD "%s"\n' "$$(date +%m%d.%H%M)" > $(KERNEL_DIR)/include/buildstamp.h)
+
+KERNEL := $(BUILD_DIR)/kernel.elf
+
+# DEV=1 builds a boot that spawns only the browser: the test suites take most of
+# the boot time and are not what a rendering change is being judged by, and the
+# main suite build stays the default so nothing is measured against a dev boot by
+# accident. The flag lives in a generated header, so switching costs one object
+# file rather than the whole kernel.
+DEV ?= 0
+$(shell mkdir -p $(KERNEL_DIR)/include; printf '#define OMI_DEV_BOOT %s\n' $(DEV) > /tmp/devboot.new.$$$$ 2>/dev/null; cmp -s /tmp/devboot.new.$$$$ $(KERNEL_DIR)/include/devboot.h 2>/dev/null || cp /tmp/devboot.new.$$$$ $(KERNEL_DIR)/include/devboot.h; rm -f /tmp/devboot.new.$$$$)
+ifeq ($(DEV),1)
+ISO := omi-dev.iso
+else
+ISO := omi.iso
+endif
 
 # Compiler flags
-# CPU target: generic works on QEMU and most ARM64 hardware
-CFLAGS_COMMON := -Wall -Wextra -Wno-unused-function -ffreestanding -fstack-protector-strong \
-                 -fno-pic -mcpu=cortex-a72 -O2 -g
+CFLAGS := -target x86_64-unknown-none-elf \
+          -ffreestanding \
+          -fno-stack-protector \
+          -fno-stack-check \
+          -fno-lto \
+          -fno-PIC \
+          -m64 \
+          -march=x86-64 \
+          -mno-red-zone \
+          -mcmodel=kernel \
+          -I$(KERNEL_DIR)/include \
+          -I$(KERNEL_DIR)/lib/bearssl/port \
+          -I$(KERNEL_DIR)/lib/bearssl/inc \
+          -Wall -Wextra \
+          -O2 \
+          -g
 
-CFLAGS_KERNEL := $(CFLAGS_COMMON) $(CROSS_TARGET) \
-                 -I$(KERNEL_DIR)/include -I$(KERNEL_DIR) \
-                 -mgeneral-regs-only \
-                 -fno-builtin -nostdlib -nostdinc \
-                 -DARCH_ARM64
+# Use GCC-compatible flags if using cross compiler
+ifneq ($(CROSS_CC),)
+CFLAGS := -ffreestanding \
+          -fno-stack-protector \
+          -fno-stack-check \
+          -fno-lto \
+          -fno-PIC \
+          -m64 \
+          -march=x86-64 \
+          -mno-red-zone \
+          -mcmodel=kernel \
+          -I$(KERNEL_DIR)/include \
+          -I$(KERNEL_DIR)/lib/bearssl/port \
+          -I$(KERNEL_DIR)/lib/bearssl/inc \
+          -Wall -Wextra \
+          -O2 \
+          -g
+endif
 
-CFLAGS_USER := -Wall -Wextra -O2 -g \
-               --target=aarch64-linux-musl \
-               --sysroot=$(SYSROOT)
+# Linker flags
+LDFLAGS := -nostdlib \
+           -static \
+           -z max-page-size=0x1000 \
+           -T $(KERNEL_DIR)/linker.ld
 
-LDFLAGS_KERNEL := -nostdlib -static -T $(KERNEL_DIR)/linker.ld
+# compiler-rt soft-float helpers (minimp3 uses float maths, kernel is -mno-sse)
+BUILTINS := $(shell ls /usr/lib/llvm-*/lib/clang/*/lib/linux/libclang_rt.builtins-x86_64.a 2>/dev/null | head -1)
 
-# QEMU configuration
-QEMU := qemu-system-aarch64
-QEMU_MACHINE := virt,gic-version=3
-QEMU_CPU := max
-QEMU_MEMORY := 4G
-QEMU_FLAGS := -M $(QEMU_MACHINE) -cpu $(QEMU_CPU) -m $(QEMU_MEMORY) \
-              -nographic -serial mon:stdio \
-              -drive if=none,id=hd0,format=raw,file=$(IMAGE_DIR)/unixos.img \
-              -device virtio-blk-device,drive=hd0
+# Source files
+SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
+           $(KERNEL_DIR)/lib/string.c \
+           $(KERNEL_DIR)/lib/builtins_shim.c \
+           $(KERNEL_DIR)/mm/kmalloc.c \
+           $(KERNEL_DIR)/mm/mmio.c \
+           $(KERNEL_DIR)/mm/pmm.c \
+           $(KERNEL_DIR)/cow.c \
+           $(KERNEL_DIR)/walltime.c \
+           $(KERNEL_DIR)/fs/vfs.c \
+           $(KERNEL_DIR)/drivers/framebuffer.c \
+           $(KERNEL_DIR)/drivers/idt.c \
+           $(KERNEL_DIR)/drivers/wc.c \
+           $(KERNEL_DIR)/drivers/ps2.c \
+           $(KERNEL_DIR)/drivers/pci.c \
+           $(KERNEL_DIR)/drivers/ata.c \
+           $(KERNEL_DIR)/drivers/e1000.c \
+           $(KERNEL_DIR)/net/net.c \
+           $(KERNEL_DIR)/drivers/hda.c \
+           $(KERNEL_DIR)/drivers/acpi.c \
+           $(KERNEL_DIR)/drivers/usb.c \
+           $(KERNEL_DIR)/drivers/usb_hid.c \
+           $(KERNEL_DIR)/drivers/usb_xhci.c \
+           $(KERNEL_DIR)/drivers/usb_ehci.c \
+           $(KERNEL_DIR)/gui/font.c \
+           $(KERNEL_DIR)/gui/terminal.c \
+           $(KERNEL_DIR)/gui/desktop_mgr.c \
+           $(KERNEL_DIR)/gui/window.c \
+           $(KERNEL_DIR)/gui/compositor.c \
+           $(KERNEL_DIR)/gui/ttf.c \
+           $(KERNEL_DIR)/kernel_task.c \
+           $(KERNEL_DIR)/gdt.c \
+           $(KERNEL_DIR)/ring3.c \
+           $(KERNEL_DIR)/elf.c \
+           $(KERNEL_DIR)/fs/fd.c \
+           $(KERNEL_DIR)/fs/socket.c \
+           $(KERNEL_DIR)/fs/pipe.c \
+           $(KERNEL_DIR)/fs/epoll.c \
+           $(KERNEL_DIR)/fs/shfile.c \
+           $(KERNEL_DIR)/fs/diskfs.c \
+           $(KERNEL_DIR)/fs/unixpair.c \
+           $(KERNEL_DIR)/fs/unixname.c \
+           $(KERNEL_DIR)/fs/fd_opaque_check.c \
+           $(KERNEL_DIR)/fs/socket_selftest.c \
+           $(KERNEL_DIR)/fs/readiness_selftest.c \
+         $(KERNEL_DIR)/fs/preempt_selftest.c \
+           $(KERNEL_DIR)/gui/icons_ri.c \
+           $(KERNEL_DIR)/net/tcp.c \
+           $(KERNEL_DIR)/net/tls.c \
+           $(KERNEL_DIR)/net/roots.c \
+           $(KERNEL_DIR)/net/http.c \
+           $(KERNEL_DIR)/media/media.c \
+           $(KERNEL_DIR)/media/image.c \
+           $(KERNEL_DIR)/media/modules.c \
+           $(KERNEL_DIR)/media/mp3.c \
+           $(KERNEL_DIR)/media/picojpeg.c \
+           $(KERNEL_DIR)/media/hd_wallpaper_landscape.c \
+           $(KERNEL_DIR)/media/hd_wallpaper_nature.c \
+           $(KERNEL_DIR)/media/hd_wallpaper_city.c
 
-# ============================================================================
-# Main Targets
-# ============================================================================
+# Object files
+BEARSSL := $(KERNEL_DIR)/lib/bearssl
+BEARSSL_ALL := $(wildcard $(BEARSSL)/src/*/*.c)
+# Everything that only exists for big-endian PowerPC/x86-64 extras, plus server
+# and client-certificate paths Omi never takes, plus key generation/signing we
+# do not perform. Keeping the list explicit keeps the kernel image small.
+BEARSSL_SKIP := aes_big aes_ct64 aes_pwr8 aes_x86ni aes_small ghash_pclmul \
+                ghash_pwr8 c25519_m15 c25519_m64 p256_m15 p256_m64 all_m15 \
+                all_m64 chacha20_sse2 des_ descbc sysrng pemdec pemenc keygen \
+                sign server scert ccert
+BEARSSL_SOURCES := $(filter-out $(foreach p,$(BEARSSL_SKIP),$(BEARSSL)/src/*/*$(p)*.c),$(BEARSSL_ALL))
 
-.PHONY: all clean kernel drivers libc userspace runtimes image qemu qemu-debug test help
+# Gumbo HTML5 parser (vendored, freestanding, kernel heap)
+GUMBO_DIR  := kernel/lib/gumbo
+GUMBO_ALL  := $(wildcard $(GUMBO_DIR)/src/*.c) $(GUMBO_DIR)/glue.c
+GUMBO_SRC  := $(GUMBO_ALL)
+GUMBO_OBJ  := $(patsubst $(KERNEL_DIR)/lib/gumbo/%.c,$(BUILD_DIR)/lib/gumbo/%.o,$(GUMBO_SRC))
 
-all: kernel drivers libc userspace runtimes image
-	@echo "=========================================="
-	@echo "UnixOS build complete!"
-	@echo "=========================================="
-	@echo "Boot image: $(IMAGE_DIR)/unixos.img"
-	@echo "Run 'make qemu' to test in emulator"
+# The first user-mode program: a static ELF built freestanding and linked at
+# the address ring3.c/elf.c map it to. It travels on the ISO as a boot module.
+USER_SRC := $(KERNEL_DIR)/user/init.c
+USER_LD  := $(KERNEL_DIR)/user/app.ld
+USER_ELF := $(BUILD_DIR)/init.elf
 
-help:
-	@echo "UnixOS Build System"
-	@echo "==================="
-	@echo ""
-	@echo "Build targets:"
-	@echo "  all          - Build everything"
-	@echo "  kernel       - Build kernel only"
-	@echo "  drivers      - Build device drivers"
-	@echo "  libc         - Build C library"
-	@echo "  userspace    - Build userspace programs"
-	@echo "  runtimes     - Build Python and Node.js"
-	@echo "  image        - Create bootable disk image"
-	@echo ""
-	@echo "Test targets:"
-	@echo "  qemu         - Run in QEMU emulator"
-	@echo "  qemu-debug   - Run with GDB server"
-	@echo "  test         - Run test suite"
-	@echo ""
-	@echo "Utility targets:"
-	@echo "  clean        - Remove build artifacts"
-	@echo "  toolchain    - Install build dependencies"
+OBJECTS := $(patsubst $(KERNEL_DIR)/%.c,$(BUILD_DIR)/%.o,$(SOURCES)) \
+           $(patsubst $(BEARSSL)/src/%.c,$(BUILD_DIR)/lib/bearssl/%.o,$(BEARSSL_SOURCES)) \
+           $(GUMBO_OBJ)
 
-# ============================================================================
-# Directory Setup
-# ============================================================================
+# Limine
+LIMINE_VERSION := 8.6.0
+LIMINE_DIR := limine
+LIMINE_URL := https://github.com/limine-bootloader/limine/releases/download/v$(LIMINE_VERSION)/limine-$(LIMINE_VERSION).tar.xz
 
+# Default target
+.PHONY: all
+all: $(ISO)
+
+# Create build directories
 $(BUILD_DIR):
-	@mkdir -p $(BUILD_DIR)
-	@mkdir -p $(BUILD_DIR)/kernel
-	@mkdir -p $(BUILD_DIR)/drivers
-	@mkdir -p $(BUILD_DIR)/libc
-	@mkdir -p $(BUILD_DIR)/userspace
-	@mkdir -p $(BUILD_DIR)/runtimes
-	@mkdir -p $(SYSROOT)/usr/lib
-	@mkdir -p $(SYSROOT)/usr/include
-	@mkdir -p $(SYSROOT)/bin
-	@mkdir -p $(SYSROOT)/sbin
+	mkdir -p $(BUILD_DIR)/boot
+	mkdir -p $(BUILD_DIR)/lib
+	mkdir -p $(BUILD_DIR)/mm
+	mkdir -p $(BUILD_DIR)/fs
+	mkdir -p $(BUILD_DIR)/drivers
+	mkdir -p $(BUILD_DIR)/gui
+	mkdir -p $(BUILD_DIR)/media
 
-$(IMAGE_DIR):
-	@mkdir -p $(IMAGE_DIR)
-
-# ============================================================================
-# Kernel Build
-# ============================================================================
-
-KERNEL_SOURCES := $(shell find $(KERNEL_DIR) -name '*.c' -o -name '*.S' 2>/dev/null | grep -v '/x86_64/' | grep -v '/x86/')
-# Also include ARM64-specific assembly
-KERNEL_SOURCES += $(shell find $(KERNEL_DIR)/arch/arm64 -name '*.S' 2>/dev/null)
-KERNEL_OBJECTS := $(patsubst $(KERNEL_DIR)/%.c,$(BUILD_DIR)/kernel/%.o,$(filter %.c,$(KERNEL_SOURCES)))
-KERNEL_OBJECTS += $(patsubst $(KERNEL_DIR)/%.S,$(BUILD_DIR)/kernel/%.o,$(filter %.S,$(KERNEL_SOURCES)))
-
-# Include drivers in the kernel
-DRIVER_SOURCES := $(shell find $(DRIVERS_DIR) -name '*.c' 2>/dev/null)
-DRIVER_OBJECTS := $(patsubst $(DRIVERS_DIR)/%.c,$(BUILD_DIR)/drivers/%.o,$(DRIVER_SOURCES))
-
-ALL_KERNEL_OBJECTS := $(KERNEL_OBJECTS) $(DRIVER_OBJECTS)
-KERNEL_BINARY := $(BUILD_DIR)/kernel/unixos.elf
-
-kernel: $(BUILD_DIR) $(ALL_KERNEL_OBJECTS) $(KERNEL_BINARY)
-	@echo "[KERNEL] Build complete: $(KERNEL_BINARY)"
-
-$(BUILD_DIR)/kernel/%.o: $(KERNEL_DIR)/%.c
+# MP3 decoding needs real SSE maths: minimp3 works in float, and the kernel's
+# default -mno-sse soft-float ABI does not match compiler-rt / xmm registers.
+# Only this file gets SSE; interrupt handlers stay integer-only.
+$(BUILD_DIR)/media/mp3.o: $(KERNEL_DIR)/media/mp3.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	@echo "[CC] $<"
-	@# Media files need FP support, compile without -mgeneral-regs-only
-	@if echo "$<" | grep -q "/media/"; then \
-		$(CC) $(CFLAGS_COMMON) $(CROSS_TARGET) -mcpu=cortex-a72 -I$(KERNEL_DIR)/include -fno-builtin -nostdlib -nostdinc -c $< -o $@; \
-	else \
-		$(CC) $(CFLAGS_KERNEL) -c $< -o $@; \
-	fi
+	$(CC) $(CFLAGS) -msse -msse2 -mfpmath=sse -c $< -o $@
 
-$(BUILD_DIR)/kernel/%.o: $(KERNEL_DIR)/%.S
+# Gumbo builds with its own port headers (stdint/stddef/stdbool map onto types.h)
+# and is third-party code whose warnings are not ours to police.
+$(BUILD_DIR)/lib/gumbo/%.o: $(KERNEL_DIR)/lib/gumbo/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	@echo "[AS] $<"
-	@$(AS) $(CFLAGS_KERNEL) -c $< -o $@
+	$(CC) -I$(GUMBO_DIR)/port -I$(GUMBO_DIR)/src $(CFLAGS) -w -c $< -o $@
 
-$(BUILD_DIR)/drivers/%.o: $(DRIVERS_DIR)/%.c
+# The user program. Freestanding C, no libc, no relocations, linked by its own
+# script (kernel/user/app.ld) at 0x8000000000 - the window elf.c maps.
+$(USER_ELF): $(USER_SRC) $(USER_LD) | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	@echo "[CC] $<"
-	@$(CC) $(CFLAGS_KERNEL) -I$(KERNEL_DIR)/include -c $< -o $@
+	$(CC) -target x86_64-unknown-none-elf -ffreestanding -fno-stack-protector \
+	      -fno-pic -mno-red-zone -mcmodel=large -O1 -c $(USER_SRC) -o $(BUILD_DIR)/user_init.o
+	$(LD) -nostdlib -static -z max-page-size=0x1000 -T $(USER_LD) \
+	      -o $@ $(BUILD_DIR)/user_init.o
+	@echo "user elf: $$(stat -c %s $@) bytes"
 
-$(KERNEL_BINARY): $(ALL_KERNEL_OBJECTS)
-	@echo "[LD] $@"
-	@$(LD) $(LDFLAGS_KERNEL) -o $@ $^
+# Every header is a dependency of every object. Crude, but a stale constant in
+# an unrebuilt object cost an afternoon once: ring3.h changed the user window and
+# elf.o kept spawning tasks onto the old stack address.
+KHEADERS := $(wildcard $(KERNEL_DIR)/include/*.h) $(wildcard $(KERNEL_DIR)/include/*/*.h)
 
-# ============================================================================
-# Drivers Build
-# ============================================================================
-
-DRIVER_SOURCES := $(shell find $(DRIVERS_DIR) -name '*.c' 2>/dev/null)
-DRIVER_OBJECTS := $(patsubst $(DRIVERS_DIR)/%.c,$(BUILD_DIR)/drivers/%.o,$(DRIVER_SOURCES))
-
-drivers: $(BUILD_DIR) $(DRIVER_OBJECTS)
-	@echo "[DRIVERS] Build complete"
-
-$(BUILD_DIR)/drivers/%.o: $(DRIVERS_DIR)/%.c
+# Compile C files
+$(BUILD_DIR)/%.o: $(KERNEL_DIR)/%.c $(KHEADERS) | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	@echo "[CC] $<"
-	@$(CC) $(CFLAGS_KERNEL) -I$(DRIVERS_DIR)/include -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@
 
-# ============================================================================
-# C Library Build
-# ============================================================================
+# BearSSL: freestanding, its own port headers (stdint/stddef map onto types.h),
+# and its warning level is not ours to police.
+$(BUILD_DIR)/lib/bearssl/%.o: $(BEARSSL)/src/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -w -I$(BEARSSL)/port -I$(BEARSSL)/inc -I$(BEARSSL)/src -c $< -o $@
 
-libc: $(BUILD_DIR)
-	@echo "[LIBC] Building musl libc..."
-	@if [ -f $(LIBC_DIR)/Makefile ]; then \
-		$(MAKE) -C $(LIBC_DIR) DESTDIR=$(SYSROOT) install; \
-	else \
-		echo "[LIBC] Source not yet configured"; \
-	fi
+# Link kernel
+$(KERNEL): $(OBJECTS)
+	$(LD) $(LDFLAGS) $(OBJECTS) $(BUILTINS) -o $@
 
-# ============================================================================
-# Userspace Build
-# ============================================================================
+# Download and build Limine
+$(LIMINE_DIR):
+	curl -L $(LIMINE_URL) -o limine.tar.xz
+	mkdir -p $(LIMINE_DIR)
+	tar -xf limine.tar.xz -C $(LIMINE_DIR) --strip-components=1
+	rm limine.tar.xz
+	cd $(LIMINE_DIR) && ./configure --enable-uefi-x86-64 && make
 
-userspace: $(BUILD_DIR) libc
-	@echo "[USERSPACE] Building userspace programs..."
-	@if [ -f $(USERSPACE_DIR)/Makefile ]; then \
-		$(MAKE) -C $(USERSPACE_DIR) SYSROOT=$(SYSROOT); \
-	else \
-		echo "[USERSPACE] Source not yet configured"; \
-	fi
+# Create ISO
+# limine.conf is a prerequisite: its module list is part of the ISO's contents,
+# and a stale copy on the image looks exactly like a kernel that cannot find a
+# module that is sitting right there on the disk.
+# The ISO recipe builds userland itself, but each .elf is also a prerequisite so
+# that editing a .c rebuilds the image. That needs a rule of its own, or make
+# refuses the prerequisite before the recipe ever runs.
+userland/%.elf: userland/%.c
+	$(MAKE) -C userland $*.elf
 
-# ============================================================================
-# Runtimes Build (Python, Node.js)
-# ============================================================================
+# The browser is several translation units and a shared header. Without these the
+# pattern rule above sees only ominet.c, so editing fetch.c or omilayout.c leaves
+# ominet.elf - and every image built from it - silently a version behind.
+userland/ominet.elf: userland/ominet.c userland/fetch.c userland/omilayout.c \
+                     userland/fetch.h userland/omilayout.h userland/omitext.h \
+                     userland/glyphs.h userland/roots_user.o
+	$(MAKE) -C userland ominet.elf
 
-runtimes: $(BUILD_DIR) libc
-	@echo "[RUNTIMES] Building Python and Node.js..."
-	@if [ -f $(RUNTIMES_DIR)/Makefile ]; then \
-		$(MAKE) -C $(RUNTIMES_DIR) SYSROOT=$(SYSROOT); \
-	else \
-		echo "[RUNTIMES] Source not yet configured"; \
-	fi
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf userland/tlsget.elf userland/surftest.elf userland/omirender.elf userland/surfexit.elf userland/ominet.elf userland/vmtest.elf userland/shmtest.elf userland/surfbig.elf userland/unixpair.elf userland/scmtest.elf userland/unixname.elf userland/credtest.elf userland/formtest.elf userland/imgtest.elf userland/memtest.elf
+	@echo "Creating bootable ISO..."
+	rm -rf $(ISO_ROOT)
+	mkdir -p $(ISO_ROOT)/boot
+	mkdir -p $(ISO_ROOT)/EFI/BOOT
+	mkdir -p $(ISO_ROOT)/limine
+	
+	# Copy kernel
+	cp $(KERNEL) $(ISO_ROOT)/boot/kernel.elf
 
-# ============================================================================
-# Boot Image Creation
-# ============================================================================
+	# User programs, exposed to the kernel as boot modules
+	mkdir -p $(ISO_ROOT)/apps
+	cp $(USER_ELF) $(ISO_ROOT)/apps/init.elf
 
-image: $(IMAGE_DIR) kernel drivers
-	@echo "[IMAGE] Creating bootable disk image..."
-	@./scripts/create-boot-image.sh $(BUILD_DIR) $(IMAGE_DIR)
-	@echo "[IMAGE] Created: $(IMAGE_DIR)/unixos.img"
+	# Standalone userspace programs: built by their own Makefile with their own
+	# flags and linker script, then copied on. Nothing here is linked into the
+	# kernel, and nothing there includes a kernel header.
+	$(MAKE) -C userland
+	cp userland/cat.elf $(ISO_ROOT)/apps/cat.elf
+	cp userland/httpget.elf $(ISO_ROOT)/apps/httpget.elf
+	cp userland/polltest.elf $(ISO_ROOT)/apps/polltest.elf
+	cp userland/pipetest.elf $(ISO_ROOT)/apps/pipetest.elf
+	cp userland/linuxtest.elf $(ISO_ROOT)/apps/linuxtest.elf
+	@if [ -f userland/muslhello.elf ]; then cp userland/muslhello.elf $(ISO_ROOT)/apps/muslhello.elf; else echo "no muslhello.elf: skipping"; fi
+	@if [ -f userland/muslthreads.elf ]; then cp userland/muslthreads.elf $(ISO_ROOT)/apps/muslthreads.elf; else echo "no muslthreads.elf: skipping"; fi
+	@if [ -f userland/muslstat.elf ]; then cp userland/muslstat.elf $(ISO_ROOT)/apps/muslstat.elf; else echo "no muslstat.elf: skipping"; fi
+	@if [ -f userland/muslfork.elf ]; then cp userland/muslfork.elf $(ISO_ROOT)/apps/muslfork.elf; else echo "no muslfork.elf: skipping"; fi
+	@if [ -f userland/cowlives.elf ]; then cp userland/cowlives.elf $(ISO_ROOT)/apps/cowlives.elf; else echo "no cowlives.elf: skipping"; fi
+	@if [ -f userland/libprobe.elf ]; then cp userland/libprobe.elf $(ISO_ROOT)/apps/libprobe.elf; else echo "no libprobe.elf: skipping"; fi
+	@if [ -f userland/libmap.elf ]; then cp userland/libmap.elf $(ISO_ROOT)/apps/libmap.elf; else echo "no libmap.elf: skipping"; fi
+	@if [ -f userland/dyntest.elf ]; then cp userland/dyntest.elf $(ISO_ROOT)/apps/dyntest.elf; else echo "no dyntest.elf: skipping"; fi
+	@if [ -f userland/exectest.elf ]; then cp userland/exectest.elf $(ISO_ROOT)/apps/exectest.elf; else echo "no exectest.elf: skipping"; fi
+	@if [ -f userland/epolltest.elf ]; then cp userland/epolltest.elf $(ISO_ROOT)/apps/epolltest.elf; else echo "no epolltest.elf: skipping"; fi
+	@if [ -f userland/memfdtest.elf ]; then cp userland/memfdtest.elf $(ISO_ROOT)/apps/memfdtest.elf; else echo "no memfdtest.elf: skipping"; fi
+	@if [ -f userland/socktest.elf ]; then cp userland/socktest.elf $(ISO_ROOT)/apps/socktest.elf; else echo "no socktest.elf: skipping"; fi
+	@if [ -f userland/tlsget.elf ]; then cp userland/tlsget.elf $(ISO_ROOT)/apps/tlsget.elf; else echo "no tlsget.elf: skipping"; fi
+	@if [ -f userland/surftest.elf ]; then cp userland/surftest.elf $(ISO_ROOT)/apps/surftest.elf; else echo "no surftest.elf: skipping"; fi
+	@if [ -f userland/omirender.elf ]; then cp userland/omirender.elf $(ISO_ROOT)/apps/omirender.elf; else echo "no omirender.elf: skipping"; fi
+	@if [ -f userland/surfexit.elf ]; then cp userland/surfexit.elf $(ISO_ROOT)/apps/surfexit.elf; else echo "no surfexit.elf: skipping"; fi
+	@if [ -f userland/ominet.elf ]; then cp userland/ominet.elf $(ISO_ROOT)/apps/ominet.elf; else echo "no ominet.elf: skipping"; fi
+	@if [ -f userland/vmtest.elf ]; then cp userland/vmtest.elf $(ISO_ROOT)/apps/vmtest.elf; else echo "no vmtest.elf: skipping"; fi
+	@if [ -f userland/shmtest.elf ]; then cp userland/shmtest.elf $(ISO_ROOT)/apps/shmtest.elf; else echo "no shmtest.elf: skipping"; fi
+	@if [ -f userland/surfbig.elf ]; then cp userland/surfbig.elf $(ISO_ROOT)/apps/surfbig.elf; else echo "no surfbig.elf: skipping"; fi
+	@if [ -f userland/unixpair.elf ]; then cp userland/unixpair.elf $(ISO_ROOT)/apps/unixpair.elf; else echo "no unixpair.elf: skipping"; fi
+	@if [ -f userland/scmtest.elf ]; then cp userland/scmtest.elf $(ISO_ROOT)/apps/scmtest.elf; else echo "no scmtest.elf: skipping"; fi
+	@if [ -f userland/unixname.elf ]; then cp userland/unixname.elf $(ISO_ROOT)/apps/unixname.elf; else echo "no unixname.elf: skipping"; fi
+	@if [ -f userland/credtest.elf ]; then cp userland/credtest.elf $(ISO_ROOT)/apps/credtest.elf; else echo "no credtest.elf: skipping"; fi
+	@if [ -f userland/formtest.elf ]; then cp userland/formtest.elf $(ISO_ROOT)/apps/formtest.elf; else echo "no formtest.elf: skipping"; fi
+	@if [ -f userland/imgtest.elf ]; then cp userland/imgtest.elf $(ISO_ROOT)/apps/imgtest.elf; else echo "no imgtest.elf: skipping"; fi
+	@if [ -f userland/memtest.elf ]; then cp userland/memtest.elf $(ISO_ROOT)/apps/memtest.elf; else echo "no memtest.elf: skipping"; fi
+	@if [ -f userland/exectarget.elf ]; then cp userland/exectarget.elf $(ISO_ROOT)/apps/exectarget.elf; else echo "no exectarget.elf: skipping"; fi
+	# A shared object, in a directory of its own: the loader will look it up by
+	# path, so the path it is copied to is the path that must appear in limine.conf.
+	@mkdir -p $(ISO_ROOT)/lib
+	@if [ -f userland/libgreet.so ]; then cp userland/libgreet.so $(ISO_ROOT)/lib/libgreet.so; else echo "no libgreet.so: skipping"; fi
+	@for m in /lib/ld-musl-x86_64.so.1 /usr/lib/x86_64-linux-musl/libc.so; do \
+	  if [ -f "$$m" ]; then cp "$$m" $(ISO_ROOT)/lib/ld-musl-x86_64.so.1; echo "interpreter: $$m"; break; fi; \
+	done; [ -f $(ISO_ROOT)/lib/ld-musl-x86_64.so.1 ] || echo "no musl ld.so on this host: dyntest will refuse to load"
+	cp userland/spin.elf $(ISO_ROOT)/apps/spin.elf
 
-# ============================================================================
-# QEMU Testing
-# ============================================================================
+	# Media samples, exposed to the kernel as boot modules
+	mkdir -p $(ISO_ROOT)/media
+	cp assets/sample.mp3 assets/sample.mp4 $(ISO_ROOT)/media/
 
-qemu: kernel
-	@echo "[QEMU] Starting UnixOS in emulator (direct kernel boot)..."
-	@$(QEMU) -M virt,gic-version=3 -cpu max -m 4G \
-		-nographic \
-		-kernel $(BUILD_DIR)/kernel/unixos.elf
+	# TrueType faces, also boot modules
+	mkdir -p $(ISO_ROOT)/fonts
+	cp assets/fonts/*.ttf $(ISO_ROOT)/fonts/
+	
+	# Copy Limine config to ALL locations Limine searches
+	cp limine.conf $(ISO_ROOT)/limine.conf
+	cp limine.conf $(ISO_ROOT)/boot/limine.conf
+	cp limine.conf $(ISO_ROOT)/limine/limine.conf
+	cp limine.conf $(ISO_ROOT)/EFI/BOOT/limine.conf
+	
+	# Copy Limine files
+	cp $(LIMINE_DIR)/bin/limine-bios.sys $(ISO_ROOT)/boot/ 2>/dev/null || true
+	cp $(LIMINE_DIR)/bin/limine-bios-cd.bin $(ISO_ROOT)/boot/ 2>/dev/null || true
+	cp $(LIMINE_DIR)/bin/limine-uefi-cd.bin $(ISO_ROOT)/boot/ 2>/dev/null || true
+	cp $(LIMINE_DIR)/bin/BOOTX64.EFI $(ISO_ROOT)/EFI/BOOT/
+	
+	# Create ISO using xorriso
+	xorriso -as mkisofs -b boot/limine-bios-cd.bin \
+		-no-emul-boot -boot-load-size 4 -boot-info-table \
+		--efi-boot boot/limine-uefi-cd.bin \
+		-efi-boot-part --efi-boot-image --protective-msdos-label \
+		-V OMI -A "Omi" -p "Omi" \
+		$(ISO_ROOT) -o $(ISO)
+	
+	# Install Limine for hybrid boot
+	$(LIMINE_DIR)/bin/limine bios-install $(ISO) 2>/dev/null || true
+	
+	@echo ""
+	@echo "============================================"
+	@echo "  ISO created: $(ISO)"
+	@echo "============================================"
+	@echo ""
+	@echo "To test in QEMU:"
+	@echo "  make run"
+	@echo ""
+	@echo "To flash to USB (replace /dev/sdX):"
+	@echo "  sudo dd if=$(ISO) of=/dev/sdX bs=4M status=progress"
+	@echo ""
 
-qemu-uefi: image
-	@echo "[QEMU] Starting UnixOS with UEFI boot..."
-	@echo "[QEMU] Note: Requires UEFI firmware (AAVMF)"
-	@if [ ! -f /usr/share/qemu-efi-aarch64/QEMU_EFI.fd ]; then \
-		echo "[ERROR] UEFI firmware not found. Install qemu-efi-aarch64 package."; \
-		echo "[INFO] Using direct kernel boot instead. Run 'make qemu'"; \
-		exit 1; \
-	fi
-	@$(QEMU) -M virt,gic-version=3 -cpu max -m 4G \
-		-nographic \
-		-drive if=pflash,format=raw,readonly=on,file=/usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
-		-drive if=none,id=hd0,format=raw,file=$(IMAGE_DIR)/unixos.img \
-		-device virtio-blk-device,drive=hd0
-
-qemu-debug: kernel
-	@echo "[QEMU] Starting UnixOS with GDB server on port 1234..."
-	@$(QEMU) -M virt,gic-version=3 -cpu max -m 4G \
-		-nographic \
-		-kernel $(BUILD_DIR)/kernel/unixos.elf \
-		-s -S
-
-# ============================================================================
-# Testing
-# ============================================================================
-
-test: kernel
-	@echo "[TEST] Running kernel tests..."
-	@./scripts/run-tests.sh
-
-# ============================================================================
 # Run in QEMU
-# ============================================================================
-
-run: kernel
-	@echo "[RUN] Starting Vib-OS in QEMU..."
-	@qemu-system-aarch64 -M virt,gic-version=3 -cpu max -m 4G -nographic -kernel $(KERNEL_BINARY)
-
-run-gui: kernel
-	@echo "[RUN] Starting Vib-OS with GUI display..."
-	@qemu-system-aarch64 -M virt,gic-version=3 \
-		-cpu max -m 512M \
-		-global virtio-mmio.force-legacy=false \
-		-device ramfb \
-		-device virtio-keyboard-device \
-		-device virtio-tablet-device \
-		-device virtio-net-device,netdev=net0 \
-		-netdev user,id=net0 \
-		-audiodev coreaudio,id=snd0 \
-		-device intel-hda -device hda-duplex,audiodev=snd0 \
+.PHONY: run
+run: $(ISO)
+	qemu-system-x86_64 \
+		-M q35 \
+		-m 512M \
+		-cdrom $(ISO) \
 		-serial stdio \
-		-kernel $(KERNEL_BINARY)
+		-bios /opt/homebrew/share/qemu/edk2-x86_64-code.fd \
+		-vga std
 
-run-gpu: kernel
-	@echo "[RUN] Starting Vib-OS with virtio-GPU acceleration..."
-	@qemu-system-aarch64 -M virt,gic-version=3 \
-		-cpu max -m 512M \
-		-global virtio-mmio.force-legacy=false \
-		-device ramfb \
-		-device virtio-gpu-pci \
-		-device virtio-keyboard-device \
-		-device virtio-tablet-device \
-		-device virtio-net-device,netdev=net0 \
-		-netdev user,id=net0 \
-		-audiodev coreaudio,id=snd0 \
-		-device intel-hda -device hda-duplex,audiodev=snd0 \
+# Run in QEMU with BIOS (fallback)
+.PHONY: run-bios
+run-bios: $(ISO)
+	qemu-system-x86_64 \
+		-M q35 \
+		-m 512M \
+		-cdrom $(ISO) \
 		-serial stdio \
-		-kernel $(KERNEL_BINARY)
+		-vga std
 
-# ============================================================================
-# Toolchain Setup
-# ============================================================================
-
-toolchain:
-	@echo "[TOOLCHAIN] Installing build dependencies..."
-	@if [ "$(UNAME_S)" = "Darwin" ]; then \
-		./scripts/setup-toolchain.sh; \
-	else \
-		./scripts/setup-toolchain-linux.sh; \
-	fi
-
-# ============================================================================
-# Clean
-# ============================================================================
-
+# Clean build files
+.PHONY: clean
 clean:
-	@echo "[CLEAN] Removing build artifacts..."
-	@rm -rf $(BUILD_DIR)
-	@rm -rf $(IMAGE_DIR)
-	@echo "[CLEAN] Done"
+	rm -rf $(BUILD_DIR)
+	rm -rf $(ISO_ROOT)
+	rm -f $(ISO)
 
+# Deep clean (including Limine)
+.PHONY: distclean
 distclean: clean
-	@echo "[DISTCLEAN] Removing all generated files..."
-	@rm -rf $(SYSROOT)
+	rm -rf $(LIMINE_DIR)
+
+# Help
+.PHONY: help
+help:
+	@echo "UEFI Demo OS Build System"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all       - Build the bootable ISO (default)"
+	@echo "  run       - Run in QEMU with UEFI"
+	@echo "  run-bios  - Run in QEMU with legacy BIOS"
+	@echo "  clean     - Remove build files"
+	@echo "  distclean - Remove build files and Limine"
+	@echo "  help      - Show this help"
+	@echo ""
+	@echo "Prerequisites:"
+	@echo "  - clang or x86_64-elf-gcc"
+	@echo "  - ld.lld or x86_64-elf-ld"
+	@echo "  - xorriso"
+	@echo "  - qemu-system-x86_64 (for testing)"

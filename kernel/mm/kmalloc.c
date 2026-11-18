@@ -1,321 +1,203 @@
 /*
- * UnixOS Kernel - Kernel Heap Allocator Implementation
- *
- * A simple bucket-based allocator for kernel memory.
- * Fixed to use direct memory region like VibeOS for reliability.
+ * MeepOS x86_64 - Simple Kernel Memory Allocator
+ * 
+ * A simple first-fit allocator using a static heap.
  */
 
-#include "mm/kmalloc.h"
-#include "mm/pmm.h"
-#include "printk.h"
+#include "../include/kmalloc.h"
+#include "../include/string.h"
 
-/* ===================================================================== */
-/* Configuration */
-/* ===================================================================== */
-
-#define HEAP_SIZE                                                              \
-  (128 * 1024 * 1024) /* 128MB kernel heap - 4K wallpapers need space */
-#define MIN_ALLOC 32  /* Minimum allocation size */
-#define MAX_ALLOC                                                              \
-  (32 * 1024 * 1024) /* Maximum single allocation (32MB for large images) */
-
-/* Fixed heap location - after kernel at 0x42000000 */
-/* Kernel loads at 0x40200000, so 0x42000000 gives 30MB for kernel code/data */
-#define HEAP_BASE 0x42000000
+/* Heap configuration - 64MB heap */
+#define HEAP_SIZE (64 * 1024 * 1024)
+#define MIN_BLOCK_SIZE 64
+#define BLOCK_MAGIC 0xDEADBEEF
 
 /* Block header */
-struct block_header {
-  size_t size;               /* Size of this block (including header) */
-  uint32_t magic;            /* Magic number for validation */
-  uint32_t flags;            /* Block flags */
-  struct block_header *next; /* Next free block (if free) */
-  struct block_header *prev; /* Previous block */
-};
+typedef struct block {
+  uint32_t magic;
+  uint32_t size;      /* Size including header */
+  uint32_t free;      /* 1 if free, 0 if used */
+  struct block *next;
+  struct block *prev;
+} block_t;
 
-#define BLOCK_MAGIC_FREE 0xDEADBEEF
-#define BLOCK_MAGIC_USED 0xCAFEBABE
+/* Static heap */
+static uint8_t heap_memory[HEAP_SIZE] __attribute__((aligned(16)));
+static block_t *free_list = NULL;
+static int heap_initialized = 0;
+static size_t heap_used = 0;
 
-#define BLOCK_FLAG_FREE 0x01
-
-/* ===================================================================== */
-/* Static data */
-/* ===================================================================== */
-
-static uint8_t *heap_start;
-static uint8_t *heap_end;
-static struct block_header *free_list;
-static size_t heap_total;
-static size_t heap_used;
-static bool heap_initialized = false;
-
-/* Simple spinlock for heap operations */
-static volatile int heap_lock = 0;
-
-static void lock_heap(void) {
-  while (__atomic_test_and_set(&heap_lock, __ATOMIC_ACQUIRE)) {
-#ifdef ARCH_ARM64
-    asm volatile("yield");
-#elif defined(ARCH_X86_64) || defined(ARCH_X86)
-    asm volatile("pause");
-#endif
-  }
-}
-
-static void unlock_heap(void) { __atomic_clear(&heap_lock, __ATOMIC_RELEASE); }
-
-/* ===================================================================== */
-/* Helper functions */
-/* ===================================================================== */
-
-static inline size_t align_up(size_t val, size_t align) {
-  return (val + align - 1) & ~(align - 1);
-}
-
-static inline void *block_data(struct block_header *block) {
-  return (void *)((uint8_t *)block + sizeof(struct block_header));
-}
-
-static inline struct block_header *data_to_block(void *ptr) {
-  return (struct block_header *)((uint8_t *)ptr - sizeof(struct block_header));
-}
-
-/* ===================================================================== */
-/* Initialization */
-/* ===================================================================== */
-
+/* Initialize heap */
 void kmalloc_init(void) {
-  /* Use fixed memory region - no PMM dependency */
-  /* This is like how VibeOS does it - simple and reliable */
-  heap_start = (uint8_t *)HEAP_BASE;
-  heap_end = heap_start + HEAP_SIZE;
-  heap_total = HEAP_SIZE;
-  heap_used = 0;
+  if (heap_initialized)
+    return;
 
-  /* Initialize single free block covering entire heap */
-  free_list = (struct block_header *)heap_start;
+  /* Create initial free block spanning entire heap */
+  free_list = (block_t *)heap_memory;
+  free_list->magic = BLOCK_MAGIC;
   free_list->size = HEAP_SIZE;
-  free_list->magic = BLOCK_MAGIC_FREE;
-  free_list->flags = BLOCK_FLAG_FREE;
+  free_list->free = 1;
   free_list->next = NULL;
   free_list->prev = NULL;
 
-  heap_initialized = true;
-
-  printk(KERN_INFO "KMALLOC: Heap at 0x%lx - 0x%lx (%lu KB)\n",
-         (unsigned long)heap_start, (unsigned long)heap_end,
-         (unsigned long)(HEAP_SIZE / 1024));
+  heap_initialized = 1;
+  heap_used = sizeof(block_t);
 }
 
-/* ===================================================================== */
-/* Allocation */
-/* ===================================================================== */
-
-void *_kmalloc(size_t size, uint32_t flags) {
-  if (!heap_initialized) {
-    kmalloc_init();
-    if (!heap_initialized) {
-      return NULL;
-    }
-  }
-
-  if (size == 0 || size > MAX_ALLOC) {
-    return NULL;
-  }
-
-  /* Align size and add header */
-  size_t total_size = align_up(size + sizeof(struct block_header), MIN_ALLOC);
-
-  lock_heap();
-
-  /* Find first fit */
-  struct block_header *block = free_list;
-  struct block_header *prev_free = NULL;
-
+/* Find a free block of at least 'size' bytes */
+static block_t *find_free_block(size_t size) {
+  block_t *block = free_list;
+  
   while (block) {
-    if (block->magic != BLOCK_MAGIC_FREE) {
-      printk(KERN_ERR "KMALLOC: Corrupted free list!\n");
-      unlock_heap();
-      return NULL;
+    if (block->free && block->size >= size + sizeof(block_t)) {
+      return block;
     }
-
-    if (block->size >= total_size) {
-      /* Found a suitable block */
-      break;
-    }
-
-    prev_free = block;
     block = block->next;
   }
+  
+  return NULL;
+}
 
-  if (!block) {
-    /* No suitable block found */
-    unlock_heap();
-    return NULL;
-  }
-
-  /* Split block if it's much larger than needed */
-  if (block->size >= total_size + sizeof(struct block_header) + MIN_ALLOC) {
-    /* Create new free block from remainder */
-    struct block_header *new_block =
-        (struct block_header *)((uint8_t *)block + total_size);
-    new_block->size = block->size - total_size;
-    new_block->magic = BLOCK_MAGIC_FREE;
-    new_block->flags = BLOCK_FLAG_FREE;
+/* Split a block if it's large enough */
+static void split_block(block_t *block, size_t size) {
+  size_t total_needed = size + sizeof(block_t);
+  
+  /* Only split if remaining space is useful */
+  if (block->size >= total_needed + MIN_BLOCK_SIZE + sizeof(block_t)) {
+    /* Create new block from remainder */
+    block_t *new_block = (block_t *)((uint8_t *)block + total_needed);
+    new_block->magic = BLOCK_MAGIC;
+    new_block->size = block->size - total_needed;
+    new_block->free = 1;
     new_block->next = block->next;
     new_block->prev = block;
-
+    
     if (block->next) {
       block->next->prev = new_block;
     }
-
-    block->size = total_size;
+    
+    block->size = total_needed;
     block->next = new_block;
   }
+}
 
-  /* Remove block from free list */
-  if (prev_free) {
-    prev_free->next = block->next;
-  } else {
-    free_list = block->next;
-  }
-
-  if (block->next) {
-    block->next->prev = prev_free;
-  }
-
-  /* Mark as used */
-  block->magic = BLOCK_MAGIC_USED;
-  block->flags = 0;
-  block->next = NULL;
-
-  heap_used += block->size;
-
-  unlock_heap();
-
-  void *ptr = block_data(block);
-
-  /* Zero if requested */
-  if (flags & GFP_ZERO) {
-    uint8_t *p = (uint8_t *)ptr;
-    for (size_t i = 0; i < size; i++) {
-      p[i] = 0;
+/* Merge adjacent free blocks */
+static void coalesce(block_t *block) {
+  /* Merge with next block if free */
+  if (block->next && block->next->free) {
+    block->size += block->next->size;
+    block->next = block->next->next;
+    if (block->next) {
+      block->next->prev = block;
     }
   }
+  
+  /* Merge with previous block if free */
+  if (block->prev && block->prev->free) {
+    block->prev->size += block->size;
+    block->prev->next = block->next;
+    if (block->next) {
+      block->next->prev = block->prev;
+    }
+  }
+}
 
+/* Allocate memory */
+void *kmalloc(size_t size) {
+  if (!heap_initialized) {
+    kmalloc_init();
+  }
+  
+  if (size == 0) {
+    return NULL;
+  }
+  
+  /* Align size to 16 bytes */
+  size = (size + 15) & ~15;
+  
+  /* Find a free block */
+  block_t *block = find_free_block(size);
+  if (!block) {
+    return NULL; /* Out of memory */
+  }
+  
+  /* Split block if too large */
+  split_block(block, size);
+  
+  /* Mark as used */
+  block->free = 0;
+  heap_used += block->size;
+  
+  /* Return pointer to data (after header) */
+  return (void *)((uint8_t *)block + sizeof(block_t));
+}
+
+/* Allocate and zero memory */
+void *kzalloc(size_t size) {
+  void *ptr = kmalloc(size);
+  if (ptr) {
+    memset(ptr, 0, size);
+  }
   return ptr;
 }
 
-void *kzalloc(size_t size, uint32_t flags) {
-  return kmalloc(size, flags | GFP_ZERO);
-}
-
-/* ===================================================================== */
-/* Deallocation */
-/* ===================================================================== */
-
-void kfree(void *ptr) {
+/* Reallocate memory */
+void *krealloc(void *ptr, size_t new_size) {
   if (!ptr) {
-    return;
+    return kmalloc(new_size);
   }
-
-  struct block_header *block = data_to_block(ptr);
-
-  /* Validate block */
-  if (block->magic != BLOCK_MAGIC_USED) {
-    printk(KERN_ERR "KMALLOC: kfree of invalid pointer %p (magic=0x%x)\n", ptr,
-           block->magic);
-    return;
-  }
-
-  lock_heap();
-
-  heap_used -= block->size;
-
-  /* Mark as free */
-  block->magic = BLOCK_MAGIC_FREE;
-  block->flags = BLOCK_FLAG_FREE;
-
-  /* Add to front of free list */
-  block->next = free_list;
-  block->prev = NULL;
-  if (free_list) {
-    free_list->prev = block;
-  }
-  free_list = block;
-
-  /* Coalesce with next physical block if it's free */
-  struct block_header *next_physical =
-      (struct block_header *)((uint8_t *)block + block->size);
-  if ((uint8_t *)next_physical < heap_end &&
-      next_physical->magic == BLOCK_MAGIC_FREE) {
-    /* Remove next_physical from free list */
-    if (next_physical->prev) {
-      next_physical->prev->next = next_physical->next;
-    } else {
-      /* next_physical was head of free list, but block is new head now */
-    }
-    if (next_physical->next) {
-      next_physical->next->prev = next_physical->prev;
-    }
-    /* Merge sizes */
-    block->size += next_physical->size;
-    /* Invalidate merged block's magic to prevent double-free */
-    next_physical->magic = 0;
-  }
-
-  unlock_heap();
-}
-
-/* ===================================================================== */
-/* Reallocation */
-/* ===================================================================== */
-
-void *krealloc(void *ptr, size_t new_size, uint32_t flags) {
-  if (!ptr) {
-    return kmalloc(new_size, flags);
-  }
-
+  
   if (new_size == 0) {
     kfree(ptr);
     return NULL;
   }
-
-  struct block_header *block = data_to_block(ptr);
-  size_t old_size = block->size - sizeof(struct block_header);
-
+  
+  /* Get current block */
+  block_t *block = (block_t *)((uint8_t *)ptr - sizeof(block_t));
+  size_t old_size = block->size - sizeof(block_t);
+  
   /* If new size fits in current block, just return */
   if (new_size <= old_size) {
     return ptr;
   }
-
-  /* Allocate new block */
-  void *new_ptr = kmalloc(new_size, flags);
-  if (!new_ptr) {
-    return NULL;
+  
+  /* Allocate new block and copy */
+  void *new_ptr = kmalloc(new_size);
+  if (new_ptr) {
+    memcpy(new_ptr, ptr, old_size);
+    kfree(ptr);
   }
-
-  /* Copy old data */
-  uint8_t *src = (uint8_t *)ptr;
-  uint8_t *dst = (uint8_t *)new_ptr;
-  for (size_t i = 0; i < old_size; i++) {
-    dst[i] = src[i];
-  }
-
-  /* Free old block */
-  kfree(ptr);
-
+  
   return new_ptr;
 }
 
-/* ===================================================================== */
-/* Statistics */
-/* ===================================================================== */
+/* Free memory */
+void kfree(void *ptr) {
+  if (!ptr) {
+    return;
+  }
+  
+  /* Get block header */
+  block_t *block = (block_t *)((uint8_t *)ptr - sizeof(block_t));
+  
+  /* Validate magic */
+  if (block->magic != BLOCK_MAGIC) {
+    return; /* Invalid pointer */
+  }
+  
+  /* Mark as free */
+  block->free = 1;
+  heap_used -= block->size;
+  
+  /* Merge adjacent free blocks */
+  coalesce(block);
+}
 
-void kmalloc_get_stats(size_t *total, size_t *used, size_t *free_mem) {
-  if (total)
-    *total = heap_total;
-  if (used)
-    *used = heap_used;
-  if (free_mem)
-    *free_mem = heap_total - heap_used;
+/* Get heap statistics */
+size_t kmalloc_get_used(void) {
+  return heap_used;
+}
+
+size_t kmalloc_get_free(void) {
+  return HEAP_SIZE - heap_used;
 }
