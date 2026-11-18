@@ -26,6 +26,31 @@ struct socket_ops;
 /* No connection yet - a socket() call has no transport behind it until connect. */
 struct socket *sock_new(void);
 
+/* AF_UNIX by name. bind() claims a path and makes this socket a listener;
+ * listen() starts taking connections; accept() hands back one waiting endpoint as
+ * a socket object the caller installs in a descriptor; connect() looks a path up
+ * and gives this socket the client end. All four keep struct socket private. */
+int sock_unix_bind(struct socket *s, const char *path);
+int sock_unix_listen(struct socket *s, int backlog);
+int sock_unix_accept(struct socket *s, struct socket **out);
+int sock_unix_connect(struct socket *s, const char *path);
+
+/* AF_UNIX socketpair: two endpoints wired to each other, ready for read() and
+ * write() with no connect and no address. -> 0, or -ENOMEM / -ENFILE when the
+ * socket or pipe pool is full (said out loud, never a silent half-pair). */
+int sock_pair(struct socket **out_a, struct socket **out_b);
+
+/* Hand open-file descriptions (void* here: fd.h owns that type and cannot be
+ * included from this header) to the endpoint's peer. -ENOTSUP when the transport
+ * has no peer inside this kernel. On success the transport owns one reference
+ * each. */
+int sock_send_ctl(struct socket *s, void **ofiles, int n);
+/* Take queued descriptions: the count, -E2BIG when a message was dropped because
+ * it did not fit (the caller sets MSG_CTRUNC), or 0 when nothing is queued. */
+int sock_recv_ctl(struct socket *s, void **out, int max);
+/* Take back the last queued control message (its descriptors go with it). */
+int sock_cancel_ctl(struct socket *s);
+
 int  sock_connect(struct socket *s, const net_cfg_t *cfg, const uint8_t ip[4],
                   uint16_t port);
 long sock_send(struct socket *s, const void *buf, uint64_t n);
@@ -92,13 +117,35 @@ void sock_close(struct socket *s);
 
 /* Number of socket objects currently allocated (test/observability). */
 int sock_live(void);
+/* The process on the other end of an endpoint (SO_PEERCRED). -> 0, or -ENOTSUP
+ * when the transport has no peer process. */
+int sock_peer_cred(struct socket *s, int *pid, int *uid, int *gid);
+/* Record who is on the other end. Takes the socket, not the transport handle:
+ * the handle is private to the socket layer, and passing the wrong one writes
+ * credentials over the socket's own ops and impl. */
+int sock_set_peer_cred(struct socket *s, int pid, int uid, int gid);
+/* Who is asking. The ring-3 layer supplies this; there is one uid, so identity
+ * is the pid and the uid/gid fields are reported as 0. */
+void sock_set_cred_hook(void (*fn)(int *, int *, int *));
+void sock_cred_now(int *pid, int *uid, int *gid);
+
+/* Ownership: a socket queued on a listener belongs to the space that will accept
+ * it, not the one that dialled - otherwise the dialling process's teardown finds
+ * a connection it handed over and calls it a leak. */
+void *sock_owner_now(void);
+void sock_set_owner(struct socket *s, void *space);
+
+/* Endpoints created by one address space. The space pointer is opaque here. */
+int sock_owned_live(void *space);
+/* Where new endpoints record their owner; the ring-3 layer supplies this. */
+void sock_set_owner_hook(void *(*fn)(void));
 
 /* Called after an address space is freed with `had` socket descriptors in it:
  * asserts every endpoint died with the space that owned it. */
 /* had: endpoints the dying space held. before: live count taken immediately
  * before its descriptors were released. Global zero is only the right answer
  * when this space was the last one holding anything; the delta is right always. */
-void sock_report_after_space(int had, int live_before);
+void sock_report_after_space(void *space, int had);
 
 /* Backend substitution test: runs the descriptor sequence against a
  * deterministic backend, then restores the kernel's own. */

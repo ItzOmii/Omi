@@ -8,6 +8,21 @@
  * `path`, and leave the body at the front of `out`. The address actually used is
  * written to `ip_used` (16 bytes, may be NULL).
  * Returns the HTTP status code (200, 301, ...) or -1 with *why set. */
+/* Non-zero when the last fetch stopped because the caller's buffer filled: the
+ * body was longer than the space it was given. Set by the reader, not guessed at
+ * from the length afterwards - a chunked body's length shrinks when the framing
+ * comes off, so a full buffer can look like a short body. */
+extern int fetch_clipped;
+
+/* When set, each request opens its own connection and closes it afterwards.
+ *
+ * Keep-alive assumes the server will hold the socket until the next request; a
+ * CDN serving a page's images closes an idle one almost immediately, and the next
+ * request then goes out on a dead socket and comes back with no reply at all
+ * ("no-headers" for half the thumbnails on a gallery page). Image fetches are a
+ * handful per page, so a fresh connection each time is the cheaper mistake. */
+extern int https_no_reuse;
+
 long https_get(const char *host, int port, const char *path,
                char *out, size_t cap, const char **why, long *body_len,
                char *ip_used);

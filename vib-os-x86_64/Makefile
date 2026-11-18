@@ -19,8 +19,25 @@ BUILD_DIR := build
 ISO_ROOT := iso_root
 
 # Output files
+# A build stamp, regenerated each build and shown in the browser's chrome: the
+# question "is that the build with the fix?" cost a whole round trip once, because
+# the only way to tell two ISOs apart was the file's md5.
+$(shell mkdir -p $(KERNEL_DIR)/include; printf '#define OMI_BUILD "%s"\n' "$$(date +%m%d.%H%M)" > $(KERNEL_DIR)/include/buildstamp.h)
+
 KERNEL := $(BUILD_DIR)/kernel.elf
+
+# DEV=1 builds a boot that spawns only the browser: the test suites take most of
+# the boot time and are not what a rendering change is being judged by, and the
+# main suite build stays the default so nothing is measured against a dev boot by
+# accident. The flag lives in a generated header, so switching costs one object
+# file rather than the whole kernel.
+DEV ?= 0
+$(shell mkdir -p $(KERNEL_DIR)/include; printf '#define OMI_DEV_BOOT %s\n' $(DEV) > /tmp/devboot.new.$$$$ 2>/dev/null; cmp -s /tmp/devboot.new.$$$$ $(KERNEL_DIR)/include/devboot.h 2>/dev/null || cp /tmp/devboot.new.$$$$ $(KERNEL_DIR)/include/devboot.h; rm -f /tmp/devboot.new.$$$$)
+ifeq ($(DEV),1)
+ISO := omi-dev.iso
+else
 ISO := omi.iso
+endif
 
 # Compiler flags
 CFLAGS := -target x86_64-unknown-none-elf \
@@ -83,6 +100,7 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/drivers/wc.c \
            $(KERNEL_DIR)/drivers/ps2.c \
            $(KERNEL_DIR)/drivers/pci.c \
+           $(KERNEL_DIR)/drivers/ata.c \
            $(KERNEL_DIR)/drivers/e1000.c \
            $(KERNEL_DIR)/net/net.c \
            $(KERNEL_DIR)/drivers/hda.c \
@@ -106,6 +124,9 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/fs/pipe.c \
            $(KERNEL_DIR)/fs/epoll.c \
            $(KERNEL_DIR)/fs/shfile.c \
+           $(KERNEL_DIR)/fs/diskfs.c \
+           $(KERNEL_DIR)/fs/unixpair.c \
+           $(KERNEL_DIR)/fs/unixname.c \
            $(KERNEL_DIR)/fs/fd_opaque_check.c \
            $(KERNEL_DIR)/fs/socket_selftest.c \
            $(KERNEL_DIR)/fs/readiness_selftest.c \
@@ -240,7 +261,7 @@ userland/ominet.elf: userland/ominet.c userland/fetch.c userland/omilayout.c \
                      userland/glyphs.h userland/roots_user.o
 	$(MAKE) -C userland ominet.elf
 
-$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf userland/tlsget.elf userland/surftest.elf userland/omirender.elf userland/surfexit.elf userland/ominet.elf
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf userland/tlsget.elf userland/surftest.elf userland/omirender.elf userland/surfexit.elf userland/ominet.elf userland/vmtest.elf userland/shmtest.elf userland/surfbig.elf userland/unixpair.elf userland/scmtest.elf userland/unixname.elf userland/credtest.elf userland/formtest.elf userland/imgtest.elf userland/memtest.elf
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -280,6 +301,16 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	@if [ -f userland/omirender.elf ]; then cp userland/omirender.elf $(ISO_ROOT)/apps/omirender.elf; else echo "no omirender.elf: skipping"; fi
 	@if [ -f userland/surfexit.elf ]; then cp userland/surfexit.elf $(ISO_ROOT)/apps/surfexit.elf; else echo "no surfexit.elf: skipping"; fi
 	@if [ -f userland/ominet.elf ]; then cp userland/ominet.elf $(ISO_ROOT)/apps/ominet.elf; else echo "no ominet.elf: skipping"; fi
+	@if [ -f userland/vmtest.elf ]; then cp userland/vmtest.elf $(ISO_ROOT)/apps/vmtest.elf; else echo "no vmtest.elf: skipping"; fi
+	@if [ -f userland/shmtest.elf ]; then cp userland/shmtest.elf $(ISO_ROOT)/apps/shmtest.elf; else echo "no shmtest.elf: skipping"; fi
+	@if [ -f userland/surfbig.elf ]; then cp userland/surfbig.elf $(ISO_ROOT)/apps/surfbig.elf; else echo "no surfbig.elf: skipping"; fi
+	@if [ -f userland/unixpair.elf ]; then cp userland/unixpair.elf $(ISO_ROOT)/apps/unixpair.elf; else echo "no unixpair.elf: skipping"; fi
+	@if [ -f userland/scmtest.elf ]; then cp userland/scmtest.elf $(ISO_ROOT)/apps/scmtest.elf; else echo "no scmtest.elf: skipping"; fi
+	@if [ -f userland/unixname.elf ]; then cp userland/unixname.elf $(ISO_ROOT)/apps/unixname.elf; else echo "no unixname.elf: skipping"; fi
+	@if [ -f userland/credtest.elf ]; then cp userland/credtest.elf $(ISO_ROOT)/apps/credtest.elf; else echo "no credtest.elf: skipping"; fi
+	@if [ -f userland/formtest.elf ]; then cp userland/formtest.elf $(ISO_ROOT)/apps/formtest.elf; else echo "no formtest.elf: skipping"; fi
+	@if [ -f userland/imgtest.elf ]; then cp userland/imgtest.elf $(ISO_ROOT)/apps/imgtest.elf; else echo "no imgtest.elf: skipping"; fi
+	@if [ -f userland/memtest.elf ]; then cp userland/memtest.elf $(ISO_ROOT)/apps/memtest.elf; else echo "no memtest.elf: skipping"; fi
 	@if [ -f userland/exectarget.elf ]; then cp userland/exectarget.elf $(ISO_ROOT)/apps/exectarget.elf; else echo "no exectarget.elf: skipping"; fi
 	# A shared object, in a directory of its own: the loader will look it up by
 	# path, so the path it is copied to is the path that must appear in limine.conf.

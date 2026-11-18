@@ -36,6 +36,14 @@ typedef struct { int w, h; const uint32_t *px; } web_image_t;
 typedef const web_image_t *(*web_image_fn)(const char *src, int len);
 void web_image_provider(web_image_fn fn);
 
+/* External stylesheets. A page's CSS is nearly always a separate file, and until
+ * it is fetched the engine sees an unstyled document - which is why real pages
+ * came out as a wall of text with no grid and no widths. The provider gets an
+ * href and fills `out`; returning <= 0 means "no stylesheet", which is not an
+ * error worth stopping for. */
+typedef int (*web_css_fn)(const char *href, int len, char *out, int cap);
+void web_css_provider(web_css_fn fn);
+
 /* measure a string in font `font`, supplied by the compositor so the font
  * bitmaps are only ever compiled into one translation unit */
 typedef int (*web_measure_fn)(int font, const char *s);
@@ -54,7 +62,25 @@ uint32_t web_fg(void);
 void web_free(void);
 int web_height(void);
 int web_count(void);
+/* Non-zero when the display list filled up: the page is shown only up to here. */
+int web_ops_full(void);
 const web_op_t *web_ops(void);
 int web_line_height(int font);
+/* How many times the 8x16 bitmap a font id is drawn at: 1 or 2. The measure
+ * function must multiply by this too, or the layout wraps at the wrong width. */
+int web_font_scale(int font);
+
+/* ---- forms -------------------------------------------------------------
+ * Ops of kind 4 are text fields (iw = field index) and kind 5 are submit
+ * buttons (iw = form index, text = the label). The client draws their contents,
+ * owns what has been typed, and does the submitting. */
+int web_field_count(void);
+const char *web_field_name(int i);
+const char *web_field_value(int i);   /* the value="" the page started with */
+int web_field_form(int i);            /* -1 when the field is outside a form */
+int web_field_hidden(int i);
+int web_form_count(void);
+const char *web_form_action(int f);   /* may be "" (post to this URL) */
+const char *web_form_method(int f);   /* "get" or "post" */
 
 #endif

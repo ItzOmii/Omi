@@ -31,8 +31,13 @@
 #define EBUSY       16
 #define EEXIST      17
 #define ENODEV      19
+#define ENAMETOOLONG 36
 #define EINVAL      22
 #define EMFILE 24
+/* The system-wide file/object table, as opposed to EMFILE's per-process one:
+ * socketpair says this when the kernel has no pipe slot left, which is a
+ * different sentence from "this process opened too many descriptors". */
+#define ENFILE 23
 #define EIO 5
 #define EPIPE 32
 #define ENOSPC      28
@@ -40,6 +45,10 @@
 #define ESPIPE      29
 #define EDEADLK     35
 #define ENOSYS      38
+/* "This transport cannot do that at all", as opposed to EOPNOTSUPP on a call it
+ * has but that this socket's state forbids: passing a descriptor over a TCP
+ * stream has no meaning, and saying so beats accepting it and dropping it. */
+#define ENOTSUP     95
 #define EOVERFLOW   75
 #define ETIMEDOUT  110
 #define ENOBUFS    105   /* no buffer space: a waiter table that cannot take one */

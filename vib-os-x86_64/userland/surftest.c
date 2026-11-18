@@ -106,10 +106,10 @@ int main(void) {
   if (addr <= 0) { printf("[surf] %d/%d\n", checks - fails, checks); return 1; }
 
   /* Where the pixels landed: a user address, page aligned, inside the window
-   * the kernel reserved for surfaces (0x8000000000 + 8 MB). */
+   * the kernel reserved for surfaces: base + 3.75 GB, eight 16 MB slots. */
   check((addr & 0xFFF) == 0 &&
-        (unsigned long long)addr >= 0x800F000000ULL &&
-        (unsigned long long)addr < 0x800F800000ULL,
+        (unsigned long long)addr >= 0x80F0000000ULL &&
+        (unsigned long long)addr < 0x80F8000000ULL,
         "the pixels are mapped at a user address", addr, 0);
   px = (uint32_t *)addr;
 

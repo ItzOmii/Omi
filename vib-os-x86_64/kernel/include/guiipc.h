@@ -15,7 +15,12 @@
 
 #include <stdint.h>
 
-#define WINIPC_MAX       6     /* concurrent foreign windows */
+/* Concurrent ring-3 windows. Six was the number that made the desktop's own
+ * four windows plus one browser work, which is not a budget an application can
+ * plan around: the seventh opener got -ENOSPC and its click did nothing. A
+ * window is a few kilobytes of command buffer, so the cost of a real number is
+ * paid in one static array, and tabs are not windows - this only bounds windows. */
+#define WINIPC_MAX      64
 #define WINIPC_MAX_CMDS  48    /* commands kept per window */
 #define WINIPC_TEXT_MAX  128   /* bytes of text copied per command */
 
@@ -69,8 +74,8 @@ void winipc_draw_all(void);
 /* uses, so compositing is a row copy - no scaling, no resampling.       */
 /* ==================================================================== */
 
-#define SURF_MAX_W      1280
-#define SURF_MAX_H      768
+#define SURF_MAX_W      1920   /* 1920x1200 x 4 B = 9.2 MB, inside a 16 MB slot */
+#define SURF_MAX_H      1200
 
 /* Bounds are clamped to the window limits. Returns the address the pixels
  * appeared at, or -errno (-ENOSPC when every slot is taken). */
@@ -83,6 +88,10 @@ int      surf_present(int win_id, int x, int y, int w, int h);
  * takes it a row at a time. */
 int       surf_size(int win_id, int *w, int *h);
 uint32_t *surf_row(int win_id, int y);
+/* Copy row `y` into `dst` (cols pixels), spanning the frame boundary the surface
+ * pages introduce. Prefer this to surf_row + memcpy: a row is wider than the
+ * space left in a frame often enough that the plain copy reads the wrong memory. */
+int surf_copy_row(int win_id, int y, uint32_t *dst, int cols);
 /* The rectangle presented since the last frame (client coordinates), cleared
  * by the read. 0 when nothing new was presented. */
 int       surf_take_damage(int win_id, int *x, int *y, int *w, int *h);

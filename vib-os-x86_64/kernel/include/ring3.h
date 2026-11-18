@@ -34,33 +34,54 @@
  * tests against this edge rather than against our linker script's choice.
  * 0x10000 stays below it, so a null dereference is still a fault. */
 #define RING3_USER_MIN    0x0000000000010000ULL
-/* The window a process may occupy: 256 MB. Segments land near the base, the
+/* The window a process may occupy: 4 GB. Segments land near the base, the
  * stack at the top, and SYS_VM_ALLOC hands out ranges in between. Page tables
- * for it are built on demand, so an empty window costs nothing. */
-#define RING3_LIMIT       0x0000008010000000ULL
-#define RING3_MMAP_BASE   0x0000008000100000ULL   /* SYS_VM_ALLOC starts here */
-#define RING3_MMAP_TOP    0x000000800F000000ULL   /* below the surface region */
+ * for it are built on demand, so an empty window costs nothing - which is the
+ * whole reason this can be 4 GB. A browser engine reserves a gigabyte or two
+ * per renderer (V8 cage, code range, a heap that only commits what it touches)
+ * and used to be refused at 256 MB while the machine sat idle. */
+#define RING3_LIMIT       (RING3_USER_BASE + 0x100000000ULL)
+/* The window is laid out once, here, and every region has a home in it. It used
+ * to be laid out piecemeal: the shared-segment arena sat at 8 MB and grew 256 MB
+ * straight through the area mmap hands out, so a process with a few shared
+ * regions and a 1.5 GB allocation would have found them in the same pages. The
+ * numbers below are a single map, in order, with a gigabyte kept for a growing
+ * brk heap and the rest for anonymous mappings:
+ *
+ *   0 .. 8 MB          low addresses, where a null dereference must still fault
+ *   16 MB .. 3.5 GB    mmap / SYS_VM_ALLOC, handed out from MMAP_BASE up
+ *   3.5 GB .. 3.75 GB  shared-segment attaches, one 256 MB arena per process
+ *   3.75 GB .. 3.875 GB pixel surfaces, RING3_SURF_SLOTS of RING3_SURF_AREA
+ *   top 4 MB           the stack
+ */
+#define RING3_MMAP_BASE   0x0000008000100000ULL  /* low, where musl expects it */
+#define RING3_MMAP_TOP    RING3_SHM_BASE                      /* stops at the shm arena */
 /* Shared segments are mapped here in every process that attaches them: the
  * same physical frames, so a write in one process is visible in the other. */
-#define RING3_SHM_BASE    (RING3_USER_BASE + 0x00080000ULL)
-#define RING3_SHM_MAX     32                      /* pages per segment */
-/* Pixel surfaces get their own region, taken out of the top of the window and
- * sized so a maximum window (620x420) fits in one slot with room to spare: 2 MB
- * a slot, four slots, mapped only in the process that created them. VM_ALLOC
- * now stops below this, so a growing heap cannot run into a surface. */
-#define RING3_SURF_BASE   (RING3_USER_BASE + 0x0E400000ULL)
-#define RING3_SURF_AREA   0x00400000ULL           /* 4 MB per slot: a 1280x768
-                                                   * client at 4 bytes a pixel,
-                                                   * rounded to the window region */
-#define RING3_SURF_SLOTS  6                       /* 6 x 4 MB = 24 MB, ending at
-                                                   * 252 MB with the top 4 MB left
-                                                   * for the stack. Three was too
-                                                   * few: the desktop boots with
-                                                   * four ring-3 demo windows, so a
-                                                   * browser asking for a fourth
-                                                   * slot got -ENOSPC and quietly
-                                                   * went away - a click that opens
-                                                   * nothing and says nothing. */
+#define RING3_SHM_BASE    (RING3_USER_BASE + 0xE0000000ULL)   /* 3.5 GB */
+#define RING3_SHM_ARENA   (256ULL << 20)          /* per-process space for attaches */
+#define RING3_SHM_TOP     (RING3_SHM_BASE + RING3_SHM_ARENA)  /* 3.75 GB */
+#define RING3_SHM_SLOTS   64                      /* named regions, system wide */
+#define RING3_SHM_MAX     4096                    /* pages per region: 16 MB */
+/* Pixel surfaces: 16 MB a slot, eight slots, mapped only in the process that
+ * created them. The area is sized for a full-HD-ish window rather than for the
+ * window a demo happens to use - 1920x1200 at four bytes a pixel is 9.2 MB, and
+ * at 4 MB a slot the ceiling used to be 1280x768, which is not a browser window
+ * on any display made this decade. The slot is address space, not memory: frames
+ * are allocated for the pixels the surface actually has, so a 440x360 window
+ * costs 634 KB of RAM, not 16 MB. Resizing allocates more frames as it grows.
+ */
+#define RING3_SURF_BASE   (RING3_USER_BASE + 0xF0000000ULL)   /* 3.75 GB */
+#define RING3_SURF_AREA   0x01000000ULL           /* 16 MB per slot */
+#define RING3_SURF_SLOTS  8                       /* 8 x 16 MB = 128 MB of address
+                                                   * space, ending at 3.875 GB with
+                                                   * the top 4 MB left for the stack.
+                                                   * Three was too few: the desktop
+                                                   * boots with four ring-3 demo
+                                                   * windows, so a browser asking for
+                                                   * a fourth slot got -ENOSPC and
+                                                   * quietly went away - a click that
+                                                   * opens nothing and says nothing. */
 
 /* PTE flags */
 #define RING3_P   0x001ULL   /* present */
@@ -82,8 +103,8 @@
 #define SYS_WIN_WAIT    12    /* (id, win_event_t*) -> blocks until an event  */
 #define SYS_WIN_RECT    13    /* (id, x, y, (w<<16)|h) -> resize/move self   */
 #define SYS_WIN_GEOM    14    /* (id, int32_t out[4]) -> x,y,w,h             */
-#define SYS_SHM_GET     15    /* (slot, pages) -> 0, creates if needed       */
-#define SYS_SHM_ATTACH  16    /* (slot) -> user base address, or -1          */
+#define SYS_SHM_GET     15    /* (slot, pages) -> 0, creates or grows        */
+#define SYS_SHM_ATTACH  16    /* (slot) -> this process's address, or -EINVAL*/
 #define SYS_CLIP_SET    17    /* (char*, len) -> len stored                  */
 #define SYS_CLIP_GET    18    /* (char*, max) -> len copied                  */
 #define SYS_VM_ALLOC    19    /* (len, prot) -> user address, pages on fault */
@@ -105,6 +126,13 @@
 #define SYS_SURF_CREATE 35  /* (win, w, h) -> user address of the pixels | -errno */
 #define SYS_SURF_PRESENT 36 /* (win, (x<<16)|y, (w<<16)|h) -> 0 | -errno         */
 #define SYS_SURF_RESIZE 37  /* (win, w, h) -> 0 | -errno: the client changed size  */
+#define SYS_SHM_INFO    38  /* (slot) -> pages in the region | -EINVAL              */
+#define SYS_SHM_DETACH  39  /* (slot) -> 0 | -EINVAL: unmap it and drop one use     */
+#define SYS_SYNC        40  /* (void) -> 0: flush every dirty file to the disk      */
+/* (void) -> (total_pages << 32) | free_pages. A process that is about to spend
+ * memory on something discretionary - a page's images, say - should be able to ask
+ * how much the machine has instead of carrying a guess around in a constant. */
+#define SYS_MEMINFO     41
 
 /* the switch, the gates and the fault handler */
 void     ring3_init(void);

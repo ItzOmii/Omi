@@ -21,6 +21,8 @@ shfile_t *shfile_new(void) {
   if (!f) return 0;
   f->refs = 1;
   f->pages = 0;
+  f->cap = 0;
+  f->page = 0;
   live_objects++;
   return f;
 }
@@ -32,7 +34,7 @@ void shfile_ref(shfile_t *f) {
 void shfile_unref(shfile_t *f) {
   if (!f) return;
   if (--f->refs > 0) return;
-  for (int i = 0; i < SHFILE_MAX_PAGES; i++) {
+  for (int i = 0; i < f->cap; i++) {
     if (!f->page[i]) continue;
     /* The frames were never mapped into a user space by this call, so they are
      * ours to free: a mapping that is still alive is holding a reference, and
@@ -42,6 +44,7 @@ void shfile_unref(shfile_t *f) {
     live_pages--;
   }
   live_objects--;
+  kfree(f->page);
   kfree(f);
 }
 
@@ -49,15 +52,28 @@ int shfile_truncate(shfile_t *f, uint64_t size) {
   if (!f) return -EINVAL;
   uint64_t pg = (size + 0xFFF) / 0x1000;
   if (pg > SHFILE_MAX_PAGES) return -EINVAL;
-  /* Growing does not allocate here: a page appears when it is first touched,
-   * through shfile_page(create=1) on the fault path or through a write. That way
-   * a 256 KiB request costs nothing until a program uses it. */
+  /* Growing does not allocate frames here: a page appears when it is first
+   * touched, through shfile_page(create=1) on the fault path or through a write.
+   * The index of frames is a different matter - it has to exist to be indexed,
+   * so it grows in steps and is freed with the object. Two levels were avoided
+   * on purpose: at 8 bytes a page a 256 MB region needs a 512 KB index, which is
+   * one kmalloc, and a second level would only pay off past 16 GB. */
+  if ((int)pg > f->cap) {
+    int cap = f->cap ? f->cap : 16;
+    while (cap < (int)pg) cap *= 2;
+    void **n = (void **)kzalloc((size_t)cap * sizeof(void *));
+    if (!n) return -ENOMEM;
+    for (int i = 0; i < f->cap; i++) n[i] = f->page[i];
+    kfree(f->page);
+    f->page = n;
+    f->cap = cap;
+  }
   f->pages = (int)pg;
   return 0;
 }
 
 void *shfile_page(shfile_t *f, int idx, int create) {
-  if (!f || idx < 0 || idx >= SHFILE_MAX_PAGES) return 0;
+  if (!f || idx < 0 || idx >= f->cap) return 0;
   if (f->page[idx]) return f->page[idx];
   if (idx >= f->pages) return 0;          /* past EOF: not a page to hand out */
   if (!create) return 0;
@@ -81,7 +97,7 @@ int64_t shfile_read(shfile_t *f, uint64_t off, void *dst, uint64_t n) {
     uint64_t skip = at & 0xFFF;
     uint64_t take = 4096 - skip;
     if (take > n - done) take = n - done;
-    const uint8_t *src = f->page[idx];
+    const uint8_t *src = idx < f->cap ? f->page[idx] : 0;
     /* A page inside the file that was never written is zeroes, and reading it
      * must not allocate one: the file's size is a claim about bytes, not about
      * frames. */
@@ -98,7 +114,7 @@ int64_t shfile_read(shfile_t *f, uint64_t off, void *dst, uint64_t n) {
 
 int64_t shfile_write(shfile_t *f, uint64_t off, const void *src, uint64_t n) {
   if (!f) return -EINVAL;
-  if (off + n > (uint64_t)SHFILE_MAX_PAGES * 4096) return -ENOSPC;
+  if (off + n > (uint64_t)SHFILE_MAX_PAGES * 4096) return -ENOSPC;   /* the claim ceiling */
   /* A write past the end grows the file, as it does on Linux: the descriptor is
    * a stream, and refusing would make a program that writes-then-maps fail for a
    * reason that has nothing to do with sharing. */

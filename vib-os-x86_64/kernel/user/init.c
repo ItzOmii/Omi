@@ -423,6 +423,9 @@ static void futex_demo(void) {
 #define SYS_LSEEK  25
 #define SYS_CLOSE  26
 #define SYS_DUP    27
+#define SYS_WRITED 1
+#define SYS_TYPE   2
+#define SYS_SYNC   40
 #define SYS_VM_ALLOC_ 19
 
 #define F_RDWR    2
@@ -541,13 +544,16 @@ static void vfs_demo(void) {
   sys3(SYS_CLOSE, fd, 0, 0);
   int opened = 0;
   long last = 0;
-  for (int i = 0; i < 40; i++) {
+  /* The table starts at 16 slots and doubles to FD_MAX as a program opens more,
+   * so the end is 4096 descriptors away, not 13. What has to stay true is that
+   * growing is silent and the end is loud: -EMFILE, not a short read or a crash. */
+  for (int i = 0; i < 4200; i++) {
     last = sys3(SYS_OPEN, (long)"/motd", 0, 0);
     if (last >= 0) opened++;
     else break;
   }
-  vcheck("descriptors run out with -EMFILE", last == -24 && opened == 13);
-  for (int i = 3; i < 16; i++) sys3(SYS_CLOSE, i, 0, 0);
+  vcheck("descriptors run out with -EMFILE", last == -24 && opened > 13 && opened <= 4096);
+  for (int i = 3; i < 3 + opened; i++) sys3(SYS_CLOSE, i, 0, 0);
 
   vcheck("close of a bad descriptor is -EBADF", sys3(SYS_CLOSE, 99, 0, 0) == -9);
   int c = sys3(SYS_OPEN, (long)"/motd", 0, 0);
@@ -568,6 +574,117 @@ static void vfs_demo(void) {
   sys3(2, vpass == vtotal ? 0 : 1, 0, 0);
 }
 
+/* The disk: a counter that has to survive the machine going away. Boot 1 finds
+ * no file and writes 1; boot 2 reads 1 and writes 2. There is no way to fake
+ * that from inside one boot, which is why this is the test worth having - every
+ * other check in this file would pass with a filesystem that lived in RAM. */
+static int dpass, dtotal;
+
+static void dcheck(const char *what, int ok) {
+  dtotal++;
+  if (ok) dpass++;
+  say("[disk] ");
+  say(ok ? "ok   " : "FAIL ");
+  say(what);
+  say("\n");
+}
+
+static int parse_u32(const char *s, int n) {
+  int v = 0;
+  for (int i = 0; i < n && s[i] >= '0' && s[i] <= '9'; i++) v = v * 10 + (s[i] - '0');
+  return v;
+}
+
+static int read_boots(void) {
+  long fd = sys3(SYS_OPEN, (long)"/boots", 0, 0);
+  if (fd < 0) return -1;
+  char b[32];
+  long n = sys3(SYS_READ, fd, (long)b, 31);
+  sys3(SYS_CLOSE, fd, 0, 0);
+  if (n <= 0) return 0;
+  return parse_u32(b, (int)n);
+}
+
+static void disk_demo(void) {
+  /* If the kernel mounted a disk it publishes this file; without one there is
+   * nothing to test and nothing to fail - a machine with no disk is legal. */
+  long info = sys3(SYS_OPEN, (long)"/disk.info", 0, 0);
+  if (info < 0) {
+    say("[disk] no disk attached: the filesystem is ram-only this boot\n");
+    sys3(2, 0, 0, 0);
+    return;
+  }
+  char line[96];
+  long got = sys3(SYS_READ, info, (long)line, 80);
+  sys3(SYS_CLOSE, info, 0, 0);
+  if (got > 0) {
+    int k = 0;
+    char head[96];
+    k = put_str(head, k, "[disk] ");
+    for (long i = 0; i < got && k < 90; i++) {
+      if (line[i] == '\n') break;          /* the model line */
+      head[k++] = line[i];
+    }
+    head[k] = 0;
+    say(head);
+    say("\n");
+  }
+  dcheck("the kernel mounted a disk", got > 0);
+
+  int boots = read_boots();
+  if (boots < 0) boots = 0;                 /* first boot: no file yet */
+  int k = 0;
+  k = put_str(line, k, "[disk] this boot read back boots=");
+  k = put_uint(line, k, (u64)boots);
+  k = put_str(line, k, "\n");
+  line[k] = 0;
+  say(line);
+
+  /* Write the next number through the same open/write/close path a program uses,
+   * so the layer above the disk is tested as well as the disk itself. */
+  int next = boots + 1;
+  char out[16];
+  int m = put_uint(out, 0, (u64)next);
+  long fd = sys3(SYS_OPEN, (long)"/boots", F_CREAT | 01000 | F_RDWR, 0);   /* O_TRUNC */
+  dcheck("a program can open a file for writing", fd >= 3);
+  long w = fd >= 0 ? sys3(1, fd, (long)out, m) : -1;                       /* SYS_WRITE */
+  dcheck("and write to it", w == m);
+  sys3(SYS_SYNC, 0, 0, 0);
+  if (fd >= 0) sys3(SYS_CLOSE, fd, 0, 0);
+
+  int back = read_boots();
+  dcheck("what it wrote reads back", back == next);
+
+  /* One byte proves the plumbing, not the sectors. Six sectors of a known
+   * pattern prove the last short sector is written and read back as carefully
+   * as a full one. */
+  static char big[3000];
+  for (int i = 0; i < 3000; i++) big[i] = (char)('A' + (i % 26));
+  long bfd = sys3(SYS_OPEN, (long)"/blocks", F_CREAT | 01000 | F_RDWR, 0);
+  long bw = bfd >= 0 ? sys3(1, bfd, (long)big, 3000) : -1;
+  if (bfd >= 0) sys3(SYS_CLOSE, bfd, 0, 0);
+  dcheck("a six-sector file writes in one call", bw == 3000);
+
+  long rfd = sys3(SYS_OPEN, (long)"/blocks", 0, 0);
+  static char back2[3000];
+  long br = rfd >= 0 ? sys3(SYS_READ, rfd, (long)back2, 3000) : -1;
+  if (rfd >= 0) sys3(SYS_CLOSE, rfd, 0, 0);
+  int same = br == 3000;
+  for (int i = 0; same && i < 3000; i++) if (back2[i] != big[i]) same = 0;
+  dcheck("and reads back byte for byte", same);
+
+  k = 0;
+  k = put_str(line, k, "[disk] ");
+  k = put_uint(line, k, (u64)dpass);
+  k = put_str(line, k, "/");
+  k = put_uint(line, k, (u64)dtotal);
+  k = put_str(line, k, "\n");
+  line[k] = 0;
+  say(line);
+
+  sys3(2, dpass == dtotal ? 0 : 1, 0, 0);
+}
+
 void _start(long mode) {
   if (mode == 3) ui_demo();
   if (mode == 4) shm_writer();
@@ -576,6 +693,7 @@ void _start(long mode) {
   if (mode == 7) thread_demo();
   if (mode == 8) futex_demo();
   if (mode == 9) vfs_demo();
+  if (mode == 10) disk_demo();
 
   if (mode == 2) {
     /* Spin forever without a single syscall: only a preemptive scheduler can

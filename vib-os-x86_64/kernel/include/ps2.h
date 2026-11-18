@@ -48,6 +48,9 @@ typedef void (*keyboard_callback_t)(int key);
 
 /* Initialize PS/2 controller, keyboard, and mouse */
 int ps2_init(void);
+/* Modifier state, for the compositor to pass on with a key event. */
+int kb_shift_down(void);
+int kb_ctrl_down(void);
 
 /* Poll for keyboard and mouse data (non-interrupt mode) */
 void ps2_poll(void);

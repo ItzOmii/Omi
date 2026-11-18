@@ -14,6 +14,7 @@
 #include "../include/task.h"
 #include "../include/readiness.h"
 #include "../include/pipe.h"
+#include "../include/diskfs.h"
 
 extern void serial_puts(const char *s);
 
@@ -55,17 +56,20 @@ static rfile_t *file_create(const char *name, const char *body) {
   for (int i = 0; i < RFILE_MAX; i++) if (!files[i].used) { slot = i; break; }
   if (slot < 0) return 0;
   rfile_t *f = &files[slot];
-  uint8_t *data = (uint8_t *)kmalloc(RFILE_CAP);
+  /* With a disk attached a file is not limited to the RAM filesystem's 4 KB:
+   * it has somewhere to live, and the cap is what write() is allowed to reach. */
+  uint32_t cap = diskfs_present() ? DISK_MAX_FILE : RFILE_CAP;
+  uint8_t *data = (uint8_t *)kmalloc(cap);
   if (!data) return 0;
-  zero(data, RFILE_CAP);
+  zero(data, cap);
   zero(f, sizeof *f);
   strcpy32(f->name, name);
   f->data = data;
-  f->cap = RFILE_CAP;
+  f->cap = cap;
   f->used = 1;
   if (body) {
     uint32_t n = 0;
-    while (body[n] && n < RFILE_CAP) n++;
+    while (body[n] && n < cap) n++;
     for (uint32_t i = 0; i < n; i++) f->data[i] = (uint8_t)body[i];
     f->size = n;
   }
@@ -123,6 +127,65 @@ void rfs_init(void) {
               "eight files, four kilobytes each\n"
               "offsets live in the open-file description, so dup shares them\n");
   file_create("/motd", "welcome, human\n");
+  rfs_load_disk();       /* -1 when there is no disk: the RAM fs stays as it was */
+}
+
+/* Mount the disk into this table: every record becomes a file, at its recorded
+ * length, loaded into the same heap copy the RAM files use. The disk is the
+ * durable copy, not a second namespace - a program cannot tell the difference
+ * between a file that was seeded at boot and one that survived the last one. */
+int rfs_load_disk(void) {
+  if (diskfs_init() != 0) return -1;
+  int n = diskfs_count();
+  for (int i = 0; i < n; i++) {
+    const char *name = 0;
+    int len = 0;
+    if (diskfs_entry(i, &name, &len) != 0 || !name) continue;
+    if (file_find(name)) continue;             /* seeded content wins */
+    int slot = -1;
+    for (int k = 0; k < RFILE_MAX; k++) if (!files[k].used) { slot = k; break; }
+    if (slot < 0) return -1;                   /* table full: the disk cannot be mounted whole */
+    rfile_t *f = &files[slot];
+    uint8_t *data = (uint8_t *)kmalloc(DISK_MAX_FILE);
+    if (!data) return -1;
+    zero(data, DISK_MAX_FILE);
+    zero(f, sizeof *f);
+    strcpy32(f->name, name);
+    f->data = data;
+    f->cap = DISK_MAX_FILE;
+    f->used = 1;
+    f->on_disk = 1;
+    int got = diskfs_read(name, data, (int)DISK_MAX_FILE);
+    if (got < 0) { f->used = 0; kfree(data); return -1; }
+    f->size = (uint32_t)got;
+  }
+  /* A program can see whether it has a disk without a new syscall: if this file
+   * is there, the disk answered IDENTIFY and its contents were mounted. */
+  char info[96];
+  int k = 0;
+  const char *m = diskfs_model();
+  for (int i = 0; m[i] && k < 60; i++) info[k++] = m[i];
+  info[k++] = '\n';
+  uint32_t mb = diskfs_sectors() / 2048;
+  char num[12];
+  int d = 0;
+  if (!mb) num[d++] = '0';
+  while (mb) { num[d++] = (char)('0' + mb % 10); mb /= 10; }
+  while (d) info[k++] = num[--d];
+  info[k++] = '\n';
+  info[k] = 0;
+  file_create("/disk.info", info);
+  return 0;
+}
+
+static void file_flush(rfile_t *f) {
+  if (!f || !f->used || f->ro || !f->dirty) return;
+  if (!diskfs_present()) return;
+  if (diskfs_write(f->name, f->data, (int)f->size) == 0) { f->dirty = 0; f->on_disk = 1; }
+}
+
+void rfs_sync(void) {
+  for (int i = 0; i < RFILE_MAX; i++) if (files[i].used) file_flush(&files[i]);
 }
 
 /* ------------------------------------------------------ open-file descriptions */
@@ -173,6 +236,7 @@ static void ofile_put(ofile_t *o) {
   if (!o || o->kind == FK_CONSOLE) return;    /* static, never freed */
   if (o->refs > 0) o->refs--;
   if (o->refs > 0) return;
+  if (o->kind == FK_FILE) file_flush(o->file);   /* close() is where a write lands */
   ofile_shutdown(o);
   ofile_maybe_destroy(o);
 }
@@ -192,10 +256,35 @@ void ofile_unpin(ofile_t *o) {
 
 /* ------------------------------------------------------------ descriptor tables */
 
+/* Grow the table so it can hold descriptor `want`. Doubling keeps the cost of
+ * opening files amortised and the table's size a power of two, which is also
+ * what makes it cheap to clone: the copy is one kmalloc and a memcpy. */
+int fd_grow(fdtable_t *t, int want) {
+  if (!t || want < 0) return -EINVAL;
+  if (want < t->cap) return 0;
+  if (want >= FD_MAX) return -EMFILE;
+  int cap = t->cap ? t->cap : FD_FIRST;
+  while (cap <= want) cap *= 2;
+  if (cap > FD_MAX) cap = FD_MAX;
+  ofile_t **n = (ofile_t **)kzalloc((size_t)cap * sizeof(ofile_t *));
+  if (!n) return -ENOMEM;
+  for (int i = 0; i < t->cap; i++) n[i] = t->fd[i];
+  kfree(t->fd);
+  t->fd = n;
+  t->cap = cap;
+  return 0;
+}
+
+ofile_t *fd_at(fdtable_t *t, int fd) {
+  if (!t || !t->fd || fd < 0 || fd >= t->cap) return 0;
+  return t->fd[fd];
+}
+
 fdtable_t *fdtable_new(void) {
   fdtable_t *t = (fdtable_t *)kmalloc(sizeof(fdtable_t));
   if (!t) return 0;
   zero(t, sizeof *t);
+  if (fd_grow(t, 2) != 0) { kfree(t); return 0; }   /* starts with 16 slots */
   t->fd[0] = &console_in;
   t->fd[1] = &console_out;
   t->fd[2] = &console_out;
@@ -213,7 +302,8 @@ fdtable_t *fdtable_clone(fdtable_t *src) {
   fdtable_t *t = (fdtable_t *)kmalloc(sizeof(fdtable_t));
   if (!t) return 0;
   zero(t, sizeof *t);
-  for (int i = 0; i < FD_MAX; i++) {
+  if (src->cap && fd_grow(t, src->cap - 1) != 0) { kfree(t); return 0; }
+  for (int i = 0; i < src->cap; i++) {
     ofile_t *o = src->fd[i];
     if (!o) continue;
     t->fd[i] = o;
@@ -224,15 +314,20 @@ fdtable_t *fdtable_clone(fdtable_t *src) {
 
 void fdtable_free(fdtable_t *t) {
   if (!t) return;
-  for (int i = 0; i < FD_MAX; i++) {
+  for (int i = 0; i < t->cap; i++)
     if (t->fd[i]) ofile_put(t->fd[i]);
-    t->fd[i] = 0;
-  }
+  kfree(t->fd);
   kfree(t);
 }
 
 static int fd_alloc(fdtable_t *t, ofile_t *o) {
-  for (int i = 0; i < FD_MAX; i++)
+  if (!t) return -EBADF;
+  for (int i = 0; i < t->cap; i++)
+    if (!t->fd[i]) { t->fd[i] = o; return i; }
+  /* Full: grow rather than fail, unless the ceiling is what was hit. */
+  int r = fd_grow(t, t->cap);
+  if (r != 0) return r == -EMFILE ? -EMFILE : r;
+  for (int i = 0; i < t->cap; i++)
     if (!t->fd[i]) { t->fd[i] = o; return i; }
   return -EMFILE;
 }
@@ -269,8 +364,8 @@ int fd_open(fdtable_t *t, const char *path, int flags) {
 }
 
 int fd_dup(fdtable_t *t, int fd) {
-  if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
-  ofile_t *o = t->fd[fd];
+  if (!fd_at(t, fd)) return -EBADF;
+  ofile_t *o = fd_at(t, fd);
   if (o->kind == FK_CONSOLE) {
     int n = fd_alloc(t, o);
     return n < 0 ? n : n;
@@ -295,6 +390,21 @@ int fd_socket(fdtable_t *t) {
   return fd;
 }
 
+/* Same as fd_socket, but for an endpoint that was created before the descriptor:
+ * a socketpair is made as a pair and only then handed to two fds. */
+int fd_socket_from(fdtable_t *t, struct socket *s) {
+  if (!t || !s) return -EINVAL;
+  ofile_t *o = ofile_get();
+  if (!o) return -EMFILE;
+  o->kind = FK_SOCKET;
+  o->flags = O_RDWR;
+  o->file = 0;
+  o->sock = s;
+  int fd = fd_alloc(t, o);
+  if (fd < 0) { ofile_put(o); return fd; }
+  return fd;
+}
+
 int fd_shfile(fdtable_t *t) {
   if (!t) return -EMFILE;
   ofile_t *o = ofile_get();
@@ -309,8 +419,8 @@ int fd_shfile(fdtable_t *t) {
 }
 
 struct shfile *fd_shfile_of(fdtable_t *t, int fd) {
-  if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return 0;
-  ofile_t *o = t->fd[fd];
+  if (!fd_at(t, fd)) return 0;
+  ofile_t *o = fd_at(t, fd);
   return o->kind == FK_SHFILE ? o->shf : 0;
 }
 
@@ -359,7 +469,7 @@ int fd_pipe(fdtable_t *t, int out[2]) {
 int fd_count_kind(fdtable_t *t, int kind) {
   int n = 0;
   if (!t) return 0;
-  for (int i = 0; i < FD_MAX; i++)
+  for (int i = 0; i < t->cap; i++)
     if (t->fd[i] && t->fd[i]->kind == kind) n++;
   return n;
 }
@@ -367,8 +477,8 @@ int fd_count_kind(fdtable_t *t, int kind) {
 /* Readiness, computed. A regular file is always ready: it cannot block. A
  * socket answers through its backend. */
 unsigned fd_poll(fdtable_t *t, int fd) {
-  if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return OMI_POLLERR;
-  ofile_t *o = t->fd[fd];
+  if (!fd_at(t, fd)) return OMI_POLLERR;
+  ofile_t *o = fd_at(t, fd);
   if (o->kind == FK_SOCKET)  return sock_poll(o->sock);
   if (o->kind == FK_PIPE)    return pipe_poll(o->pipe, (o->flags & 3) == O_WRONLY);
   if (o->kind == FK_FILE)    return OMI_POLLIN | OMI_POLLOUT;
@@ -379,8 +489,8 @@ unsigned fd_poll(fdtable_t *t, int fd) {
 }
 
 int fd_connect(fdtable_t *t, int fd, uint32_t ip, uint16_t port) {
-  if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
-  ofile_t *o = t->fd[fd];
+  if (!fd_at(t, fd)) return -EBADF;
+  ofile_t *o = fd_at(t, fd);
   if (o->kind != FK_SOCKET) return -ENOTSOCK;
   if (!o->sock) return -EBADF;
 
@@ -401,8 +511,8 @@ int fd_connect(fdtable_t *t, int fd, uint32_t ip, uint16_t port) {
  * not used here: it closes both directions at once and would throw away the
  * answer the caller is waiting for. */
 long fd_shutdown(fdtable_t *t, int fd, int how) {
-  if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
-  ofile_t *o = t->fd[fd];
+  if (!fd_at(t, fd)) return -EBADF;
+  ofile_t *o = fd_at(t, fd);
   if (o->kind != FK_SOCKET || !o->sock) return -ENOTSOCK;
   if (how != 0 && how != 1 && how != 2) return -EINVAL;
   if (how == 0 || how == 2) sock_shutdown_rd(o->sock);   /* SHUT_RD, SHUT_RDWR */
@@ -411,8 +521,8 @@ long fd_shutdown(fdtable_t *t, int fd, int how) {
 }
 
 int fd_close(fdtable_t *t, int fd) {
-  if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
-  ofile_put(t->fd[fd]);
+  if (!fd_at(t, fd)) return -EBADF;
+  ofile_put(fd_at(t, fd));
   t->fd[fd] = 0;
   return 0;
 }
@@ -490,8 +600,8 @@ static long sock_write_wait(ofile_t *o, const void *kbuf, uint64_t n, uint64_t t
 }
 
 long fd_read_ticks(fdtable_t *t, int fd, void *kbuf, uint64_t n, uint64_t ticks) {
-  if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
-  ofile_t *o = t->fd[fd];
+  if (!fd_at(t, fd)) return -EBADF;
+  ofile_t *o = fd_at(t, fd);
   if ((o->flags & 3) == O_WRONLY) return -EBADF;
   if (o->kind == FK_SOCKET) return sock_read_wait(o, kbuf, n, ticks);
   if (o->kind == FK_PIPE)   return pipe_read(o->pipe, kbuf, n, ticks);
@@ -524,8 +634,8 @@ long fd_write(fdtable_t *t, int fd, const void *kbuf, uint64_t n) {
 }
 
 long fd_write_ticks(fdtable_t *t, int fd, const void *kbuf, uint64_t n, uint64_t ticks) {
-  if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
-  ofile_t *o = t->fd[fd];
+  if (!fd_at(t, fd)) return -EBADF;
+  ofile_t *o = fd_at(t, fd);
   if ((o->flags & 3) == O_RDONLY) return -EBADF;
 
   if (o->kind == FK_SOCKET) return sock_write_wait(o, kbuf, n, ticks);
@@ -563,17 +673,38 @@ long fd_write_ticks(fdtable_t *t, int fd, const void *kbuf, uint64_t n, uint64_t
   for (uint64_t i = 0; i < took; i++) f->data[o->off + i] = s[i];
   o->off += took;
   if (o->off > f->size) f->size = (uint32_t)o->off;
+  f->dirty = 1;                       /* flushed on close() or sync() */
   return (long)took;
 }
 
 ofile_t *fd_ofile(fdtable_t *t, int fd) {
-  if (!t || fd < 0 || fd >= FD_MAX) return 0;
-  return t->fd[fd];
+  return fd_at(t, fd);
+}
+
+/* Descriptor passing needs the description itself, not just the number: the
+ * number means nothing in another process's table, and the object must survive
+ * the sender closing its copy. */
+ofile_t *fd_ref_ofile(fdtable_t *t, int fd) {
+  ofile_t *o = fd_at(t, fd);
+  if (!o) return 0;
+  if (o->kind != FK_CONSOLE) o->refs++;
+  return o;
+}
+
+int fd_install_ofile(fdtable_t *t, ofile_t *o) {
+  if (!t || !o) return -EINVAL;
+  int fd = fd_alloc(t, o);
+  if (fd < 0 && o->kind != FK_CONSOLE) ofile_put(o);   /* the ref does not leak */
+  return fd;
+}
+
+void fd_drop_ofile(ofile_t *o) {
+  if (o) ofile_put(o);
 }
 
 long fd_seek(fdtable_t *t, int fd, int64_t off, int whence) {
-  if (!t || fd < 0 || fd >= FD_MAX || !t->fd[fd]) return -EBADF;
-  ofile_t *o = t->fd[fd];
+  if (!fd_at(t, fd)) return -EBADF;
+  ofile_t *o = fd_at(t, fd);
   if (o->kind == FK_CONSOLE) return -ESPIPE;   /* a terminal has no offset */
 
   int64_t base;

@@ -7,6 +7,7 @@
  * before the call, never against whatever the kernel happens to return. */
 #include <errno.h>
 #include <stdint.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -100,8 +101,11 @@ int main(void) {
   status = 0;
   int spins = 0;
   got = 0;
-  while (spins++ < 2000 && (got = waitpid(pid, &status, WNOHANG)) == 0) {
-    for (volatile int i = 0; i < 2000; i++) { }
+  /* Yield rather than burn: a bounded busy-spin gives up on a child that simply
+   * has not been scheduled yet, which is a property of the load, not of waitpid. */
+  while (spins++ < 4000 && (got = waitpid(pid, &status, WNOHANG)) == 0) {
+    sched_yield();
+    for (volatile int i = 0; i < 200; i++) { }
   }
   check(got == pid && WIFEXITED(status) && WEXITSTATUS(status) == 3,
         "a WNOHANG wait still reports exit code 3",

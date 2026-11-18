@@ -95,6 +95,33 @@ static void text(int x, int y, const char *s, unsigned c) {
   for (; *s; s++, x += GLYPH_W) glyph(x, y, *s, c);
 }
 
+/* The same glyphs at 1x or 2x. Scaling is nearest neighbour by whole pixels: the
+ * bitmap is the only face there is, and a filter over an 8x16 pattern makes mud. */
+static void text_scaled(int x, int y, const char *s, unsigned c, int scale) {
+  if (scale <= 1) { text(x, y, s, c); return; }
+  for (; *s; s++, x += GLYPH_W * scale) {
+    int idx = (unsigned char)*s - GLYPH_FIRST;
+    if (idx < 0 || idx > GLYPH_LAST - GLYPH_FIRST) continue;
+    const unsigned char *rows = glyphs[idx];
+    for (int r = 0; r < GLYPH_H; r++) {
+      unsigned char bits = rows[r];
+      if (!bits) continue;
+      for (int col = 0; col < GLYPH_W; col++) {
+        if (!(bits & (0x80 >> col))) continue;
+        int px0 = x + col * scale, py0 = y + r * scale;
+        for (int dy = 0; dy < scale; dy++)
+          for (int dx = 0; dx < scale; dx++) {
+            int px = px0 + dx, py = py0 + dy;
+            if (px < 0 || py < 0 || px >= CW || py >= CH) continue;
+            if (clip_on && (px < clip_x0 || py < clip_y0 || px >= clip_x1 || py >= clip_y1)) continue;
+            pix[py * CW + px] = c;
+            text_glyph_pixels++;
+          }
+      }
+    }
+  }
+}
+
 /* Greedy word wrap inside maxpx, drawing as it goes. Returns the line count and
  * leaves the widest line in *widest so the caller can assert on the wrap. */
 static int wrap_text(const char *s, int x, int y, int maxpx, int lh,

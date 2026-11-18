@@ -91,12 +91,16 @@ int main(void) {
     out[0].iov_base = (void *)"GET / HTTP/1.0\r\n";
     out[0].iov_len  = 16;
     out[1].iov_base = (void *)"Host: one.one.one.one\r\n\r\n";
-    out[1].iov_len  = 24;
+    /* 25, not 24: the second CRLF is four bytes, and the last byte is the one
+     * that ends the header block. With 24 the request is incomplete and the
+     * server simply waits - which looked like a receive timeout for as long as
+     * sendmsg was dropping the second iovec instead of writing it. */
+    out[1].iov_len  = 25;
     struct msghdr mo;
     memset(&mo, 0, sizeof mo);
     mo.msg_iov = out; mo.msg_iovlen = 2;
     long m = (long)sendmsg(fd2, &mo, 0);
-    check(m == 40, "sendmsg() writes both iovecs", m, 40);
+    check(m == 41, "sendmsg() writes both iovecs", m, 41);
 
     /* recvmsg: and the answer read back across two. */
     char b1[64], b2[192];
@@ -137,11 +141,14 @@ int main(void) {
 
   int raw = socket(AF_INET, SOCK_STREAM, 0);
   if (raw >= 3) {
+    /* Binding is a name, and names are AF_UNIX: an IP address has no local port
+     * to claim here, so the family is refused rather than reinterpreted. */
     errno = 0;
-    check(bind(raw, (struct sockaddr *)&sa, sizeof sa) == -1 && errno == ENOSYS,
-          "bind() is refused: there is no listener", errno, ENOSYS);
+    check(bind(raw, (struct sockaddr *)&sa, sizeof sa) == -1 && errno == EAFNOSUPPORT,
+          "bind() to an IP address is refused", errno, EAFNOSUPPORT);
     errno = 0;
-    check(listen(raw, 4) == -1 && errno == ENOSYS, "listen() is refused", errno, ENOSYS);
+    check(listen(raw, 4) == -1 && errno == EINVAL,
+          "listen() on a socket with no name is refused", errno, EINVAL);
     /* SHUT_RD is the other half: the receive side goes, and a read says so at
      * once rather than waiting for a peer that is not coming. */
     check(shutdown(raw, SHUT_RD) == 0, "shutdown(SHUT_RD) drops the receive side", 0, 0);

@@ -75,6 +75,13 @@ static inline void io_wait(void) {
 static volatile int cad_flag;          /* Ctrl+Alt+Del latched, cleared by the shell */
 static int shift_pressed = 0;
 static int ctrl_pressed = 0;
+
+/* Modifier state for whoever needs it: the compositor packs these into a key
+ * event so a client can tell Ctrl+A from A. The driver already tracked both -
+ * for shift it was folded into the character, and Ctrl was only watched for
+ * Ctrl+Alt+Del - so nothing new is being decoded here, just reported. */
+int kb_shift_down(void) { return shift_pressed; }
+int kb_ctrl_down(void)  { return ctrl_pressed; }
 static int alt_pressed = 0;
 static int caps_lock = 0;
 

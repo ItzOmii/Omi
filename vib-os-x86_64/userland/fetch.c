@@ -196,9 +196,13 @@ static int handshake(int fd, const char *sni, const char **why) {
 /* A connection worth keeping: the response said how long it is and did not ask
  * for the socket back. Without a length there is no way to know the body ended
  * except EOF, and EOF means the connection is gone by definition. */
+int fetch_clipped;
+int https_no_reuse;
+
 static long exchange_all(int fd, const char *req, char *out, size_t cap,
                          int *keep_out) {
   size_t rlen = strlen(req), total = 0;
+  fetch_clipped = 0;
 
   size_t alen = 0;
   unsigned char *ab = br_ssl_engine_sendapp_buf(&cc.eng, &alen);
@@ -269,6 +273,9 @@ static long exchange_all(int fd, const char *req, char *out, size_t cap,
     } else break;
   }
   out[total] = 0;
+  /* The loop's own exit condition, not the length: if it stopped because there
+   * was no room, the body was longer than this buffer. */
+  fetch_clipped = (total + 1 >= cap);
   return (long)total;
 }
 
@@ -324,7 +331,7 @@ long https_get(const char *host, int port, const char *path,
   char ip[16];
   int reused = 0;
   long t0 = sys3(SYS_TICKS, 0, 0, 0);
-  if (ka_fd >= 0 && ka_port == port && !strcmp(ka_host, host)) {
+  if (!https_no_reuse && ka_fd >= 0 && ka_port == port && !strcmp(ka_host, host)) {
     /* Same host, live socket: no resolver, no dial, no handshake. */
     memcpy(ip, ka_ip, sizeof ip);
     reused = 1;
@@ -355,7 +362,7 @@ long https_get(const char *host, int port, const char *path,
   int keep = 0;
   long got = exchange_all(fd, req, out, cap, &keep);
   long t4 = sys3(SYS_TICKS, 0, 0, 0);
-  if (keep && got > 0) {
+  if (keep && got > 0 && !https_no_reuse) {
     ka_fd = fd;
     snprintf(ka_host, sizeof ka_host, "%s", host);
     memcpy(ka_ip, ip, sizeof ka_ip);

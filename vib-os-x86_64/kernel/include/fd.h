@@ -22,8 +22,19 @@
 #include <stdint.h>
 #include "readiness.h"
 
-#define FD_MAX      16
-#define OFILE_MAX    64
+/* The descriptor table starts at FD_FIRST slots and doubles on demand up to
+ * FD_MAX. Sixteen was a hard ceiling, and a browser opens hundreds: a socket per
+ * connection, a pipe per channel, an eventfd, one memfd per shared region. A
+ * program that hits FD_MAX gets -EMFILE, which is what Linux says, but it now
+ * takes 4096 open files to get there instead of 16. */
+#define FD_MAX      4096
+#define FD_FIRST      16
+/* Open file *descriptions*, system-wide - one per open(), shared by every dup.
+ * 64 was enough for a desktop of windows and a handful of sockets; a program that
+ * starts a helper process per task holds two per channel, so a browser with a
+ * couple of dozen children would have run into this rather than into anything it
+ * could see. The socketpair test found it at seventeen pairs. */
+#define OFILE_MAX    512
 /* Slots, not bytes: each one is ~56 bytes of static table. The boot medium
  * carries 24 modules and three RAM files are seeded on top, so 24 was exactly
  * full the day a shared library and its loader joined the ISO - and the three
@@ -75,6 +86,14 @@ typedef struct {
    * kernel does not own and cannot grow). Opening one for writing is EROFS, not
    * a silent truncation of the boot image. */
   int      ro;
+  /* Durable: the bytes are also on the ATA disk, and `dirty` says the copy in
+   * heap has moved on since they were. A file becomes durable when it is loaded
+   * from the disk or written while a disk is present, and is flushed to it on
+   * close() and on sync() - not on every write, because a browser writes in
+   * small pieces and a sector-and-a-half each time would be worse than the RAM
+   * copy it already has. */
+  int      on_disk;
+  int      dirty;
 } rfile_t;
 
 /* The open file description: owns flags and the offset, shared by dup(). */
@@ -95,8 +114,14 @@ typedef struct {
 
 /* The descriptor table: one per address space. */
 typedef struct {
-  ofile_t *fd[FD_MAX];      /* FD_CONSOLE slots point at two static ofiles */
+  int       cap;            /* slots in fd: a power of two, >= FD_FIRST */
+  ofile_t **fd;             /* FD_CONSOLE slots point at two static ofiles */
 } fdtable_t;
+
+/* The open file at `fd`, or NULL when the number is out of range or empty. Every
+ * lookup goes through this, because the table moves when it grows: a descriptor
+ * number is stable, the address of the slot is not. */
+ofile_t *fd_at(fdtable_t *t, int fd);
 
 void  rfs_init(void);
 /* The RAM file with this name, or NULL. Read-only for the caller: the entry is
@@ -114,6 +139,11 @@ int  rfs_expose(const char *path, uint8_t *blob, uint32_t size);
  * is not. */
 int  rfs_count(void);
 int  rfs_rom_count(void);
+/* Mount the ATA disk into the file table (-1 when there is no disk) and flush
+ * every dirty file back to it. Both are no-ops without a disk attached: a
+ * machine with no disk runs the same kernel, just without persistence. */
+int  rfs_load_disk(void);
+void rfs_sync(void);
 
 /* The file behind a descriptor, or NULL when it is not a file descriptor. Used by
  * mmap, which needs the bytes and the length rather than a read position. */
@@ -135,9 +165,20 @@ long fd_seek(fdtable_t *t, int fd, int64_t off, int whence);
  * the descriptor can be closed by another task; fstat only reads what it needs
  * while the task is pinned in the syscall, which is sufficient for its fields. */
 ofile_t *fd_ofile(fdtable_t *t, int fd);
+
+/* An extra reference to the description behind a descriptor, so it can be handed
+ * to another process (SCM_RIGHTS) and outlive the sender's close(). 0 = EBADF. */
+ofile_t *fd_ref_ofile(fdtable_t *t, int fd);
+/* Install a description that already holds a reference. The reference belongs to
+ * the new descriptor either way: on failure it is released here. */
+int  fd_install_ofile(fdtable_t *t, ofile_t *o);
+/* Drop a reference taken by fd_ref_ofile (or passed out by the transport). */
+void fd_drop_ofile(ofile_t *o);
 int  fd_close(fdtable_t *t, int fd);
 int  fd_dup(fdtable_t *t, int fd);
 int  fd_socket(fdtable_t *t);
+/* Bind an endpoint that already exists (a socketpair half) to a new descriptor. */
+int  fd_socket_from(fdtable_t *t, struct socket *s);
 /* Creates both ends. out[0] is the read end, out[1] the write end. */
 int  fd_pipe(fdtable_t *t, int out[2]);
 unsigned fd_poll(fdtable_t *t, int fd);   /* OMI_POLL* bits, never blocks */

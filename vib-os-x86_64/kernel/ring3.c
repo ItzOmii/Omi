@@ -24,10 +24,13 @@
 #include "include/elf.h"   /* elf_prepare_image: the load half of execve */
 #include "include/epoll.h"  /* registration sets: the ABI epoll_ctl and friends speak */
 #include "include/shfile.h"  /* the pages a MAP_SHARED mapping windows onto */
+#include "include/string.h"  /* memcpy: the cmsg chain is read field by field */
 #include "include/kmalloc.h"
 #include "include/net.h"
 #include "include/omi_net.h"
 #include "include/socket.h"
+#include "include/unixname.h"  /* UNIX_PATH_MAX: the length of a name */
+#include "include/readiness.h" /* OMI_POLLIN: accept waits on the same bits a read does */
 #include "include/vfs.h"   /* stat() answers from the boot-module filesystem */
 #include "include/fd.h"    /* rfs_expose: boot modules are openable files */
 #include "include/limine_modules.h"
@@ -143,6 +146,7 @@ uint64_t ring3_new_space(void) {
 /* ------------------------------------------------------------ address spaces */
 
 static void mm_free_tables(mm_t *mm);
+static void shm_drop_all(mm_t *mm);
 
 mm_t *ring3_new_mm(void) {
   uint64_t cr3 = ring3_new_space();
@@ -203,9 +207,8 @@ void mm_on_exit(task_t *t) {
     return;
   }
   int socks = fd_count_kind(mm->fds, FK_SOCKET);
-  int socks_live = sock_live();
   fdtable_free(mm->fds);
-  sock_report_after_space(socks, socks_live);
+  sock_report_after_space(mm, socks);
   mm_free_tables(mm);          /* table full: nothing sane left to do */
   kfree(mm);
 }
@@ -250,6 +253,11 @@ static void free_region(uint64_t *pml4, int i1) {
 }
 
 static void mm_free_tables(mm_t *mm) {
+  /* Before the tables go: a process that exits holding shared regions must give
+   * its references back, or the frames are never freed and a browser that opens
+   * and closes a few tabs exhausts the pool without ever leaking a byte it could
+   * see. */
+  shm_drop_all(mm);
   uint64_t *pml4 = (uint64_t *)(hhdm_offset + mm->cr3);
   free_region(pml4, 1);      /* our window */
   free_region(pml4, 0);      /* the low half, if a low program took any of it */
@@ -342,9 +350,8 @@ void mm_reap(void) {
   for (int i = 0; i < nzombies; i++) {
     if (zombie[i]->cr3 == now) continue;      /* still the live one */
     int socks = fd_count_kind(zombie[i]->fds, FK_SOCKET);
-    int socks_live = sock_live();
     fdtable_free(zombie[i]->fds);
-    sock_report_after_space(socks, socks_live);   /* endpoints must not outlive their space */
+    sock_report_after_space(zombie[i], socks);   /* endpoints must not outlive their space */
     mm_free_tables(zombie[i]);
     kfree(zombie[i]);
     serial_puts("[mm] address space freed\n");
@@ -527,39 +534,150 @@ int ring3_map_existing(uint64_t cr3, uint64_t vaddr, uint64_t phys, uint64_t fla
 static char clip_buf[4096];
 static int  clip_len;
 
-/* Named shared segments: a fixed set of slots, each backed by frames from the
- * kernel pool and mapped at RING3_SHM_BASE in every process that attaches. */
-#define SHM_SLOTS 4
-
+/* Named shared segments - the primitive every multi-process engine is built on.
+ *
+ * A browser hands work to a renderer by name: a frame buffer, a command buffer,
+ * a ring of IPC messages, each a block of memory both sides can see. Four
+ * things here made that impossible:
+ *
+ *   - four regions, system wide (a fixed table of 4)
+ *   - 128 KB each, and a request for more was silently clamped, so a caller
+ *     asking for 4 MB got 128 KB and had no way to find out
+ *   - every attach mapped at RING3_SHM_BASE, so a process could hold exactly
+ *     one region and the second attach overwrote the first
+ *   - no way to let go: nothing counted users, so regions lived until reboot
+ *
+ * Now: 64 regions, 16 MB each (the page array is allocated to size instead of
+ * being a static array per slot), each attach takes its own range from a
+ * per-process arena, and a region is freed when its last attacher lets go -
+ * including when a process dies without detaching, which mm handles at teardown.
+ */
 static struct {
-  int      used, pages;
-  void    *kva[RING3_SHM_MAX];
-} shm[SHM_SLOTS];
+  int       used;
+  unsigned  pages;
+  void    **kva;        /* one frame per page, allocated to size */
+  int       refs;       /* processes currently attached */
+} shm[RING3_SHM_SLOTS];
 
-static int shm_get(int slot, int pages) {
-  if (slot < 0 || slot >= SHM_SLOTS) return -1;
-  if (pages < 1) pages = 1;
-  if (pages > RING3_SHM_MAX) pages = RING3_SHM_MAX;
-  if (shm[slot].used) return shm[slot].pages >= pages ? 0 : -1;
-  for (int i = 0; i < pages; i++) {
-    shm[slot].kva[i] = alloc_frame();
-    if (!shm[slot].kva[i]) return -1;
+static void shm_release(int slot) {
+  if (slot < 0 || slot >= RING3_SHM_SLOTS || !shm[slot].used) return;
+  if (shm[slot].refs > 0) return;              /* someone still has it */
+  for (unsigned i = 0; i < shm[slot].pages; i++)
+    if (shm[slot].kva[i]) pmm_free_page(to_phys(shm[slot].kva[i]));
+  kfree(shm[slot].kva);
+  shm[slot].kva = 0;
+  shm[slot].pages = 0;
+  shm[slot].used = 0;
+}
+
+/* Frames for `from`..`pages`, on top of what is already there. Returns 0 or
+ * rolls back everything this call allocated. */
+static int shm_add_frames(int slot, void **arr, unsigned from, unsigned pages) {
+  for (unsigned i = from; i < pages; i++) {
+    arr[i] = alloc_frame();
+    if (!arr[i]) {
+      for (unsigned j = from; j < i; j++) { pmm_free_page(to_phys(arr[j])); arr[j] = 0; }
+      return -ENOMEM;
+    }
   }
-  shm[slot].pages = pages;
-  shm[slot].used = 1;
+  (void)slot;
   return 0;
 }
 
-static uint64_t shm_attach(int slot) {
-  if (slot < 0 || slot >= SHM_SLOTS || !shm[slot].used) return 0;
-  task_t *t = task_at(task_current());
-  if (!t || !t->cr3) return 0;
-  for (int i = 0; i < shm[slot].pages; i++) {
-    if (ring3_map_existing(t->cr3, RING3_SHM_BASE + (uint64_t)i * 4096,
-                           to_phys(shm[slot].kva[i]),
-                           PTE_P | PTE_W | PTE_U | PTE_SHARED) != 0) return 0;
+static int shm_get(int slot, int pages) {
+  if (slot < 0 || slot >= RING3_SHM_SLOTS) return -EINVAL;
+  if (pages < 1 || pages > RING3_SHM_MAX) return -EINVAL;   /* no silent clamp */
+  if (shm[slot].used) {
+    if ((unsigned)pages <= shm[slot].pages) return 0;
+    /* Grow. Anyone already attached keeps the pages it mapped - the new ones
+     * appear on its next attach, which is why a renderer asks for the size it
+     * wants once rather than growing a region it is sharing. */
+    void **n = (void **)kmalloc((size_t)pages * sizeof(void *));
+    if (!n) return -ENOMEM;
+    for (unsigned i = 0; i < shm[slot].pages; i++) n[i] = shm[slot].kva[i];
+    if (shm_add_frames(slot, n, shm[slot].pages, (unsigned)pages) != 0) {
+      kfree(n);
+      return -ENOMEM;
+    }
+    kfree(shm[slot].kva);
+    shm[slot].kva = n;
+    shm[slot].pages = (unsigned)pages;
+    return 0;
   }
-  return RING3_SHM_BASE;
+  void **n = (void **)kmalloc((size_t)pages * sizeof(void *));
+  if (!n) return -ENOMEM;
+  if (shm_add_frames(slot, n, 0, (unsigned)pages) != 0) {
+    kfree(n);
+    return -ENOMEM;
+  }
+  shm[slot].kva = n;
+  shm[slot].pages = (unsigned)pages;
+  shm[slot].used = 1;
+  shm[slot].refs = 0;
+  return 0;
+}
+
+/* Clear one mapped page without touching the frame behind it: the frame belongs
+ * to the region, not to this process. */
+static void shm_unmap_page(uint64_t cr3, uint64_t va) {
+  uint64_t *pt = walk_user(cr3, va & ~0xFFFULL);
+  if (!pt) return;
+  pt[(va >> 12) & 511] = 0;
+  asm volatile("invlpg (%0)" :: "r"(va) : "memory");
+}
+
+static uint64_t shm_attach(int slot) {
+  if (slot < 0 || slot >= RING3_SHM_SLOTS || !shm[slot].used) return 0;
+  task_t *t = task_at(task_current());
+  if (!t || !t->cr3 || !t->mm) return 0;
+  mm_t *mm = t->mm;
+  uint64_t bit = 1ULL << slot;
+  if (mm->shm_bits & bit) return 0;      /* this process is already attached */
+  uint64_t base = mm->shm_next ? mm->shm_next : RING3_SHM_BASE;
+  uint64_t len = (uint64_t)shm[slot].pages * 4096;
+  if (base + len > RING3_SHM_TOP) return 0;
+  for (unsigned i = 0; i < shm[slot].pages; i++) {
+    if (ring3_map_existing(t->cr3, base + (uint64_t)i * 4096,
+                           to_phys(shm[slot].kva[i]),
+                           PTE_P | PTE_W | PTE_U | PTE_SHARED) != 0) {
+      for (unsigned j = 0; j < i; j++) shm_unmap_page(t->cr3, base + (uint64_t)j * 4096);
+      return 0;
+    }
+  }
+  mm->shm_addr[slot] = base;
+  mm->shm_next = base + len;
+  mm->shm_bits |= bit;
+  shm[slot].refs++;
+  return base;
+}
+
+static int shm_detach(int slot) {
+  if (slot < 0 || slot >= RING3_SHM_SLOTS) return -EINVAL;
+  task_t *t = task_at(task_current());
+  if (!t || !t->cr3 || !t->mm) return -EINVAL;
+  mm_t *mm = t->mm;
+  uint64_t bit = 1ULL << slot;
+  if (!(mm->shm_bits & bit)) return -EINVAL;
+  uint64_t base = mm->shm_addr[slot];
+  unsigned pages = shm[slot].used ? shm[slot].pages : 0;
+  for (unsigned i = 0; i < pages; i++) shm_unmap_page(t->cr3, base + (uint64_t)i * 4096);
+  mm->shm_bits &= ~bit;
+  mm->shm_addr[slot] = 0;
+  if (shm[slot].refs > 0) shm[slot].refs--;
+  shm_release(slot);
+  return 0;
+}
+
+/* Called from mm_free_tables: give back every slot this space still holds. */
+static void shm_drop_all(mm_t *mm) {
+  if (!mm) return;
+  for (int s = 0; s < RING3_SHM_SLOTS; s++) {
+    if (!(mm->shm_bits & (1ULL << s))) continue;
+    mm->shm_bits &= ~(1ULL << s);
+    mm->shm_addr[s] = 0;
+    if (shm[s].refs > 0) shm[s].refs--;
+    shm_release(s);
+  }
 }
 
 /* Pixel surfaces: frames the kernel owns, mapped writable into one process,
@@ -569,11 +687,13 @@ static uint64_t shm_attach(int slot) {
  *
  * The frames are not contiguous, so a surface is not one buffer: it is a list
  * of pages and a width. Everything that reads pixels goes a row at a time. */
-#define SURF_PAGES ((int)(RING3_SURF_AREA / 4096))
-
+/* Frames are allocated for the pixels a surface has, not for the whole slot:
+ * `pages` is how many are mapped and `cap` how many pointer slots exist. A
+ * window that grows gets more of both; one that shrinks keeps what it has,
+ * because the next resize usually grows it again. */
 static struct {
-  int       used, win, w, h, pages;
-  void     *kva[SURF_PAGES];
+  int       used, win, w, h, pages, cap;
+  void    **kva;
   uint64_t  presented;          /* present() calls, for the log */
   int       has_damage;         /* dam is the union of what was presented */
   int       dam_x, dam_y, dam_w, dam_h;
@@ -597,13 +717,12 @@ uint64_t surf_create(int win_id, int w, int h) {
   if (w < 1 || h < 1 || win_id < 0) return (uint64_t)-EINVAL;
   if (w > SURF_MAX_W) w = SURF_MAX_W;
   if (h > SURF_MAX_H) h = SURF_MAX_H;
-  /* The whole slot is mapped, not just the pixels this size needs. A window
-   * that is resized or maximised then only changes its logical w/h - no frames
-   * move, no page tables change, and the process' pointer stays valid. Four
-   * megabytes a window is a fair price for not having to reason about a stale
-   * TLB entry on the frame it used to point at. */
-  int pages = SURF_PAGES;
-  if ((size_t)w * (size_t)h * 4 > (size_t)pages * 4096) return (uint64_t)-EINVAL;
+  /* Bytes the client can reach, in whole pages. The process gets a pointer to
+   * the start of the slot and indexes it as w*h*4 bytes; everything past that
+   * is deliberately left unmapped, so a client that draws outside its own
+   * surface faults instead of scribbling on the next window's pixels. */
+  int need = (int)(((size_t)w * (size_t)h * 4 + 4095) / 4096);
+  if ((uint64_t)need * 4096 > RING3_SURF_AREA) return (uint64_t)-EINVAL;
   if (surf_slot_for_win(win_id) >= 0) return (uint64_t)-EEXIST;
 
   int slot = -1;
@@ -613,23 +732,33 @@ uint64_t surf_create(int win_id, int w, int h) {
   task_t *t = task_at(task_current());
   if (!t || !t->cr3) return (uint64_t)-EINVAL;
 
+  surf[slot].kva = (void **)kzalloc((size_t)need * sizeof(void *));
+  if (!surf[slot].kva) return (uint64_t)-ENOMEM;
+  surf[slot].cap = need;
+
   int got = 0;
-  for (; got < pages; got++) {
+  for (; got < need; got++) {
     surf[slot].kva[got] = alloc_frame();
     if (!surf[slot].kva[got]) break;
     surf_zero(surf[slot].kva[got], 4096);     /* defined from the first frame */
   }
-  if (got < pages) {                          /* give back what we took */
+  if (got < need) {                           /* give back what we took */
     for (int j = 0; j < got; j++) pmm_free_page(to_phys(surf[slot].kva[j]));
+    kfree(surf[slot].kva);
+    surf[slot].kva = 0;
+    surf[slot].cap = 0;
     return (uint64_t)-ENOMEM;
   }
 
   uint64_t base = RING3_SURF_BASE + (uint64_t)slot * RING3_SURF_AREA;
-  for (int i = 0; i < pages; i++) {
+  for (int i = 0; i < need; i++) {
     if (ring3_map_existing(t->cr3, base + (uint64_t)i * 4096,
                            to_phys(surf[slot].kva[i]),
                            PTE_P | PTE_W | PTE_U | PTE_SHARED) != 0) {
-      for (int j = 0; j < pages; j++) pmm_free_page(to_phys(surf[slot].kva[j]));
+      for (int j = 0; j < need; j++) pmm_free_page(to_phys(surf[slot].kva[j]));
+      kfree(surf[slot].kva);
+      surf[slot].kva = 0;
+      surf[slot].cap = 0;
       return (uint64_t)-ENOMEM;
     }
   }
@@ -638,7 +767,7 @@ uint64_t surf_create(int win_id, int w, int h) {
   surf[slot].win = win_id;
   surf[slot].w = w;
   surf[slot].h = h;
-  surf[slot].pages = pages;
+  surf[slot].pages = need;
   surf[slot].has_damage = 1;                  /* the first frame is all of it */
   surf[slot].dam_x = 0; surf[slot].dam_y = 0;
   surf[slot].dam_w = w; surf[slot].dam_h = h;
@@ -652,8 +781,45 @@ int surf_resize(int win_id, int w, int h) {
   if (h < 1) h = 1;
   if (w > SURF_MAX_W) w = SURF_MAX_W;
   if (h > SURF_MAX_H) h = SURF_MAX_H;
-  if ((size_t)w * (size_t)h * 4 > (size_t)surf[slot].pages * 4096) return -EINVAL;
   if (w == surf[slot].w && h == surf[slot].h) return 0;
+
+  int need = (int)(((size_t)w * (size_t)h * 4 + 4095) / 4096);
+  if ((uint64_t)need * 4096 > RING3_SURF_AREA) return -EINVAL;
+
+  task_t *t = task_at(task_current());
+  if (!t || !t->cr3) return -EINVAL;
+
+  /* Growing: more frames, and more of the slot mapped. Shrinking keeps the
+   * frames it has - the next resize usually grows it back, and a freed page
+   * that has to be reallocated and re-zeroed is worse than an idle one. */
+  if (need > surf[slot].pages) {
+    if (need > surf[slot].cap) {
+      void **n = (void **)kzalloc((size_t)need * sizeof(void *));
+      if (!n) return -ENOMEM;
+      for (int i = 0; i < surf[slot].cap; i++) n[i] = surf[slot].kva[i];
+      kfree(surf[slot].kva);
+      surf[slot].kva = n;
+      surf[slot].cap = need;
+    }
+    uint64_t base = RING3_SURF_BASE + (uint64_t)slot * RING3_SURF_AREA;
+    int have = surf[slot].pages;
+    int got = have;
+    for (; got < need; got++) {
+      void *f = alloc_frame();
+      if (!f) break;
+      surf_zero(f, 4096);
+      surf[slot].kva[got] = f;
+      if (ring3_map_existing(t->cr3, base + (uint64_t)got * 4096,
+                             to_phys(f), PTE_P | PTE_W | PTE_U | PTE_SHARED) != 0) {
+        pmm_free_page(to_phys(f));
+        surf[slot].kva[got] = 0;
+        break;
+      }
+    }
+    surf[slot].pages = got;
+    if (got < need) return -ENOMEM;           /* partial: the client keeps the old size */
+  }
+
   surf[slot].w = w;
   surf[slot].h = h;
   /* everything the old size showed is suspect, so the next blit is all of it */
@@ -700,10 +866,44 @@ int surf_size(int win_id, int *w, int *h) {
   return 1;
 }
 
+/* Copy one surface row into `dst`, one page at a time.
+ *
+ * surf_row() hands back a pointer into the frame that row *starts* in, and a row
+ * is wider than the remaining space in that frame often enough to matter: at 438
+ * pixels a row is 1752 bytes, so every second row crosses a 4 KB boundary. The
+ * frames are separate allocations mapped contiguously in the client's address
+ * space, so reading past one frame is reading whatever the allocator put after
+ * it - which is exactly how single stray rows of garbage appeared in an
+ * otherwise correct window, and why they came and went with allocation order.
+ *
+ * Returns how many pixels were copied (0 when the row is not mapped at all). */
+int surf_copy_row(int win_id, int y, uint32_t *dst, int cols) {
+  int slot = surf_slot_for_win(win_id);
+  if (slot < 0 || !dst || cols <= 0) return 0;
+  if (y < 0 || y >= surf[slot].h) return 0;
+  if (cols > surf[slot].w) cols = surf[slot].w;
+  size_t off = (size_t)y * (size_t)surf[slot].w * 4;
+  size_t need = (size_t)cols * 4;
+  int done = 0;
+  while (need > 0) {
+    size_t pg = off >> 12;
+    if (pg >= (size_t)surf[slot].pages) return done;      /* past the mapping */
+    size_t inpg = off & 4095;
+    size_t room = 4096 - inpg;
+    if (room > need) room = need;
+    memcpy((uint8_t *)dst + done, (uint8_t *)surf[slot].kva[pg] + inpg, room);
+    off += room;
+    done += (int)room;
+    need -= room;
+  }
+  return done / 4;
+}
+
 uint32_t *surf_row(int win_id, int y) {
   int slot = surf_slot_for_win(win_id);
   if (slot < 0 || y < 0 || y >= surf[slot].h) return 0;
   size_t off = (size_t)y * (size_t)surf[slot].w * 4;
+  if ((off >> 12) >= (size_t)surf[slot].pages) return 0;   /* past what is mapped */
   return (uint32_t *)((uint8_t *)surf[slot].kva[off >> 12] + (off & 4095));
 }
 
@@ -725,6 +925,8 @@ void surf_release_window(int win_id) {
   if (slot < 0) return;
   for (int i = 0; i < surf[slot].pages; i++)
     if (surf[slot].kva[i]) pmm_free_page(to_phys(surf[slot].kva[i]));
+  kfree(surf[slot].kva);
+  surf[slot].kva = 0;
   surf_zero(&surf[slot], sizeof surf[slot]);
 }
 
@@ -1769,7 +1971,9 @@ static long linux_socket(uint64_t domain, uint64_t type, uint64_t proto) {
   fdtable_t *fds = current_fds();
   if (!fds) return -EMFILE;
   if (proto != 0) return -EPROTONOSUPPORT;
-  if (domain != 2) return -EAFNOSUPPORT;          /* no AF_INET6, no AF_UNIX */
+  /* AF_UNIX (1) and AF_INET (2). No AF_INET6. An AF_UNIX socket starts with no
+   * transport: bind() gives it a name, or connect() gives it a peer. */
+  if (domain != 1 && domain != 2) return -EAFNOSUPPORT;
   /* SOCK_DGRAM is a real protocol this transport does not carry: saying
    * EAFNOSUPPORT would be a claim about the family, and it is the type that is
    * missing. */
@@ -1783,14 +1987,135 @@ static long linux_socket(uint64_t domain, uint64_t type, uint64_t proto) {
   return fd_socket(fds);
 }
 
+/* socketpair(53). AF_UNIX, SOCK_STREAM, and nothing else: a datagram pair would
+ * need message boundaries the pipe-backed transport does not preserve, and
+ * claiming it would hand a program a stream and let it discover the difference
+ * later. Chromium's renderer channel is a SOCK_STREAM pair. */
+static long linux_socketpair(uint64_t domain, uint64_t type, uint64_t proto, uint64_t usv) {
+  fdtable_t *fds = current_fds();
+  if (!fds) return -EMFILE;
+  if (proto != 0) return -EPROTONOSUPPORT;
+  if (domain != 1) return -EAFNOSUPPORT;            /* 1 = AF_UNIX */
+  if ((type & 0xF) != 1) return -EPROTONOSUPPORT;   /* 1 = SOCK_STREAM */
+  if (type & ~0xFull) return -EINVAL;
+
+  struct socket *sa = 0, *sb = 0;
+  int r = sock_pair(&sa, &sb);
+  if (r != 0) return r;
+
+  int fa = fd_socket_from(fds, sa);
+  if (fa < 0) { sock_close(sa); sock_close(sb); return fa; }
+  int fb = fd_socket_from(fds, sb);
+  if (fb < 0) { fd_close(fds, fa); sock_close(sb); return fb; }
+
+  int both[2];
+  both[0] = fa;
+  both[1] = fb;
+  if (user_put(usv, both, sizeof both) != 0) {
+    /* The descriptors exist only if the program can learn their numbers. */
+    fd_close(fds, fa);
+    fd_close(fds, fb);
+    return -EFAULT;
+  }
+  return 0;
+}
+
+/* struct sockaddr_un: sa_family_t (2 bytes) then a NUL-terminated path. The length
+ * a caller passes is the length of the address it built, so it includes the
+ * terminator; anything after that terminator is padding. */
+static int sockaddr_un_read(uint64_t addr, uint64_t len, char *out, int max) {
+  if (len < 3) return -EINVAL;
+  uint64_t n = len - 2;
+  if (n >= (uint64_t)max) return -ENAMETOOLONG;
+  if (user_get(addr + 2, out, n) != 0) return -EFAULT;
+  out[n] = 0;
+  if (!out[0]) return -EINVAL;        /* an unnamed socket cannot be found */
+  return 0;
+}
+
+static long linux_bind(uint64_t fd, uint64_t addr, uint64_t len) {
+  fdtable_t *fds = current_fds();
+  if (!fds) return -EBADF;
+  ofile_t *of = fd_ofile(fds, (int)fd);
+  if (!of) return -EBADF;
+  if (of->kind != FK_SOCKET || !of->sock) return -ENOTSOCK;
+  /* Names are an AF_UNIX idea. An AF_INET address has no local port to bind here,
+   * and reading its bytes as a path would invent a name out of a port number. */
+  uint16_t fam = 0;
+  if (len >= 2 && user_get(addr, &fam, 2) != 0) return -EFAULT;
+  if (fam != 1) return -EAFNOSUPPORT;
+  char path[UNIX_PATH_MAX];
+  int r = sockaddr_un_read(addr, len, path, (int)sizeof path);
+  if (r != 0) return r;
+  return sock_unix_bind(of->sock, path);
+}
+
+static long linux_listen(uint64_t fd, uint64_t backlog) {
+  fdtable_t *fds = current_fds();
+  if (!fds) return -EBADF;
+  ofile_t *of = fd_ofile(fds, (int)fd);
+  if (!of) return -EBADF;
+  if (of->kind != FK_SOCKET || !of->sock) return -ENOTSOCK;
+  return sock_unix_listen(of->sock, (int)backlog);
+}
+
+/* accept4's flags. Neither has an effect yet: there is no exec-time descriptor
+ * table to close, and a socket whose waits are already deadline-bounded is close
+ * enough to non-blocking that refusing the call would be worse than accepting it. */
+#define SOCK_CLOEXEC_FLAG  0x80000
+#define SOCK_NONBLOCK_FLAG 0x800
+
+/* accept(): wait for a connection on a bound and listening socket. The wait has a
+ * deadline rather than none - the same shape a blocking read has here - so a task
+ * stuck in accept can still be killed and a test cannot hang the boot. */
+static long linux_accept(uint64_t fd, uint64_t addr, uint64_t alen, uint64_t flags) {
+  if (flags & ~(uint64_t)(SOCK_CLOEXEC_FLAG | SOCK_NONBLOCK_FLAG)) return -EINVAL;
+  fdtable_t *fds = current_fds();
+  if (!fds) return -EBADF;
+  ofile_t *of = fd_ofile(fds, (int)fd);
+  if (!of) return -EBADF;
+  if (of->kind != FK_SOCKET || !of->sock) return -ENOTSOCK;
+
+  for (int waits = 0; waits < 10; waits++) {
+    struct socket *ns = 0;
+    int r = sock_unix_accept(of->sock, &ns);
+    if (r == 0) {
+      int nfd = fd_socket_from(fds, ns);
+      if (nfd < 0) { sock_close(ns); return nfd; }
+      if (addr && alen) {
+        uint32_t zero = 0;             /* an AF_UNIX peer has no address to report */
+        if (user_put(alen, &zero, 4) != 0) return -EFAULT;
+      }
+      return nfd;
+    }
+    if (r != -EAGAIN) return r;
+    int w = sock_wait(of->sock, OMI_POLLIN, 500);
+    if (w < 0 && w != -EAGAIN) return w;
+  }
+  return -EAGAIN;
+}
+
 static long linux_connect(uint64_t fd, uint64_t addr, uint64_t len) {
+  if (len < 2) return -EINVAL;
+  uint16_t fam = 0;
+  if (user_get(addr, &fam, 2) != 0) return -EFAULT;
+  fdtable_t *fds = current_fds();
+  if (!fds) return -EBADF;
+  ofile_t *of = fd_ofile(fds, (int)fd);
+  if (!of) return -EBADF;
+  if (of->kind != FK_SOCKET || !of->sock) return -ENOTSOCK;
+
+  if (fam == 1) {                        /* AF_UNIX: the path is the address */
+    char path[UNIX_PATH_MAX];
+    int r = sockaddr_un_read(addr, len, path, (int)sizeof path);
+    if (r != 0) return r;
+    return sock_unix_connect(of->sock, path);
+  }
   if (len < SOCKADDR_IN_LEN) return -EINVAL;
   uint32_t ip; uint16_t port;
   int r = sockaddr_in_read(addr, &ip, &port);
   if (r != 0) return r;
   if (!port) return -EINVAL;
-  fdtable_t *fds = current_fds();
-  if (!fds) return -EBADF;
   return fd_connect(fds, (int)fd, ip, port);
 }
 
@@ -1820,56 +2145,154 @@ static long linux_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t fla
   return n;
 }
 
-/* sendmsg/recvmsg: the same calls with the bytes scattered across iovecs. A
- * library that writes a header and a body separately should not have to join
- * them itself, so they are joined here - into one kernel buffer, because the
- * transport takes a contiguous range. */
+/* sendmsg/recvmsg: the same calls with the bytes scattered across iovecs, and
+ * with room for one ancillary message - which for AF_UNIX means descriptors.
+ *
+ * struct msghdr (x86-64): msg_name 0, msg_namelen 8, msg_iov 16, msg_iovlen 24,
+ * msg_control 32, msg_controllen 40, msg_flags 48. Each cmsghdr is
+ * {size_t len; int level; int type} and the next one starts at len rounded up to
+ * eight, because the payload of an SCM_RIGHTS message is an array of ints and the
+ * header that follows must stay aligned. */
 #define IOV_LEN 16
-/* One message is one page. The rest of the kernel moves bytes through a page-
- * sized bounce buffer (read(2) and write(2) both cap at 4096), and a sendmsg
- * that claimed to take more would have to loop anyway - so it loops here and
- * says so, rather than growing a second buffer discipline nobody else uses. */
 #define MSG_MAX 4096
+#define CMSG_HDR       16
+#define SOL_SOCKET     1
+#define SCM_RIGHTS     1
+/* 0x08 is MSG_CTRUNC in Linux's numbering; 0x20 is MSG_TRUNC, which means the
+ * data was short, not the ancillary data. Getting these two confused makes a
+ * correct kernel look wrong to every program that checks the flag. */
+#define MSG_CTRUNC_BIT 0x08
+
+/* Collect the descriptors out of a sendmsg's control chain, taking a reference to
+ * each. Anything that is not SOL_SOCKET/SCM_RIGHTS is refused: there is no other
+ * ancillary data here, and accepting one would be a promise this kernel cannot
+ * keep - which is the failure the old -ENOSYS was avoiding in the first place. */
+static int send_ctl_collect(fdtable_t *fds, uint64_t ctl_u, uint64_t ctl_len,
+                            ofile_t **out, int max) {
+  if (!ctl_u || !ctl_len) return 0;
+  if (ctl_len > 256) return -EINVAL;
+  uint8_t buf[256];
+  if (user_get(ctl_u, buf, ctl_len) != 0) return -EFAULT;
+  int n = 0;
+  uint64_t off = 0;
+  while (off + CMSG_HDR <= ctl_len) {
+    uint64_t clen;
+    int level, type;
+    memcpy(&clen, buf + off, 8);
+    memcpy(&level, buf + off + 8, 4);
+    memcpy(&type, buf + off + 12, 4);
+    if (clen < CMSG_HDR || off + clen > ctl_len) {
+      for (int k = 0; k < n; k++) fd_drop_ofile(out[k]);
+      return -EINVAL;
+    }
+    if (level != SOL_SOCKET || type != SCM_RIGHTS) {
+      for (int k = 0; k < n; k++) fd_drop_ofile(out[k]);
+      return -EINVAL;
+    }
+    int count = (int)((clen - CMSG_HDR) / 4);
+    if (count <= 0) {
+      for (int k = 0; k < n; k++) fd_drop_ofile(out[k]);
+      return -EINVAL;
+    }
+    for (int i = 0; i < count; i++) {
+      int fdnum;
+      memcpy(&fdnum, buf + off + CMSG_HDR + 4 * i, 4);
+      if (n >= max) {
+        for (int k = 0; k < n; k++) fd_drop_ofile(out[k]);
+        return -E2BIG;
+      }
+      ofile_t *o = fd_ref_ofile(fds, fdnum);
+      if (!o) {
+        for (int k = 0; k < n; k++) fd_drop_ofile(out[k]);
+        return -EBADF;
+      }
+      out[n++] = o;
+    }
+    off += (clen + 7) & ~(uint64_t)7;
+  }
+  return n;
+}
 
 static long linux_sendmsg(uint64_t fd, uint64_t msg_u, uint64_t flags) {
   if (flags & ~(uint64_t)MSG_NOSIGNAL_FLAG) return -EINVAL;
   if (!msg_u) return -EFAULT;
-  uint64_t hdr[4];                          /* msg_name, msg_namelen, msg_iov, msg_iovlen */
+  uint64_t hdr[6];                          /* through msg_controllen */
   if (user_get(msg_u, hdr, sizeof hdr) != 0) return -EFAULT;
   uint32_t iovlen = (uint32_t)hdr[3];
   if (iovlen > IOV_LEN) return -EINVAL;
-  /* Ancillary data (SCM_RIGHTS and friends) is how one process passes a
-   * descriptor to another. Silently dropping it would break that handshake in a
-   * way that looks like a protocol bug at the far end, so it is refused. */
-  uint64_t ctl[2];
-  if (user_get(msg_u + 32, ctl, sizeof ctl) == 0 && ctl[0] && ctl[1]) return -ENOSYS;
+
+  fdtable_t *fds = current_fds();
+  if (!fds) return -EBADF;
+  ofile_t *of = fd_ofile(fds, (int)fd);
+  if (!of) return -EBADF;
+
+  ofile_t *passed[8];
+  int npassed = send_ctl_collect(fds, hdr[4], hdr[5], passed, 8);
+  if (npassed < 0) return npassed;
+  if (npassed && of->kind != FK_SOCKET) {
+    for (int k = 0; k < npassed; k++) fd_drop_ofile(passed[k]);
+    return -ENOTSOCK;
+  }
 
   uint64_t total = 0;
   uint64_t iov[2 * IOV_LEN];
-  if (iovlen && user_get(hdr[2], iov, iovlen * 16) != 0) return -EFAULT;
-  /* struct iovec is {base, len}: the length is the odd slot, and summing the
-   * bases asks for a buffer the size of the address space. */
+  if (iovlen && user_get(hdr[2], iov, iovlen * 16) != 0) {
+    for (int k = 0; k < npassed; k++) fd_drop_ofile(passed[k]);
+    return -EFAULT;
+  }
   for (uint32_t i = 0; i < iovlen; i++) total += iov[2 * i + 1];
-  if (total > MSG_MAX) return -EMSGSIZE;
-  if (!total) return 0;
+  if (total > MSG_MAX) {
+    for (int k = 0; k < npassed; k++) fd_drop_ofile(passed[k]);
+    return -EMSGSIZE;
+  }
+  /* A descriptor needs a byte to ride on: the transport is a stream, so a
+   * control message with no data has nothing to be ordered against. Refusing it
+   * beats queueing it and leaving the receiver to guess when it applies. */
+  if (!total) {
+    for (int k = 0; k < npassed; k++) fd_drop_ofile(passed[k]);
+    return npassed ? -EINVAL : 0;
+  }
 
   uint8_t *kbuf = kmalloc((size_t)total);
-  if (!kbuf) return -ENOMEM;
+  if (!kbuf) {
+    for (int k = 0; k < npassed; k++) fd_drop_ofile(passed[k]);
+    return -ENOMEM;
+  }
   uint64_t at = 0;
   for (uint32_t i = 0; i < iovlen; i++) {
-    if (!iov[2 * i]) continue;
-    if (user_get(iov[2 * i], kbuf + at, iov[2 * i + 1]) != 0) { kfree(kbuf); return -EFAULT; }
-    at += iov[2 * i];
+    uint64_t len = iov[2 * i + 1];           /* the second slot is the length */
+    if (!len) continue;
+    if (user_get(iov[2 * i], kbuf + at, len) != 0) {
+      kfree(kbuf);
+      for (int k = 0; k < npassed; k++) fd_drop_ofile(passed[k]);
+      return -EFAULT;
+    }
+    at += len;
   }
-  /* fd_write, not sys_write: the bytes already live in a kernel buffer, and
-   * sys_write's first act is to copy from a user pointer and refuse anything
-   * outside the user window - which is exactly what a kernel address is. */
-  fdtable_t *fds = current_fds();
-  if (!fds) { kfree(kbuf); return -EBADF; }
+
+  /* The descriptors are queued before the bytes so that a full pipe cannot leave
+   * a receiver with data whose descriptors were silently thrown away; if the
+   * write then fails to move anything, the queue entry is taken back. */
+  if (npassed) {
+    int r = sock_send_ctl(of->sock, (void **)passed, npassed);
+    if (r < 0) {
+      kfree(kbuf);
+      for (int k = 0; k < npassed; k++) fd_drop_ofile(passed[k]);
+      return r;
+    }
+  }
+
   uint64_t done = 0;
   while (done < total) {
     long w = fd_write(fds, (int)fd, kbuf + done, total - done);
-    if (w <= 0) { if (!done) { kfree(kbuf); return w; } break; }
+    if (w <= 0) {
+      if (!done) {
+        if (npassed) sock_cancel_ctl(of->sock);
+        kfree(kbuf);
+        return w;
+      }
+      break;
+    }
     done += (uint64_t)w;
   }
   kfree(kbuf);
@@ -1879,49 +2302,98 @@ static long linux_sendmsg(uint64_t fd, uint64_t msg_u, uint64_t flags) {
 static long linux_recvmsg(uint64_t fd, uint64_t msg_u, uint64_t flags) {
   if (flags & ~(uint64_t)MSG_NOSIGNAL_FLAG) return -EINVAL;
   if (!msg_u) return -EFAULT;
-  uint64_t hdr[4];
+  uint64_t hdr[7];                          /* through msg_flags */
   if (user_get(msg_u, hdr, sizeof hdr) != 0) return -EFAULT;
   uint32_t iovlen = (uint32_t)hdr[3];
   if (iovlen > IOV_LEN) return -EINVAL;
-  uint64_t ctl[2];
-  if (user_get(msg_u + 32, ctl, sizeof ctl) == 0 && ctl[0] && ctl[1]) return -ENOSYS;
+
+  fdtable_t *fds = current_fds();
+  if (!fds) return -EBADF;
+  ofile_t *of = fd_ofile(fds, (int)fd);
+  if (!of) return -EBADF;
 
   uint64_t total = 0;
   uint64_t iov[2 * IOV_LEN];
   if (iovlen && user_get(hdr[2], iov, iovlen * 16) != 0) return -EFAULT;
   for (uint32_t i = 0; i < iovlen; i++) total += iov[2 * i + 1];
   if (total > MSG_MAX) return -EMSGSIZE;
-  if (!total) return 0;
 
-  uint8_t *kbuf = kmalloc((size_t)total);
-  if (!kbuf) return -ENOMEM;
-  fdtable_t *fds = current_fds();
-  if (!fds) { kfree(kbuf); return -EBADF; }
-  long n = fd_read(fds, (int)fd, kbuf, total);
-  if (n > 0) {
-    uint64_t at = 0, left = (uint64_t)n;
-    for (uint32_t i = 0; i < iovlen && left; i++) {
-      uint64_t take = iov[2 * i] < left ? iov[2 * i] : left;
-      if (take && user_put(iov[2 * i], kbuf + at, take) != 0) { kfree(kbuf); return -EFAULT; }
-      at += take; left -= take;
+  long n = 0;
+  if (total) {
+    uint8_t *kbuf = kmalloc((size_t)total);
+    if (!kbuf) return -ENOMEM;
+    n = fd_read(fds, (int)fd, kbuf, total);
+    if (n > 0) {
+      uint64_t at = 0, left = (uint64_t)n;
+      for (uint32_t i = 0; i < iovlen && left; i++) {
+        uint64_t len = iov[2 * i + 1];
+        uint64_t take = len < left ? len : left;
+        if (take && user_put(iov[2 * i], kbuf + at, take) != 0) {
+          kfree(kbuf);
+          return -EFAULT;
+        }
+        at += take;
+        left -= take;
+      }
+      n = (long)at;
     }
-    /* Every byte went somewhere, or the count would be a lie. */
-    n = (long)(at);
+    kfree(kbuf);
+    if (n < 0) return n;
   }
-  kfree(kbuf);
+
+  /* Ancillary data is only meaningful on a socket, and only one message deep. */
+  /* A non-NULL control buffer means "tell me about ancillary data", even when it
+   * is too small to hold any: that is the case MSG_CTRUNC exists for. A zero
+   * length means the caller is not asking, and the queue is left alone. */
+  if (of->kind == FK_SOCKET && of->sock && hdr[4] && hdr[5]) {
+    int fit = hdr[5] >= CMSG_HDR ? (int)((hdr[5] - CMSG_HDR) / 4) : 0;
+    if (fit > 8) fit = 8;
+    ofile_t *got[8];
+    int nc = sock_recv_ctl(of->sock, (void **)got, fit);
+    uint32_t msgflags = (uint32_t)hdr[6];
+    uint64_t ctl_used = 0;
+    if (nc == -E2BIG) {
+      msgflags |= MSG_CTRUNC_BIT;      /* taken and released: say so */
+      nc = 0;
+    }
+    if (nc > 0) {
+      int fdnums[8];
+      int installed = 0;
+      uint8_t cb[CMSG_HDR + 4 * 8];
+      uint64_t clen = CMSG_HDR + 4 * (uint64_t)nc;
+      int level = SOL_SOCKET, type = SCM_RIGHTS;
+      for (int i = 0; i < nc; i++) {
+        int nf = fd_install_ofile(fds, got[i]);
+        if (nf < 0) {
+          for (int k = i; k < nc; k++) fd_drop_ofile(got[k]);
+          for (int k = 0; k < installed; k++) fd_close(fds, fdnums[k]);
+          return nf;
+        }
+        fdnums[installed++] = nf;
+        memcpy(cb + CMSG_HDR + 4 * i, &nf, 4);
+      }
+      memcpy(cb, &clen, 8);
+      memcpy(cb + 8, &level, 4);
+      memcpy(cb + 12, &type, 4);
+      if (user_put(hdr[4], cb, clen) != 0) {
+        for (int k = 0; k < installed; k++) fd_close(fds, fdnums[k]);
+        return -EFAULT;
+      }
+      ctl_used = clen;
+    }
+    if (msgflags != (uint32_t)hdr[6] || ctl_used) {
+      if (user_put(msg_u + 48, &msgflags, 4) != 0) return -EFAULT;
+    }
+    if (user_put(msg_u + 40, &ctl_used, 8) != 0) return -EFAULT;
+  }
   return n;
 }
 
-/* setsockopt/getsockopt. The accepted options are the ones that are already
- * true here or that only describe intent; the refused ones are the ones a
- * program would build behaviour on. TCP_NODELAY is accepted because Nagle is
- * not implemented - every send leaves immediately, which is what the caller
- * asked for. */
 static long linux_setsockopt(uint64_t fd, uint64_t level, uint64_t opt,
                              uint64_t val_u, uint64_t len) {
   fdtable_t *fds = current_fds();
-  if (!fds || fd >= FD_MAX || !fds->fd[fd]) return -EBADF;
-  if (fds->fd[fd]->kind != FK_SOCKET) return -ENOTSOCK;
+  if (!fd_at(fds, fd)) return -EBADF;
+  if (fd_at(fds, fd)->kind != FK_SOCKET) return -ENOTSOCK;
   (void)val_u; (void)len;
   if (level == 1) {                        /* SOL_SOCKET */
     if (opt == 2 || opt == 9) return 0;    /* SO_REUSEADDR, SO_KEEPALIVE: no-op */
@@ -1934,8 +2406,8 @@ static long linux_setsockopt(uint64_t fd, uint64_t level, uint64_t opt,
 static long linux_getsockopt(uint64_t fd, uint64_t level, uint64_t opt,
                              uint64_t val_u, uint64_t len_u) {
   fdtable_t *fds = current_fds();
-  if (!fds || fd >= FD_MAX || !fds->fd[fd]) return -EBADF;
-  if (fds->fd[fd]->kind != FK_SOCKET) return -ENOTSOCK;
+  if (!fd_at(fds, fd)) return -EBADF;
+  if (fd_at(fds, fd)->kind != FK_SOCKET) return -ENOTSOCK;
   uint32_t len = 0;
   if (user_get(len_u, &len, sizeof len) != 0) return -EFAULT;
   if (level == 1 && opt == 4) {            /* SO_ERROR: errors surface where they happen */
@@ -1944,6 +2416,19 @@ static long linux_getsockopt(uint64_t fd, uint64_t level, uint64_t opt,
     if (user_put(val_u, &zero, sizeof zero) != 0) return -EFAULT;
     uint32_t four = 4;
     if (user_put(len_u, &four, sizeof four) != 0) return -EFAULT;
+    return 0;
+  }
+  if (level == 1 && opt == 17) {           /* SO_PEERCRED */
+    ofile_t *of = fd_at(fds, fd);
+    if (!of->sock) return -ENOTSOCK;
+    int pid = 0, uid = 0, gid = 0;
+    int r = sock_peer_cred(of->sock, &pid, &uid, &gid);
+    if (r != 0) return r;
+    if (len < 12) return -EINVAL;
+    int32_t cr[3] = { pid, uid, gid };     /* struct ucred: pid, uid, gid */
+    if (user_put(val_u, cr, sizeof cr) != 0) return -EFAULT;
+    uint32_t twelve = 12;
+    if (user_put(len_u, &twelve, sizeof twelve) != 0) return -EFAULT;
     return 0;
   }
   if (level == 1 && opt == 3) {            /* SO_TYPE */
@@ -2078,8 +2563,8 @@ static long sys_epoll_create1(uint64_t flags) {
 static long sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fdn, uint64_t ev_u) {
   fdtable_t *t = current_fds();
   if (!t) return -EBADF;
-  if (epfd >= FD_MAX || !t->fd[epfd]) return -EBADF;
-  ofile_t *o = t->fd[epfd];
+  if (!fd_at(t, epfd)) return -EBADF;
+  ofile_t *o = fd_at(t, epfd);
   if (o->kind != FK_EPOLL || !o->ep) return -EINVAL;
 
   uint32_t events = 0;
@@ -2090,7 +2575,7 @@ static long sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fdn, uint64_t ev_
      * does not have and read the program's data from the wrong place. */
     if (user_copy(&events, ev_u, 4) != 0) return -EFAULT;
     if (user_copy(&data, ev_u + 4, 8) != 0) return -EFAULT;
-    if (fdn >= FD_MAX || !t->fd[fdn]) return -EBADF;
+    if (!fd_at(t, fdn)) return -EBADF;
   }
   return epoll_ctl(o->ep, (int)op, (int)fdn, events, data);
 }
@@ -2098,8 +2583,8 @@ static long sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fdn, uint64_t ev_
 static long sys_epoll_wait(uint64_t epfd, uint64_t ev_u, uint64_t maxevents, uint64_t timeout_ms) {
   fdtable_t *t = current_fds();
   if (!t) return -EBADF;
-  if (epfd >= FD_MAX || !t->fd[epfd]) return -EBADF;
-  ofile_t *o = t->fd[epfd];
+  if (!fd_at(t, epfd)) return -EBADF;
+  ofile_t *o = fd_at(t, epfd);
   if (o->kind != FK_EPOLL || !o->ep) return -EINVAL;
   if (maxevents == 0 || maxevents > EPOLL_MAX) return -EINVAL;
   if (user_prep(ev_u, maxevents * 12) != 0) return -EFAULT;
@@ -2369,7 +2854,10 @@ static long linux_arch_prctl(uint64_t op, uint64_t addr) {
  * mallocng's guard gaps. It is raised anyway, because 16 MB of process heap is a
  * floor a page parser reaches and the failure at the ceiling is an ENOMEM that a
  * library turns into a NULL dereference. */
-#define LINUX_BRK_MAX (64u << 20)
+/* The brk arena, reserved up front and committed on touch. 64 MB was the whole
+ * of what a musl program could take through brk; a renderer's arenas want more,
+ * and the reservation costs address space rather than memory. */
+#define LINUX_BRK_MAX (1024u << 20)
 
 /* brk reserves one area and then moves a pointer inside it; nothing is mapped
  * until a byte is touched, so asking for 16 MB costs one area slot. Returning the
@@ -3070,6 +3558,11 @@ static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, 
                                                             * arrive, so nothing
                                                             * can interrupt it */
     case 20:  return linux_writev(a0, a1, a2);             /* writev */
+    /* sched_yield: the polite "let something else run". Without it a program that
+     * yields in a loop - which is how any spin-with-backoff is written, and what
+     * musl's own code does - busy-waits on one core and starves the task it is
+     * waiting for. That looked like a waitpid() bug for a while. */
+    case 24:  task_yield(); return 0;
     case 22:  return sys_pipe(a0);                         /* pipe */
     case 56:  return sys_clone(a0, a1, a2, a3);             /* clone / fork */
     case 57:  return sys_fork();                            /* fork */
@@ -3089,8 +3582,12 @@ static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, 
       if (!f) return -EBADF;
       return fd_shutdown(f, (int)a0, (int)a1);
     }
-    case 49: case 50: return -ENOSYS;                        /* bind, listen: no listener */
+    case 43:  return linux_accept(a0, a1, a2, 0);            /* accept */
+    case 288: return linux_accept(a0, a1, a2, a3);           /* accept4 */
+    case 49:  return linux_bind(a0, a1, a2);                 /* bind */
+    case 50:  return linux_listen(a0, a1);                   /* listen */
     case 51: return -ENOSYS;                                 /* getsockname: no local address */
+    case 53: return linux_socketpair(a0, a1, a2, a3); /* socketpair */
     case 54: return linux_setsockopt(a0, a1, a2, a3, r3_arg4); /* setsockopt */
     case 55: return linux_getsockopt(a0, a1, a2, a3, r3_arg4); /* getsockopt */
     case 230: return linux_clock_nanosleep(a0, a1, a2, a3); /* clock_nanosleep */
@@ -3290,12 +3787,21 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
       uint64_t addr = shm_attach((int)a0);
       return addr ? (long)addr : -EINVAL;
     }
+    case SYS_SHM_INFO: {
+      int slot = (int)a0;
+      if (slot < 0 || slot >= RING3_SHM_SLOTS || !shm[slot].used) return -EINVAL;
+      return (long)shm[slot].pages;
+    }
+    case SYS_SHM_DETACH: return shm_detach((int)a0);
     case SYS_WIN_POLL: {
       win_event_t ev;
       int r = winipc_poll((int)a0, &ev);
       if (r == 1 && user_put(a1, &ev, sizeof ev) != 0) return -EFAULT;
       return r < 0 ? -EBADF : (long)r;   /* EBADF = the window is gone */
     }
+    case SYS_SYNC: rfs_sync(); return 0;
+    case SYS_MEMINFO:
+      return (long)(((pmm_total_pages() & 0xFFFFFFFFu) << 32) | (pmm_free_pages() & 0xFFFFFFFFu));
     case SYS_WIN_PRESENT: winipc_present((int)a0); return 0;
     case SYS_WIN_CLOSE:   winipc_close((int)a0); return 0;
   }
@@ -3496,6 +4002,23 @@ void ring3_fault(uint64_t *f) {
   uint64_t cr2 = 0;
   __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
 
+  /* Serve the fault *before* saying anything about it.
+   *
+   * A demand-paged heap page is not news: it is the mechanism working. This used
+   * to print two serial lines per page before paging it in, and at 115200 baud
+   * that is ~2 ms a page - touching 40 MB of heap took three minutes, and every
+   * program that allocates looked slow. Print only what could not be served. */
+  if ((cs & 3) == 3) {
+    /* A *write* to a page that is present but read-only, in a space that shares
+     * it, is the other half of fork: the copy happens now and the instruction
+     * retries. Checked before the not-present case because the page is there -
+     * what it lacks is permission, and permission is ours to grant. */
+    if ((err & 1) && (err & 2) && cow_fault(cr2 & ~0xFFFULL)) return;
+
+    /* Not-present faults inside a SYS_VM_ALLOC region are demand paging. */
+    if (!(err & 1) && vm_fault_in(cr2, err)) return;
+  }
+
   serial_puts("[ring3] fault: rip=");
   serial_puthex(rip);
   serial_puts(" cs=");
@@ -3516,24 +4039,6 @@ void ring3_fault(uint64_t *f) {
   serial_puts("\n");
 
   if ((cs & 3) == 3) {
-    /* Not-present faults inside a SYS_VM_ALLOC region are demand paging, not a
-     * violation: map the page and let the instruction retry. */
-    /* A *write* to a page that is present but read-only, in a space that shares
-     * it, is the other half of fork: the copy happens now and the instruction
-     * retries. Checked before the not-present case because the page is there -
-     * what it lacks is permission, and permission is ours to grant. */
-    if ((err & 1) && (err & 2) && cow_fault(cr2 & ~0xFFFULL)) return;
-
-    if (!(err & 1) && vm_fault_in(cr2, err)) {
-      static int shown;
-      if (shown < 4) {                 /* a few, then stay quiet */
-        shown++;
-        serial_puts("[vm] page faulted in at ");
-        serial_puthex(cr2);
-        serial_puts("\n");
-      }
-      return;
-    }
 
     /* A user task stepped outside its window. Kill that task only: the
      * compositor and the other tasks keep running. */
@@ -3668,9 +4173,16 @@ static void pt_selftest(void) {
     iso_report(labels[i], ok);
   }
 
+  /* This used to probe twenty pages below the top, which was unmapped while the
+   * stack was 32 KB. The stack is 256 KB now, so that probe landed on a stack
+   * page and the check failed for a reason that had nothing to do with the
+   * thing it tests. Probe the gap between the surface strip and the stack
+   * instead: nothing maps there in a fresh address space, whatever the stack
+   * size grows to. */
   char b[8] = { 0 };
+  uint64_t gap = RING3_SURF_BASE + (uint64_t)RING3_SURF_SLOTS * RING3_SURF_AREA;
   iso_report("a write to an unmapped page is refused, not attempted",
-             ring3_copy_to_mm(m->cr3, top - 20 * 0x1000, b, 8) != 0);
+             ring3_copy_to_mm(m->cr3, gap + 0x1000, b, 8) != 0);
 
   fdtable_free(m->fds); mm_free_tables(m); kfree(m);
 }
@@ -3687,7 +4199,26 @@ static void netpump(void) {
   }
 }
 
+/* Which space an endpoint belongs to. The socket layer knows nothing about address
+ * spaces, so it asks this when it creates one. */
+static void *space_of_current(void) {
+  task_t *t = task_at(task_current());
+  return t ? (void *)t->mm : 0;
+}
+
+/* SO_PEERCRED's source. There is one user and no uid split, so identity is the
+ * pid: the uid and gid fields are reported as 0 because claiming a privilege
+ * boundary that does not exist would be worse than saying there is none. */
+static void cred_of_current(int *pid, int *uid, int *gid) {
+  task_t *t = task_at(task_current());
+  *pid = t ? t->id : 0;
+  *uid = 0;
+  *gid = 0;
+}
+
 void ring3_init(void) {
+  sock_set_owner_hook(space_of_current);
+  sock_set_cred_hook(cred_of_current);
   kpml4_phys = ring3_read_cr3();
   kpml4_virt = (uint64_t *)(hhdm_offset + kpml4_phys);
 

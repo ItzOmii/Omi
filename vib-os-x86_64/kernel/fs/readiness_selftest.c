@@ -283,7 +283,7 @@ void sock_readiness_selftest(void) {
   sock_connect(s, 0, noip, 0);
   int fd = fd_socket(t);                     /* a real descriptor, for the pin */
   chk("descriptor exists", fd >= 0);
-  ofile_t *o = t->fd[fd];
+  ofile_t *o = fd_at(t, fd);
   sock_close(o->sock);                       /* reuse: point the ofile at `s` */
   o->sock = s;
   ofile_pin(o);                              /* a task is inside a call */
@@ -298,7 +298,7 @@ void sock_readiness_selftest(void) {
   struct socket *s2 = sock_new();
   sock_connect(s2, 0, noip, 0);
   int fd2 = fd_socket(t);
-  ofile_t *o2 = t->fd[fd2];
+  ofile_t *o2 = fd_at(t, fd2);
   sock_close(o2->sock);
   o2->sock = s2;
   w_sock = s2; w_want = OMI_POLLIN; w_deadline = 40;
@@ -379,7 +379,7 @@ void sock_readiness_selftest(void) {
   int probe = (int)sock_recv(r, wbuf, 4, 0);
   chk("a fresh connection reports would-block, not EOF", probe == -EAGAIN);
   chk("and it connected", crc == 0);
-  ofile_t *ro = t->fd[rfd];
+  ofile_t *ro = fd_at(t, rfd);
   sock_close(ro->sock);
   ro->sock = r;
   wt = t; wfd = rfd; wlen = sizeof wbuf;

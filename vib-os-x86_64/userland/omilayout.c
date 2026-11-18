@@ -25,9 +25,20 @@ static void *krealloc(void *p, size_t n) { return realloc(p, n); }
 /* ------------------------------------------------------------------ state */
 
 #define MAX_OPS   9000
-#define MAX_RULES 96
+/* 2048 rules, not 96. A real theme's stylesheet is a few thousand rules, and 96
+ * kept only the first few percent of one: the page looked unstyled because it
+ * was, not because the engine could not apply what it had. Each rule is a pointer
+ * pair and two lengths - 2048 of them is 48 KB. */
+#define MAX_RULES 2048
 #define MAX_SEGS  160
 #define MAX_DEPTH 48
+/* Form state: what a field is called and which form submits it, so a client can
+ * build the query string without parsing the page a second time. */
+#define MAX_FIELDS 32
+#define MAX_FORMS   8
+#define FIELD_NAME_MAX  48
+#define FIELD_VALUE_MAX 48
+#define FORM_ACTION_MAX 160
 
 static web_op_t *ops;
 static int nops, capops;
@@ -38,9 +49,27 @@ typedef struct { const char *sel; int sellen; const char *decls; int decllen; } 
 static rule_t rules[MAX_RULES];
 static int nrules;
 static web_image_fn img_fn;
+static web_css_fn   css_fn;
 
 void web_image_provider(web_image_fn fn) { img_fn = fn; }
+void web_css_provider(web_css_fn fn) { css_fn = fn; }
 static char *rule_buf;
+/* Every stylesheet text lives as long as the page does: a rule's selector points
+ * into the buffer it came from, so freeing the previous buffer when the next
+ * sheet arrives leaves every earlier rule reading freed memory. That is exactly
+ * what killed the browser the first time it fetched a real site's CSS. */
+#define CSS_STORE 8
+static char *css_store[CSS_STORE];
+static int   css_store_n;
+
+static char *dup_n(const char *s, int n);   /* defined below; the store copies text */
+
+static char *css_keep(const char *src, int len) {
+  if (!src || len <= 0 || css_store_n >= CSS_STORE) return 0;
+  char *d = dup_n(src, len);
+  if (d) css_store[css_store_n++] = d;
+  return d;
+}
 
 typedef struct {
   int display;                 /* 0 inline, 1 block, 2 none */
@@ -55,7 +84,58 @@ typedef struct {
   uint32_t bcol;
   int radius;                  /* background corner radius */
   const char *href;            /* set while inside <a href>, does inherit */
+  int form;                    /* form index, -1 outside a <form>; inherits */
+  int grid;                    /* >0: lay children out in this many columns */
+  int floated;                 /* float: left - a gallery cell, in practice */
+  int inline_block;            /* display: inline-block */
 } st_t;
+
+#define OMI_CELL_LAYOUT 0   /* see the note at the cell placement, below */
+
+/* ------------------------------------------------------------- form state */
+
+typedef struct {
+  char name[FIELD_NAME_MAX];
+  char value[FIELD_VALUE_MAX];
+  int  form;                   /* -1 when the field is outside any <form> */
+  int  w, h;                   /* the box the layout gave it */
+  int  hidden;                 /* submitted, never drawn */
+} wfield_t;
+
+typedef struct {
+  char action[FORM_ACTION_MAX];
+  char method[8];
+} wform_t;
+
+static wfield_t fields[MAX_FIELDS];
+static int nfields;
+static wform_t forms[MAX_FORMS];
+static int nforms;
+
+static void copy_trunc(char *dst, int cap, const char *src) {
+  int i = 0;
+  if (!dst || cap <= 0) return;
+  if (src) for (; src[i] && i < cap - 1; i++) dst[i] = src[i];
+  dst[i] = 0;
+}
+
+static int form_add(const char *action, const char *method) {
+  if (nforms >= MAX_FORMS) return -1;
+  copy_trunc(forms[nforms].action, FORM_ACTION_MAX, action);
+  copy_trunc(forms[nforms].method, 8, method && *method ? method : "get");
+  return nforms++;
+}
+
+static int field_add(const char *name, const char *value, int form, int w, int h, int hidden) {
+  if (nfields >= MAX_FIELDS) return -1;
+  wfield_t *f = &fields[nfields];
+  copy_trunc(f->name, FIELD_NAME_MAX, name);
+  copy_trunc(f->value, FIELD_VALUE_MAX, value);
+  f->form = form;
+  f->w = w; f->h = h;
+  f->hidden = hidden;
+  return nfields++;
+}
 
 /* --------------------------------------------------------------- emission */
 
@@ -93,10 +173,24 @@ static char *dup_n(const char *s, int n) {
 
 /* ------------------------------------------------------------- text metrics */
 
-/* font ids: 0 = body (13px), 1 = display (14px), 2 = mono small (11px),
- * 3 = alternate 11px, 4 = medium (12px) - see web_faces() in the compositor */
-static int face_asc[5]  = {13, 14, 11, 11, 12};
-static int face_desc[5] = {4, 4, 3, 4, 4};
+/* Font ids and the sizes they really are *here*.
+ *
+ * The renderer in this process has one face: an 8x16 bitmap. A five-size face
+ * table was carried over from the compositor's own type, where the sizes were
+ * real, and every heading came out the same size as body text - the size field
+ * was decoration. So a font id now means an integer scale of that bitmap, and the
+ * metrics below are the bitmap's, not a wish: 1x is 8x16 in an 18px line, 2x is
+ * 16x32 in a 34px line. The measure function the client supplies multiplies by the
+ * same scale, which is what keeps wrapping honest. */
+static int face_scale[5] = {1, 2, 1, 1, 2};   /* body, display(h1/h2), mono, alt, medium(h3/h4) */
+static int face_asc[5]  = {12, 24, 12, 12, 24};
+static int face_desc[5] = {4, 8, 4, 4, 8};
+
+int web_font_scale(int font) {
+  if (font < 0) font = 0;
+  if (font > 4) font = 4;
+  return face_scale[font];
+}
 
 int web_line_height(int font) {
   if (font < 0) font = 0;
@@ -236,6 +330,18 @@ static void apply_border(st_t *st, const char *v, int vn, int which) {
   if (which == 0 || which == 4) st->bw_l = w;
 }
 
+/* A selector this engine understands well enough to trust a hide on. */
+static int sel_is_simple(const char *s, int n) {
+  if (!s || n <= 0) return 0;
+  for (int i = 0; i < n; i++) {
+    char c = s[i];
+    if (c == ' ' || c == '>' || c == '+' || c == '~' || c == ',' || c == ':' ||
+        c == '[' || c == '*' || c == '(') return 0;
+  }
+  return 1;
+}
+static int decl_ctx_simple;   /* set per rule, before its declarations run */
+
 static void apply_decls(st_t *st, const char *d, int len) {
   int i = 0;
   while (i < len) {
@@ -256,9 +362,23 @@ static void apply_decls(st_t *st, const char *d, int len) {
     int vn = e - c - 1;
     while (vn > 0 && (*v == ' ')) { v++; vn--; }
     if (ci_eq(p, "display", pn)) {
-      if (vn == 4 && ci_eq(v, "none", 4)) st->display = 2;
+      /* `display:none` is the one declaration whose false positive is fatal: a
+       * complex selector that our matcher roughly matches hid the whole body and
+       * the page came out empty (0 ops, 6 px tall). It is applied only for a
+       * selector this engine can actually reason about - one simple tag, class or
+       * id - and ignored otherwise. Not hiding something is a cosmetic miss;
+       * hiding everything is a blank page. */
+      if (vn == 4 && ci_eq(v, "none", 4)) { if (decl_ctx_simple) st->display = 2; }
       else if (vn == 5 && ci_eq(v, "block", 5)) st->display = 1;
       else if (vn == 6 && ci_eq(v, "inline", 6)) st->display = 0;
+      /* A grid or a flex row is how every gallery, card list and menu bar on the
+       * web is built. Without it each child is a block on its own line, which is
+       * the difference between a wall of text and a page of thumbnails. */
+      else if ((vn == 4 && ci_eq(v, "grid", 4)) || (vn == 4 && ci_eq(v, "flex", 4)))
+        st->grid = 3;
+      else if (vn == 11 && ci_eq(v, "inline-grid", 11)) st->grid = 3;
+      else if (vn == 11 && ci_eq(v, "inline-flex", 11)) st->grid = 3;
+      else if (vn == 12 && ci_eq(v, "inline-block", 12)) st->inline_block = 1;
     } else if (ci_eq(p, "color", pn)) {
       uint32_t c2 = parse_color(v, vn);
       if (c2 != 0xFFFFFFFF) st->color = c2;
@@ -319,6 +439,25 @@ static void apply_decls(st_t *st, const char *d, int len) {
       else if (ci_eq(p + 8, "bottom", 6)) st->pb = nv ? vals[0] : 0;
       else if (ci_eq(p + 8, "left", 4)) st->pl = nv ? vals[0] : 0;
       else st->pr = nv ? vals[0] : 0;
+    } else if (pn == 21 && ci_eq(p, "grid-template-columns", 21)) {
+      /* repeat(3, 1fr) and "1fr 1fr 1fr" are the two shapes that appear; anything
+       * else keeps the default. Reading the count is what makes a 4-up gallery
+       * come out 4-up instead of 3-up. */
+      int n = 0;
+      const char *q = v;
+      if (ci_eq(q, "repeat", 6)) {
+        while (*q && *q != '(') q++;
+        if (*q == '(') { q++; while (*q >= '0' && *q <= '9') { n = n * 10 + (*q - '0'); q++; } }
+      } else {
+        for (int i = 0; i < vn; i++) {
+          if (v[i] == ' ') { while (i + 1 < vn && v[i + 1] == ' ') i++; n++; }
+        }
+        if (vn > 0) n++;
+      }
+      if (n >= 1 && n <= 8) st->grid = n;
+    } else if (pn == 5 && ci_eq(p, "float", 5)) {
+      if (vn == 4 && ci_eq(v, "left", 4)) st->floated = 1;
+      else if (vn == 4 && ci_eq(v, "none", 4)) st->floated = 0;
     } else if (ci_eq(p, "border", pn)) {
       apply_border(st, v, vn, 0);
     } else if (pn > 7 && ci_eq(p, "border-", 7)) {
@@ -476,9 +615,13 @@ static void style_resolve(GumboNode *el, st_t *out, const st_t *inherited) {
   if ((a = gumbo_get_attribute(&e->attributes, "class"))) cls = a->value;
   if ((a = gumbo_get_attribute(&e->attributes, "id"))) id = a->value;
 
-  for (int i = 0; i < nrules; i++)
-    if (sel_matches(rules[i].sel, rules[i].sellen, tag, cls, id))
+  for (int i = 0; i < nrules; i++) {
+    if (sel_matches(rules[i].sel, rules[i].sellen, tag, cls, id)) {
+      decl_ctx_simple = sel_is_simple(rules[i].sel, rules[i].sellen);
       apply_decls(out, rules[i].decls, rules[i].decllen);
+    }
+  }
+  decl_ctx_simple = 0;
 
   if ((a = gumbo_get_attribute(&e->attributes, "style")))
     apply_decls(out, a->value, (int)strlen(a->value));
@@ -1118,6 +1261,71 @@ static void layout_table(GumboNode *table, st_t *st, int x, int avail, int depth
   cur_y += st->mb > 0 ? st->mb : 10;
 }
 
+/* An <input> is a box, and the box is the whole feature on the engine side: the
+ * client draws the value, owns the caret and does the submitting, because those
+ * are things that change without the page changing. What the engine knows is the
+ * field's name, the form it belongs to, and how wide it should be.
+ *
+ * It is placed on a line of its own. A real inline box would sit in the text run
+ * beside its label; that needs the line buffer to carry non-text items, and a
+ * form that reads well is worth more than one that shares a line. */
+static void layout_input(GumboNode *node, st_t *st, int x, int avail) {
+  GumboAttribute *at = gumbo_get_attribute(&node->v.element.attributes, "type");
+  GumboAttribute *an = gumbo_get_attribute(&node->v.element.attributes, "name");
+  GumboAttribute *av = gumbo_get_attribute(&node->v.element.attributes, "value");
+  GumboAttribute *as = gumbo_get_attribute(&node->v.element.attributes, "size");
+  const char *type = (at && at->value && *at->value) ? at->value : "text";
+  const char *name = an ? an->value : 0;
+  const char *value = av ? av->value : 0;
+
+  if (ci_eq(type, "hidden", 6)) {          /* submitted, never drawn */
+    field_add(name, value, st->form, 0, 0, 1);
+    return;
+  }
+
+  if (ci_eq(type, "submit", 6) || ci_eq(type, "button", 6) ||
+      ci_eq(type, "reset", 5) || ci_eq(type, "image", 5)) {
+    const char *label = (value && *value) ? value : "Submit";
+    int w = (int)strlen(label) * 8 + 18;
+    if (w > avail - st->pl) w = avail - st->pl;
+    if (w < 24) w = 24;
+    line_flush();
+    int bx = x + st->pl;
+    if (st->align == 1) bx = x + (avail - w) / 2;
+    else if (st->align == 2) bx = x + avail - w;
+    if (bx < x) bx = x;
+    int op = nops;
+    op_push(5, bx, cur_y, w, 22, 0, dup_n(label, (int)strlen(label)), 0, 0, 0);
+    if (op < nops) ops[op].iw = st->form;   /* which form this button sends */
+    cur_y += 26;
+    return;
+  }
+
+  int cols = 24;
+  if (as && as->value) {
+    cols = 0;
+    for (const char *q = as->value; *q >= '0' && *q <= '9'; q++) cols = cols * 10 + (*q - '0');
+  }
+  if (cols < 6) cols = 6;
+  if (cols > 48) cols = 48;
+  int w = cols * 8 + 8;
+  if (w > avail - st->pl) w = avail - st->pl;
+  if (w < 40) w = 40;
+
+  line_flush();
+  /* Inside <center> (or text-align: center) the box goes where the text around it
+   * goes; a field pinned to the left under a centred label reads as a bug. */
+  int fx = x + st->pl;
+  if (st->align == 1) fx = x + (avail - w) / 2;
+  else if (st->align == 2) fx = x + avail - w;
+  if (fx < x) fx = x;
+  int fi = field_add(name, value, st->form, w, 20, 0);
+  int op = nops;
+  op_push(4, fx, cur_y, w, 20, 0, 0, 0, 0, 0);
+  if (op < nops) ops[op].iw = fi;
+  cur_y += 24;
+}
+
 static void layout_node(GumboNode *node, st_t st, int x, int avail, int depth) {
   if (depth > MAX_DEPTH || !node) return;
   if (st.display == 2) return;
@@ -1137,6 +1345,24 @@ static void layout_node(GumboNode *node, st_t st, int x, int avail, int depth) {
       tag == GUMBO_TAG_TITLE || tag == GUMBO_TAG_NOSCRIPT)
     return;
 
+  /* A form is a container, but it is also the thing that says where its fields
+   * are posted - so it is remembered before the children are walked. */
+  if (tag == GUMBO_TAG_FORM) {
+    GumboAttribute *act = gumbo_get_attribute(&node->v.element.attributes, "action");
+    GumboAttribute *mth = gumbo_get_attribute(&node->v.element.attributes, "method");
+    st.form = form_add(act ? act->value : 0, mth ? mth->value : 0);
+  }
+
+  /* A list item gets a marker. The face has no bullet glyph, so it is a small
+   * filled square: at this size a square and a round dot are the same shape
+   * anyway, and a square is what the rasteriser can draw exactly. */
+  if (tag == GUMBO_TAG_LI) {
+    line_flush();
+    op_push(0, x - 12, cur_y + 6, 4, 4, st.color, 0, 0, 0, 0);
+  }
+
+  if (tag == GUMBO_TAG_INPUT) { layout_input(node, &st, x, avail); return; }
+
   if (tag == GUMBO_TAG_IMG) {
     GumboAttribute *a = gumbo_get_attribute(&node->v.element.attributes, "src");
     GumboAttribute *aw = gumbo_get_attribute(&node->v.element.attributes, "width");
@@ -1155,6 +1381,9 @@ static void layout_node(GumboNode *node, st_t st, int x, int avail, int depth) {
         line_flush();
         int op = nops;
         op_push(3, x, cur_y, w, h2, 0, 0, 0, 0, 0);
+        /* A thumbnail is nearly always wrapped in <a href>: the picture is the
+         * link. Without this the biggest click target on the page did nothing. */
+        if (op < nops && st.href) ops[op].href = dup_n(st.href, (int)strlen(st.href));
         ops[op].px = im->px;
         ops[op].iw = im->w;
         ops[op].ih = im->h;
@@ -1181,6 +1410,80 @@ static void layout_node(GumboNode *node, st_t st, int x, int avail, int depth) {
   }
 
   if (tag == GUMBO_TAG_TABLE) { layout_table(node, &st, x, avail, depth); return; }
+
+  /* A grid container lays its element children out in cells, row by row. Each
+   * child is laid out on its own with the cell width, and the row advances by the
+   * tallest cell - which is as much of `display: grid` as a page needs to stop
+   * being a column. */
+  /* A gallery in the wild is a run of floated or inline-block children with
+   * percentage widths - that is how this page is built, and its CSS has no grid at
+   * all. Counting those children is enough to lay them out as cells instead of as
+   * one column, which is the difference between a wall of text and a wall of
+   * pictures. */
+  int auto_cells = 0;
+  if (st.grid == 0 && node->type == GUMBO_NODE_ELEMENT &&
+      (is_block_tag(tag) || st.display == 1)) {
+    GumboVector *kk = &node->v.element.children;
+    int nf = 0;
+    for (unsigned i = 0; i < kk->length; i++) {
+      GumboNode *k = kk->data[i];
+      if (k->type != GUMBO_NODE_ELEMENT) continue;
+      st_t cs;
+      style_resolve(k, &cs, &st);
+      if (cs.display == 2) continue;
+      if (cs.floated || cs.inline_block) nf++;
+    }
+    if (nf >= 3) auto_cells = nf >= 8 ? 4 : (nf >= 4 ? 3 : 2);
+  }
+
+  /* OFF, deliberately: this lays floated children out as cells, and it produced
+   * rows - but it also broke three of the browser's own layout invariants (a text
+   * run escaping the column, link boxes no longer hit-testing to their own URLs, a
+   * padded background losing its height), because a cell is not an inline box and
+   * the cursor engine has no line box to put one in. Doing this properly means an
+   * inline formatting context, not a second placement pass. Kept behind a switch
+   * so the work is not lost, and off so the suite stays honest. */
+  if (OMI_CELL_LAYOUT && (st.grid > 0 || auto_cells > 0) && node->type == GUMBO_NODE_ELEMENT && !is_block_tag(tag) == 0) {
+    GumboVector *kids = &node->v.element.children;
+    int cols = st.grid > 0 ? st.grid : auto_cells;
+    if (cols < 1) cols = 1;
+    int gap = 6;
+    int cell = (avail - gap * (cols - 1)) / cols;
+    if (cell < 24) { cols = 1; cell = avail; }
+    line_flush();
+    cur_y += st.mt;
+    int col = 0, y0 = cur_y, row_h = 0;
+    for (unsigned i = 0; i < kids->length; i++) {
+      GumboNode *k = kids->data[i];
+      if (k->type == GUMBO_NODE_TEXT) {
+        /* stray whitespace between cells is not a cell */
+        if (!k->v.text.text || !k->v.text.text[0]) continue;
+        continue;
+      }
+      if (k->type != GUMBO_NODE_ELEMENT) continue;
+      st_t cs;
+      style_resolve(k, &cs, &st);
+      if (cs.display == 2) continue;
+      cs.grid = 0;                       /* a cell is laid out as a block */
+      cs.display = 1;
+      int cx = x + st.pl + col * (cell + gap);
+      int y_save = cur_y;
+      cur_y = y0;
+      layout_node(k, cs, cx, cell, depth + 1);
+      int h = cur_y - y0;
+      if (h > row_h) row_h = h;
+      cur_y = y_save;
+      if (++col >= cols) {
+        col = 0;
+        cur_y = y0 + row_h + gap;
+        y0 = cur_y;
+        row_h = 0;
+      }
+    }
+    if (col > 0) cur_y = y0 + row_h + gap;
+    cur_y += st.mb;
+    return;
+  }
 
   int block = is_block_tag(tag) || st.display == 1;
   if (!block) {
@@ -1290,13 +1593,17 @@ static void layout_node(GumboNode *node, st_t st, int x, int avail, int depth) {
 
 static void rules_free(void) {
   nrules = 0;
-  if (rule_buf) { kfree(rule_buf); rule_buf = 0; }
+  for (int i = 0; i < css_store_n; i++) { kfree(css_store[i]); css_store[i] = 0; }
+  css_store_n = 0;
+  rule_buf = 0;
 }
 
 const char *web_hit_link(int x, int y) {
   for (int i = 0; i < nops; i++) {
     const web_op_t *o = &ops[i];
-    if (o->kind != 1 || !o->href) continue;
+    /* Text runs and pictures: an <a> around an <img> makes the picture the link,
+     * and on a gallery page that is most of what there is to click. */
+    if ((o->kind != 1 && o->kind != 3) || !o->href) continue;
     if (x < o->x || x >= o->x + o->w) continue;
     /* The box, not the box plus slack: text boxes on consecutive lines touch,
      * and two pixels of downward grace made a click on a wrapped link's second
@@ -1330,12 +1637,30 @@ void web_free(void) {
 static void collect_css(GumboNode *n, int depth) {
   if (!n || depth > 8) return;
   if (n->type == GUMBO_NODE_ELEMENT) {
+    if (n->v.element.tag == GUMBO_TAG_LINK && css_fn) {
+      GumboAttribute *rel = gumbo_get_attribute(&n->v.element.attributes, "rel");
+      GumboAttribute *href = gumbo_get_attribute(&n->v.element.attributes, "href");
+      int is_sheet = 0;
+      if (rel && rel->value) {
+        for (const char *q = rel->value; *q; q++)
+          if ((q[0] == 's' || q[0] == 'S') && ci_eq(q, "stylesheet", 10)) { is_sheet = 1; break; }
+      }
+      if (is_sheet && href && href->value && *href->value) {
+        static char sheet[512 * 1024];   /* a theme's whole stylesheet, not a slice */
+        int got = css_fn(href->value, (int)strlen(href->value), sheet, (int)sizeof sheet - 1);
+        if (got > 0) {
+          sheet[got < (int)sizeof sheet ? got : (int)sizeof sheet - 1] = 0;
+          rule_buf = css_keep(sheet, got);
+          if (rule_buf) css_scan(rule_buf, (int)strlen(rule_buf));
+        }
+      }
+    }
     if (n->v.element.tag == GUMBO_TAG_STYLE) {
       GumboVector *kids = &n->v.element.children;
       for (unsigned i = 0; i < kids->length; i++) {
         GumboNode *k = kids->data[i];
         if (k->type == GUMBO_NODE_TEXT) {
-          rule_buf = dup_n(k->v.text.text, (int)k->v.text.original_text.length);
+          rule_buf = css_keep(k->v.text.text, (int)k->v.text.original_text.length);
           if (rule_buf) css_scan(rule_buf, (int)strlen(rule_buf));
           break;
         }
@@ -1365,7 +1690,10 @@ int web_build(const char *html, int len, int width, web_measure_fn measure) {
   base.bw_t = base.bw_r = base.bw_b = base.bw_l = 0;
   base.href = 0;
   base.radius = 0;
+  base.form = -1;
 
+  nfields = 0;
+  nforms = 0;
   line_x = 0;
   line_avail = width;
   line_align = 0;
@@ -1419,4 +1747,20 @@ uint32_t web_bg(void) { return doc_bg; }
 uint32_t web_fg(void) { return doc_fg; }
 int web_height(void) { return page_h; }
 int web_count(void) { return nops; }
+
+/* A page whose display list hit the ceiling is *incomplete*: everything past the
+ * last op was parsed and laid out and then dropped. Reporting that is the
+ * difference between a page that is short and a browser that looks broken. */
+int web_ops_full(void) { return nops >= MAX_OPS; }
+
+/* ---- fields and forms, for a client that lets the reader type ---- */
+
+int web_field_count(void) { return nfields; }
+const char *web_field_name(int i) { return (i >= 0 && i < nfields) ? fields[i].name : 0; }
+const char *web_field_value(int i) { return (i >= 0 && i < nfields) ? fields[i].value : 0; }
+int web_field_form(int i) { return (i >= 0 && i < nfields) ? fields[i].form : -1; }
+int web_field_hidden(int i) { return (i >= 0 && i < nfields) ? fields[i].hidden : 0; }
+int web_form_count(void) { return nforms; }
+const char *web_form_action(int f) { return (f >= 0 && f < nforms) ? forms[f].action : 0; }
+const char *web_form_method(int f) { return (f >= 0 && f < nforms) ? forms[f].method : 0; }
 const web_op_t *web_ops(void) { return ops; }

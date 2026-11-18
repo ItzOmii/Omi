@@ -54,6 +54,24 @@ struct socket_ops {
    * ctx is, and the layer above never learns what the handle is. Without this,
    * a waiter can only be woken by its own deadline - which is not a wake. */
   void (*bind)(void *h, void (*cb)(void *, unsigned), void *ctx);
+
+  /* Descriptor passing (SCM_RIGHTS). Optional and NULL for a backend with no
+   * peer inside this kernel: a stream over the network has no other end's
+   * descriptor table to install into, and saying -ENOTSUP is honest where
+   * accepting the descriptor and dropping it would not be.
+   *
+   * send_ctl takes one reference per description on success only; recv_ctl hands
+   * back references the caller must install or release. */
+  int  (*send_ctl)(void *h, void **ofiles, int n);
+  int  (*recv_ctl)(void *h, void **out, int max);
+  /* Undo the last send_ctl, for the case where the bytes it rode on never moved.
+   * Optional: without it the message stays queued and travels with the next
+   * write, which is wrong but not silent. */
+  int  (*cancel_ctl)(void *h);
+  /* Who is on the other end, if this transport has endpoints that belong to
+   * processes at all. NULL means "no such notion here" and becomes -ENOTSUP,
+   * which is the honest answer for TCP: its peer is an address, not a process. */
+  int  (*peer_cred)(void *h, int *pid, int *uid, int *gid);
 };
 
 /* The backend in use. Never NULL once the kernel is up. */

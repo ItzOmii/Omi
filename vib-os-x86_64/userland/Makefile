@@ -34,6 +34,16 @@ PROGS += memfdtest.elf
 PROGS += socktest.elf
 PROGS += tlsget.elf
 PROGS += surftest.elf
+PROGS += vmtest.elf
+PROGS += shmtest.elf
+PROGS += surfbig.elf
+PROGS += unixpair.elf
+PROGS += scmtest.elf
+PROGS += unixname.elf
+PROGS += credtest.elf
+PROGS += formtest.elf
+PROGS += imgtest.elf
+PROGS += memtest.elf
 PROGS += omirender.elf
 PROGS += surfexit.elf
 # The browser's ring-3 half: TLS, Gumbo, layout, paint.
@@ -115,16 +125,71 @@ $(GUMBO_LIB): $(GUMBO_SRCS)
 
 # omilayout.c is the layout engine that used to run in the kernel, moved here
 # rather than rewritten: one copy in the tree, and its CSS subset comes with it.
-ominet.elf: ominet.c fetch.c fetch.h omitext.h glyphs.h omilayout.c omilayout.h roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB)
+ominet.elf: ominet.c omifont.c omifont.h imgdec.c imgdec.h stbimg.c ../kernel/include/buildstamp.h fetch.c fetch.h omitext.h glyphs.h omilayout.c omilayout.h roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB)
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping ominet"; exit 0; }
-	@musl-gcc -O2 -static -no-pie $(BEARSSL_INC) -Ishim -I$(GUMBO_USR)/src -o $@ \
-	  ominet.c fetch.c omilayout.c roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB) \
+	@musl-gcc -O2 -static -no-pie $(BEARSSL_INC) -Ishim -I$(GUMBO_USR)/src -I../kernel/include/stb -o $@ \
+	  ominet.c omifont.c imgdec.c stbimg.c fetch.c omilayout.c roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB) \
 	  && echo "built $@ ($$(stat -c%s $@) bytes)"
 
 tlsget.elf: tlsget.c roots_user.o $(BEARSSL_LIB)
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping tlsget"; exit 0; }
 	@musl-gcc -O2 -static -no-pie $(BEARSSL_INC) -Ishim -o $@ tlsget.c roots_user.o $(BEARSSL_LIB) \
 	  && echo "built $@ ($$(stat -c%s $@) bytes)"
+
+# The address window itself: reserve more than the old 256 MB and prove both
+# ends of it are real, because every engine that reserves a gigabyte depends on
+# this and a wrong constant shows up as a fault deep inside the engine.
+# Surfaces bigger than a demo window: the client window size a browser needs.
+memtest.elf: memtest.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping memtest"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
+
+imgtest.elf: imgtest.c imgdec.c imgdec.h
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping imgtest"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ imgtest.c imgdec.c
+	@echo "built $@"
+
+formtest.elf: formtest.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping formtest"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $< omilayout.c $(wildcard $(CURDIR)/../kernel/lib/gumbo/src/*.c) -I../kernel/lib/gumbo/src
+	@echo "built $@"
+
+credtest.elf: credtest.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping credtest"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
+
+unixname.elf: unixname.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping unixname"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
+
+scmtest.elf: scmtest.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping scmtest"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
+
+unixpair.elf: unixpair.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping unixpair"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
+
+surfbig.elf: surfbig.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping surfbig"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
+
+# Shared regions: the hand-off primitive between a browser and its renderers.
+shmtest.elf: shmtest.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping shmtest"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
+
+vmtest.elf: vmtest.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping vmtest"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
 
 # The first program that paints its own pixels: a surface, presented whole and
 # then by damage rectangle. Plain musl, no BearSSL, so it builds in one step.

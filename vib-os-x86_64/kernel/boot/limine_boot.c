@@ -8,6 +8,7 @@
 #include "../include/gdt.h"
 #include "../include/idt.h"
 #include "../include/task.h"
+#include "../include/devboot.h"   /* OMI_DEV_BOOT: 1 spawns the browser and nothing else */
 #include "../include/acpi.h"
 #include "../include/string.h"
 #include "../include/types.h"
@@ -458,6 +459,7 @@ void _start(void) {
    * runs a normal write/yield/exit path; "probe" reads a kernel address and
    * must be killed for it, without taking the system down. */
   ring3_init();
+#if !OMI_DEV_BOOT
   ring3_spawn_elf("init",  "init.elf", 0);
   ring3_spawn_elf("probe", "init.elf", 1);
   ring3_spawn_elf("spin",  "init.elf", 2);
@@ -534,11 +536,34 @@ void _start(void) {
   ring3_spawn_elf("memfdtest", "memfdtest.elf", 0);
   ring3_spawn_elf("socktest", "socktest.elf", 0);
   ring3_spawn_elf("tlsget", "tlsget.elf", 0);
+  /* The address window, before anything that allocates from it. */
+  ring3_spawn_elf("vmtest", "vmtest.elf", 0);
+  ring3_spawn_elf("shmtest", "shmtest.elf", 0);
+  ring3_spawn_elf("surfbig", "surfbig.elf", 0);
+  ring3_spawn_elf("disk",   "init.elf", 10);
+  ring3_spawn_elf("unixpair", "unixpair.elf", 0);
+  ring3_spawn_elf("scm",      "scmtest.elf", 0);
+  ring3_spawn_elf("unixname", "unixname.elf", 0);
+  ring3_spawn_elf("cred",     "credtest.elf", 0);
+  ring3_spawn_elf("form",     "formtest.elf", 0);
+  ring3_spawn_elf("img",      "imgtest.elf", 0);
+  ring3_spawn_elf("mem",      "memtest.elf", 0);
   ring3_spawn_elf("surftest", "surftest.elf", 0);
   ring3_spawn_elf("omirender", "omirender.elf", 0);
   ring3_spawn_elf("surfexit", "surfexit.elf", 0);
-  ring3_spawn_elf("ominet", "ominet.elf", 0);
   }
+#endif /* !OMI_DEV_BOOT */
+
+  ring3_spawn_elf("ominet", "ominet.elf", 0);
+#if OMI_DEV_BOOT
+  /* The two suites that own the socket paths the browser depends on, so a dev
+   * boot still proves they hold - they need no network and cost a second. */
+  ring3_spawn_elf("unixname", "unixname.elf", 0);
+  ring3_spawn_elf("cred",     "credtest.elf", 0);
+  ring3_spawn_elf("form",     "formtest.elf", 0);
+  ring3_spawn_elf("img",      "imgtest.elf", 0);
+  ring3_spawn_elf("mem",      "memtest.elf", 0);
+#endif
 
   serial_puts("Starting main loop...\n");
 

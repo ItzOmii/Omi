@@ -22,8 +22,19 @@
 #include "task.h"
 #include "errno.h"
 #include "gui.h"        /* serial_puts */
+#include "unixpair.h"
+#include "../include/unixname.h"   /* AF_UNIX socketpair */
 
-#define SOCKET_MAX 24
+/* 24 sockets was sized for "a browser, a few connections and the desktop's own".
+ * A socketpair spends two per helper process and a multi-process program makes
+ * one per child, so the pool has to be an order of magnitude past that. 96 is
+ * ~40 KB of BSS. */
+/* 96 sockets, 256 pipes. Raising this to 256 was tried: the socket end held, but
+ * the *transmit* path did not - with that many connections live the e1000 ring
+ * runs dry during concurrent TLS handshakes ("seg tx failed", "short write"), and
+ * the page load fails with no reply. The NIC's descriptor ring is the next wall,
+ * and it is a driver fix, not a table size. */
+#define SOCKET_MAX 96
 
 struct sock_waiter {
   int      task;      /* task id that registered */
@@ -51,6 +62,12 @@ struct socket {
    * never be woken by, or wake anyone onto, the next one. */
   uint32_t gen;
 
+  /* The address space that created this endpoint, so the teardown audit can ask
+   * "did anything belonging to that space survive it" without comparing global
+   * counts - which is wrong the moment a second process connects while the first
+   * one exits. */
+  void *owner;
+
   struct sock_waiter waiters[SOCK_WAITERS];
 
   /* Exactly one blocking read may be in flight on a socket. Two would both park,
@@ -66,6 +83,40 @@ struct socket {
 };
 
 static struct socket sockets[SOCKET_MAX];
+
+/* Who is creating endpoints right now. Set by the ring-3 layer, which is the only
+ * thing that knows what an address space is; NULL means "not owned by anyone",
+ * which is what kernel-internal sockets get. */
+static void *(*sock_owner_hook)(void);
+
+void sock_set_owner_hook(void *(*fn)(void)) { sock_owner_hook = fn; }
+
+/* Who is asking right now. Separate from the owner hook because it is asked at a
+ * different moment for a different reason: ownership is recorded when a socket is
+ * created, credentials when a connection is made. */
+static void (*sock_cred_hook)(int *, int *, int *);
+
+void sock_set_cred_hook(void (*fn)(int *, int *, int *)) { sock_cred_hook = fn; }
+
+void sock_cred_now(int *pid, int *uid, int *gid) {
+  *pid = 0; *uid = 0; *gid = 0;
+  if (sock_cred_hook) sock_cred_hook(pid, uid, gid);
+}
+
+int sock_set_peer_cred(struct socket *s, int pid, int uid, int gid) {
+  if (!s || !s->used) return -EBADF;
+  if (s->ops != sock_unix_ops() || !s->impl) return -ENOTSUP;
+  u_set_peer_cred(s->impl, pid, uid, gid);
+  return 0;
+}
+
+int sock_peer_cred(struct socket *s, int *pid, int *uid, int *gid) {
+  if (!s || !s->used) return -EBADF;
+  if (!s->ops || !s->ops->peer_cred || !s->impl) return -ENOTSUP;
+  return s->ops->peer_cred(s->impl, pid, uid, gid);
+}
+
+
 static uint32_t socket_gens[SOCKET_MAX];   /* survives release: identity is per slot */
 
 /* Test instrumentation. Compiled in but inert: only the readiness self-test
@@ -198,6 +249,7 @@ struct socket *sock_new(void) {
     if (sockets[i].used) continue;
     sockets[i].used = 1;
     sockets[i].impl = 0;
+    sockets[i].owner = sock_owner_hook ? sock_owner_hook() : 0;
     sockets[i].ops = socket_backend();
     sockets[i].closing = 0;
     sockets[i].read_owner = 0;
@@ -207,6 +259,124 @@ struct socket *sock_new(void) {
     return &sockets[i];
   }
   return 0;
+}
+
+/* AF_UNIX socketpair. Both endpoints exist from the start, so unlike connect()
+ * there is nothing to wait for: the sockets are given the pair backend and then
+ * tell that backend where to send readiness news, which is the only thing that
+ * makes a blocked reader wake on a write instead of on its deadline. */
+static void sock_ready_cb(void *ctx, unsigned mask);
+
+int sock_pair(struct socket **out_a, struct socket **out_b) {
+  if (!out_a || !out_b) return -EINVAL;
+  struct socket *a = sock_new();
+  struct socket *b = sock_new();
+  if (!a || !b) {
+    if (a) sock_close(a);
+    if (b) sock_close(b);
+    return -EMFILE;
+  }
+  void *ea = 0, *eb = 0;
+  int r = sock_unix_new_pair(&ea, &eb);
+  if (r != 0) { sock_close(a); sock_close(b); return r; }
+
+  a->ops = sock_unix_ops();
+  a->impl = ea;
+  a->seq++;
+  b->ops = sock_unix_ops();
+  b->impl = eb;
+  b->seq++;
+  a->ops->bind(a->impl, sock_ready_cb, a);
+  b->ops->bind(b->impl, sock_ready_cb, b);
+  /* A socketpair's two ends belong to whoever made it, so each one's peer is that
+   * process - the same answer Linux gives, and the reason a forked child still
+   * sees its parent's pid rather than its own. */
+  int cpid = 0, cuid = 0, cgid = 0;
+  sock_cred_now(&cpid, &cuid, &cgid);
+  u_set_peer_cred(ea, cpid, cuid, cgid);
+  u_set_peer_cred(eb, cpid, cuid, cgid);
+
+  *out_a = a;
+  *out_b = b;
+  return 0;
+}
+
+int sock_send_ctl(struct socket *s, void **ofiles, int n) {
+  if (!s || !s->ops) return -EBADF;
+  if (!s->ops->send_ctl) return -ENOTSUP;
+  int r = s->ops->send_ctl(s->impl, ofiles, n);
+  if (r == 0) s->seq++;
+  return r;
+}
+
+int sock_recv_ctl(struct socket *s, void **out, int max) {
+  if (!s || !s->ops || !s->ops->recv_ctl) return 0;
+  return s->ops->recv_ctl(s->impl, out, max);
+}
+
+int sock_cancel_ctl(struct socket *s) {
+  if (!s || !s->ops || !s->ops->cancel_ctl) return -ENOTSUP;
+  return s->ops->cancel_ctl(s->impl);
+}
+
+/* Move an existing endpoint into a socket object that already has a descriptor.
+ * connect() needs this: the caller made its socket before there was anything to
+ * connect it to, so the transport it just got hold of has to take the place of
+ * the one that socket started with. The donor object is released without running
+ * its close op - the endpoint moved, it is not dead - and the readiness callback
+ * is re-pointed at the object that survives, or a blocked reader would be woken
+ * on the wrong socket. */
+static int sock_adopt(struct socket *dst, struct socket *donor) {
+  if (!dst || !donor || !dst->used || !donor->used) return -EINVAL;
+  if (dst->impl) return -EINVAL;                  /* already connected */
+  if (!donor->impl || !donor->ops) return -EINVAL;
+  const struct socket_ops *ops = donor->ops;
+  dst->ops = ops;
+  dst->impl = donor->impl;
+  dst->shut_wr = 0;
+  dst->shut_rd = 0;
+  dst->seq++;
+  donor->impl = 0;                 /* the transport belongs to dst now */
+  donor->ops = 0;
+  donor->used = 0;
+  sock_bump_gen(donor);
+  if (ops->bind) ops->bind(dst->impl, sock_ready_cb, dst);
+  return 0;
+}
+
+int sock_unix_bind(struct socket *s, const char *path) {
+  if (!s || !s->used) return -EBADF;
+  if (s->impl) return -EINVAL;          /* already connected or already a name */
+  void *rec = 0;
+  int r = unix_name_bind(path, &rec);
+  if (r != 0) return r;
+  s->ops = unix_listener_ops();
+  s->impl = rec;
+  s->seq++;
+  if (s->ops->bind) s->ops->bind(s->impl, sock_ready_cb, s);
+  return 0;
+}
+
+int sock_unix_listen(struct socket *s, int backlog) {
+  if (!s || !s->used || !s->impl) return -EINVAL;
+  if (s->ops != unix_listener_ops()) return -EINVAL;
+  return unix_name_listen(s->impl, backlog);
+}
+
+int sock_unix_accept(struct socket *s, struct socket **out) {
+  if (!s || !s->used || !s->impl) return -EINVAL;
+  if (s->ops != unix_listener_ops()) return -EINVAL;
+  return unix_name_accept(s->impl, out);
+}
+
+int sock_unix_connect(struct socket *s, const char *path) {
+  if (!s || !s->used) return -EBADF;
+  struct socket *end = 0;
+  int r = unix_name_connect(path, &end);
+  if (r != 0) return r;
+  r = sock_adopt(s, end);
+  if (r != 0) sock_close(end);
+  return r;
 }
 
 /* The last descriptor is gone. Nothing new may start, everyone parked leaves
@@ -242,6 +412,7 @@ void sock_close(struct socket *s) {
    * never sees a refcount, and the ofile layer never sees a packet. */
   if (s->impl && s->ops && s->ops->close) s->ops->close(s->impl);
   s->impl = 0;
+  s->owner = 0;
   s->ops = 0;
   s->used = 0;
   s->closing = 0;
@@ -357,6 +528,19 @@ int sock_wait(struct socket *s, unsigned want, uint64_t deadline_ticks) {
 
 /* ---- observability ------------------------------------------------------ */
 
+void *sock_owner_now(void) { return sock_owner_hook ? sock_owner_hook() : 0; }
+
+void sock_set_owner(struct socket *s, void *space) {
+  if (s && s->used) s->owner = space;
+}
+
+int sock_owned_live(void *space) {
+  int n = 0;
+  for (int i = 0; i < SOCKET_MAX; i++)
+    if (sockets[i].used && sockets[i].owner == space) n++;
+  return n;
+}
+
 int sock_live(void) {
   int n = 0;
   for (int i = 0; i < SOCKET_MAX; i++) if (sockets[i].used) n++;
@@ -365,11 +549,15 @@ int sock_live(void) {
 
 /* A space that owned endpoints has just been torn down. Every one of them must
  * be gone: a socket outliving the process that held it is a leak with a
- * connection attached, and it would keep receiving segments for nobody. */
-void sock_report_after_space(int had, int live_before) {
+ * connection attached, and it would keep receiving segments for nobody.
+ *
+ * The count is per owner, not global. Global counting reported a leak whenever
+ * another process opened a socket while this one was being reaped - which is
+ * every interesting workload, and said nothing about the space being audited. */
+void sock_report_after_space(void *space, int had) {
   if (!had) return;
-  int live = sock_live();
-  int want = live_before - had;
+  int live = sock_owned_live(space);
+  int want = 0;
   char d[8];
   int o = 0;
   if (live == 0) d[o++] = '0';

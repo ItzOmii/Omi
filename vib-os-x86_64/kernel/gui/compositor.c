@@ -4394,6 +4394,12 @@ static int fwin_browser_unminimize(void) {
   return 0;
 }
 static int fwin_drag = -1, fwin_dx, fwin_dy;
+/* Double-click on a title bar toggles maximise, the way every desktop does it.
+ * Same window, close in space and time; the drag that a single press starts is
+ * cancelled by the toggle so the window does not also jump. */
+static int      fwin_click_win = -1;
+static uint64_t fwin_click_tick;
+static int      fwin_click_x, fwin_click_y;
 static int fwin_lastx = -1, fwin_lasty = -1;
 
 static void fwin_push(fwin_t *f, int32_t kind, int32_t x, int32_t y, int32_t code) {
@@ -4411,6 +4417,26 @@ static void fwin_push(fwin_t *f, int32_t kind, int32_t x, int32_t y, int32_t cod
  * compositor's; the pixels are the process', so it is the process that has to
  * lay itself out again - the frame alone would just be a bigger border round a
  * small, stale image. */
+/* Maximise or restore one ring-3 window, and tell its client the new size. The
+ * client cannot infer it: it only learns its geometry from this event. */
+static void fwin_toggle_max(int idx) {
+  fwin_t *f = &fwin[idx];
+  if (!f->used) return;
+  if (!f->maxed) {
+    f->rx = f->x; f->ry = f->y; f->rw = f->w; f->rh = f->h;
+    f->x = 0; f->y = 0;
+    f->w = (int)screen_width;
+    f->h = taskbar_y();
+    f->maxed = 1;
+  } else {
+    if (f->rw > 0) { f->x = f->rx; f->y = f->ry; f->w = f->rw; f->h = f->rh; }
+    f->maxed = 0;
+  }
+  fwin_notify_geometry(idx);
+  needs_redraw = 1;
+  full_redraw = 1;
+}
+
 static void fwin_notify_geometry(int idx) {
   fwin_t *f = &fwin[idx];
   if (!f->used) return;
@@ -4543,6 +4569,21 @@ int winipc_input(int mx, int my, int buttons, int pressed, int released, int whe
     fwin_focus = hit;
     needs_redraw = 1;
     if (my < f->y + APP_TITLE_H) {
+      /* A second press on the same title bar, soon and in about the same place,
+       * is a double-click: maximise or restore, and do not also start a drag. */
+      uint64_t now = task_total_ticks();
+      if (fwin_click_win == hit && now - fwin_click_tick <= 40 &&
+          mx - fwin_click_x < 6 && fwin_click_x - mx < 6 &&
+          my - fwin_click_y < 6 && fwin_click_y - my < 6) {
+        fwin_click_win = -1;
+        fwin_drag = -1;
+        fwin_toggle_max(hit);
+        return 1;
+      }
+      fwin_click_win = hit;
+      fwin_click_tick = now;
+      fwin_click_x = mx;
+      fwin_click_y = my;
       int wc = app_wctl_hit(mx, my, f->x, f->y, f->w);
       if (wc == 3) {                                      /* close */
         fwin_push(f, WIN_EV_CLOSE, 0, 0, 0);
@@ -4557,18 +4598,7 @@ int winipc_input(int mx, int my, int buttons, int pressed, int released, int whe
         return 1;
       }
       if (wc == 2) {                                      /* maximise / restore */
-        if (!f->maxed) {
-          f->rx = f->x; f->ry = f->y; f->rw = f->w; f->rh = f->h;
-          f->x = 0; f->y = 0;
-          f->w = (int)screen_width;
-          f->h = taskbar_y();
-          f->maxed = 1;
-        } else {
-          if (f->rw > 0) { f->x = f->rx; f->y = f->ry; f->w = f->rw; f->h = f->rh; }
-          f->maxed = 0;
-        }
-        fwin_notify_geometry(hit);
-        needs_redraw = 1; full_redraw = 1;
+        fwin_toggle_max(hit);
         return 1;
       }
       fwin_drag = hit;
@@ -4610,7 +4640,12 @@ int winipc_key(int key) {
   if (fwin_focus < 0) return 0;
   fwin_t *f = &fwin[fwin_focus];
   if (!f->used) { fwin_focus = -1; return 0; }
-  fwin_push(f, WIN_EV_KEY, 0, 0, key);
+  /* A key event has no use for x/y, so the modifiers ride there: bit 0 shift,
+   * bit 1 ctrl. Without them a client cannot tell Ctrl+C from a typed c, and
+   * there is no other field to put them in that would not change the event
+   * layout every program already compiles against. */
+  int mods = (kb_shift_down() ? 1 : 0) | (kb_ctrl_down() ? 2 : 0);
+  fwin_push(f, WIN_EV_KEY, mods, 0, key);
   needs_redraw = 1;
   return 1;
 }
@@ -4790,10 +4825,11 @@ void winipc_draw_all(void) {
       int cols = cw < sw ? cw : sw;
       int rows = ch < sh ? ch : sh;
       for (int y = 0; y < rows; y++) {
-        uint32_t *src = surf_row(f->id, y);
-        if (!src) break;
-        memcpy(backbuffer + (size_t)(cy + y) * (size_t)screen_width + (size_t)cx,
-               src, (size_t)cols * 4);
+        /* One page at a time: a surface row can straddle two frames, and a plain
+         * row copy would read past the end of the first one. */
+        if (surf_copy_row(f->id, y,
+                          backbuffer + (size_t)(cy + y) * (size_t)screen_width + (size_t)cx,
+                          cols) != cols) break;
       }
       surf_blit_frames++;
       /* Once per window, not every 60 frames: a surface that parks is blitted

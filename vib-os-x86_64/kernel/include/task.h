@@ -44,7 +44,13 @@ enum { TASK_FREE = 0, TASK_READY = 1, TASK_RUN = 2, TASK_DEAD = 3, TASK_BLOCKED 
  * maps a meta area and a group per size class, so an 11 KB page parse exhausted
  * the table, mmap answered ENOMEM, malloc handed back NULL and Gumbo wrote to it.
  * 128 x 72 bytes is ~9 KB per address space, which is the right order for this. */
-#define TASK_AREAS 128
+/* 512, not 128. musl's allocator takes one mmap per size class and per growable
+ * group, and a parse of a large document can want dozens; at 128 the table ran out
+ * first, mmap said ENOMEM, malloc handed back NULL, and Gumbo - which does not
+ * check - wrote through it. That crash was read as "the machine cannot parse a
+ * 128 KB page", and the page cap was set to 64 KB to stay away from it. 512 slots
+ * at 72 bytes is 36 KB per address space. */
+#define TASK_AREAS 512
 typedef struct {
   uint64_t base, len;   /* byte range, page-aligned */
   uint64_t flags;       /* PTE flags for the pages that appear */
@@ -77,6 +83,13 @@ typedef struct {
   uint64_t  cr3;
   uint64_t  mmap_hint;    /* SYS_VM_ALLOC grows up from RING3_MMAP_BASE */
   uint64_t  stack_hint;   /* new thread stacks grow down from RING3_MMAP_TOP */
+  /* Named shared regions this process has attached: one bit per slot, and where
+   * each one landed. Attaches take a fresh range from the shm arena, so one
+   * process can hold several - it used to get exactly one, because every attach
+   * mapped at RING3_SHM_BASE and the second overwrote the first. */
+  uint64_t  shm_next;
+  uint64_t  shm_bits;
+  uint64_t  shm_addr[64];
   /* brk: one lazily-populated area reserved on the first call, then a pointer
    * that moves inside it. Pages appear on touch, so the reservation is free. */
   uint64_t  brk_base, brk_cur, brk_end;

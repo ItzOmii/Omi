@@ -18,12 +18,18 @@
 
 #include <stdint.h>
 
-#define SHFILE_MAX_PAGES 64      /* 256 KiB: a test, a canvas, a shared buffer */
+/* How much a region may claim. This is a ceiling on the claim, not on memory:
+ * pages are allocated when they are touched, so a 256 MB request costs nothing
+ * until a program uses it. The old ceiling was 64 pages - 256 KiB - which is
+ * smaller than one 1080p frame, so the first thing a browser would have done
+ * with this file (hand a renderer a frame buffer) could never have worked. */
+#define SHFILE_MAX_PAGES 65536   /* 256 MB per region */
 
 typedef struct shfile {
   int    refs;                   /* one per owner: the descriptor, each mapping */
   int    pages;                  /* pages the file currently has */
-  void  *page[SHFILE_MAX_PAGES]; /* kernel address of each frame, or NULL */
+  int    cap;                    /* slots in `page`, grown to fit `pages` */
+  void **page;                   /* kernel address of each frame, or NULL */
 } shfile_t;
 
 shfile_t *shfile_new(void);

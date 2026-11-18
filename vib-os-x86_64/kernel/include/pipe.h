@@ -7,7 +7,12 @@
 
 #include <stdint.h>
 
-#define PIPE_MAX 8
+/* Eight was set when a pipe was a shell toy: one per pipeline, four pipelines at
+ * once. A socketpair is two pipes and a program that talks to three helper
+ * processes holds six, so the pool had to grow or AF_UNIX would have been capped
+ * at four pairs by an unrelated constant. 64 pipes is ~260 KB of BSS and 32
+ * pairs, and running out is still -ENFILE rather than a silent failure. */
+#define PIPE_MAX 256
 #define PIPE_CAP 4096
 
 struct pipe;
