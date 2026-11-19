@@ -172,5 +172,14 @@ static int rw(uint32_t lba, void *buf, int write) {
   return 0;
 }
 
+/* Ask the drive to empty its write cache. Every write already issues FLUSH CACHE
+ * and waits, so this is for the case that matters before a power-off: the last
+ * sector may be sitting in the drive's buffer with nobody waiting on it. */
+int ata_flush(void) {
+  if (!present) return -1;
+  outb(ATA_CMD, CMD_FLUSH);
+  return wait_ready();
+}
+
 int ata_read(uint32_t lba, void *buf)  { return rw(lba, buf, 0); }
 int ata_write(uint32_t lba, const void *buf) { return rw(lba, (void *)buf, 1); }

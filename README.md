@@ -15,7 +15,7 @@ the browser, audio, a disk — happened here.
 By the numbers, measured from the tree (`find kernel -name '*.c'` and so on, vendored directories
 counted separately): **32,252 lines** of first-party kernel C (plus **17,733** lines of its headers),
 **9,646 lines** of user-mode C, **103,958 lines** of vendored BearSSL and Gumbo, **101,195 lines** of
-vendored audio decoders in `kernel/media/`, and **57 native syscalls** in front of the Linux ABI. A
+vendored audio decoders in `kernel/media/`, and **58 native syscalls** in front of the Linux ABI. A
 stock boot prints **340 `ok` lines** in the serial log - a couple of those checks talk to the public
 internet, and when it refuses them they print a skip instead of a failure, which is why the count
 moves by a few lines from one boot to the next.

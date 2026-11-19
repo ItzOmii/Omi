@@ -165,6 +165,8 @@ static void wr8(uint32_t off, uint8_t v) { *(volatile uint8_t *)(mmio + off) = v
 
 int hda_ready(void) { return ready && have_dac && have_adc; }
 
+
+
 static int wait_bits(uint32_t off, uint32_t mask, uint32_t want, int tries) {
   for (int i = 0; i < tries; i++) {
     if ((rd32(off) & mask) == want) return 1;
@@ -671,4 +673,37 @@ void hda_selftest(void) {
   } else {
     h_puts("[hda] capture failed\n");
   }
+}
+
+/* ---- volume ----------------------------------------------------------
+ *
+ * The DAC's output amp is the only gain this driver owns: gain 0 of 0x7f is
+ * silence, so the tray slider is a write to that amp and nothing else. QEMU's
+ * mixer and a real codec both honour it, which is why muting is a gain of 0
+ * rather than a flag anyone has to check while mixing.
+ */
+static int vol_pct = 70;
+static int vol_muted = 0;
+
+static void apply_volume(void) {
+  if (!have_dac) return;
+  int gain = vol_muted ? 0 : (vol_pct * 0x7F) / 100;
+  send_verb(0, dac_nid, VERB_SET_AMP,
+            (uint16_t)(0x8000 | 0x2000 | 0x1000 | (gain & 0x7F)), 0);
+}
+
+int audio_volume(void) { return vol_pct; }
+int audio_muted(void) { return vol_muted; }
+
+void audio_volume_set(int pct) {
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  vol_pct = pct;
+  if (pct > 0) vol_muted = 0;      /* moving the slider is how you unmute */
+  apply_volume();
+}
+
+void audio_mute(int on) {
+  vol_muted = on ? 1 : 0;
+  apply_volume();
 }

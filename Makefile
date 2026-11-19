@@ -46,6 +46,12 @@ endif
 # to show the report. It is a test harness, not a feature.
 PANIC_DEMO ?= 0
 
+# POWER_DEMO=1 switches off at the end of the boot, =2 restarts. Test harness.
+POWER_DEMO ?= 0
+
+# MENU_DEMO=1 opens the start menu at first paint, so a screenshot shows it.
+MENU_DEMO ?= 0
+
 CFLAGS := -target x86_64-unknown-none-elf \
           -ffreestanding \
           -fno-stack-protector \
@@ -63,6 +69,8 @@ CFLAGS := -target x86_64-unknown-none-elf \
           -Wall -Wextra \
           -O2 \
           -DOMI_PANIC_DEMO=$(PANIC_DEMO) \
+          -DOMI_POWER_DEMO=$(POWER_DEMO) \
+          -DOMI_MENU_DEMO=$(MENU_DEMO) \
           -g
 
 # Use GCC-compatible flags if using cross compiler
@@ -83,6 +91,8 @@ CFLAGS := -ffreestanding \
           -Wall -Wextra \
           -O2 \
           -DOMI_PANIC_DEMO=$(PANIC_DEMO) \
+          -DOMI_POWER_DEMO=$(POWER_DEMO) \
+          -DOMI_MENU_DEMO=$(MENU_DEMO) \
           -g
 endif
 
@@ -109,6 +119,7 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/drivers/idt.c \
            $(KERNEL_DIR)/bt.c \
            $(KERNEL_DIR)/bt_selftest.c \
+           $(KERNEL_DIR)/drivers/power.c \
            $(KERNEL_DIR)/drivers/wc.c \
            $(KERNEL_DIR)/drivers/ps2.c \
            $(KERNEL_DIR)/drivers/pci.c \
@@ -312,7 +323,7 @@ userland/ominet.elf: userland/ominet.c userland/fetch.c userland/omilayout.c \
                      userland/glyphs.h userland/roots_user.o
 	$(MAKE) -C userland ominet.elf
 
-$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf userland/tlsget.elf userland/surftest.elf userland/scene.elf userland/comp.elf userland/omirender.elf userland/surfexit.elf userland/ominet.elf userland/vmtest.elf userland/shmtest.elf userland/surfbig.elf userland/unixpair.elf userland/scmtest.elf userland/unixname.elf userland/credtest.elf userland/formtest.elf userland/imgtest.elf userland/memtest.elf userland/sandtest.elf
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf userland/tlsget.elf userland/surftest.elf userland/scene.elf userland/comp.elf userland/omirender.elf userland/surfexit.elf userland/ominet.elf userland/vmtest.elf userland/shmtest.elf userland/surfbig.elf userland/unixpair.elf userland/scmtest.elf userland/unixname.elf userland/credtest.elf userland/formtest.elf userland/imgtest.elf userland/memtest.elf userland/sandtest.elf userland/power.elf
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -348,6 +359,7 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	@if [ -f userland/memfdtest.elf ]; then cp userland/memfdtest.elf $(ISO_ROOT)/apps/memfdtest.elf; else echo "no memfdtest.elf: skipping"; fi
 	@if [ -f userland/socktest.elf ]; then cp userland/socktest.elf $(ISO_ROOT)/apps/socktest.elf; else echo "no socktest.elf: skipping"; fi
 	@if [ -f userland/sandtest.elf ]; then cp userland/sandtest.elf $(ISO_ROOT)/apps/sandtest.elf; else echo "no sandtest.elf: skipping"; fi
+	@if [ -f userland/power.elf ]; then cp userland/power.elf $(ISO_ROOT)/apps/power.elf; else echo "no power.elf: skipping"; fi
 	@if [ -f userland/tlsget.elf ]; then cp userland/tlsget.elf $(ISO_ROOT)/apps/tlsget.elf; else echo "no tlsget.elf: skipping"; fi
 	@if [ -f userland/surftest.elf ]; then cp userland/surftest.elf $(ISO_ROOT)/apps/surftest.elf; else echo "no surftest.elf: skipping"; fi
 	@if [ -f userland/scene.elf ]; then cp userland/scene.elf $(ISO_ROOT)/apps/scene.elf; else echo "no scene.elf: skipping"; fi

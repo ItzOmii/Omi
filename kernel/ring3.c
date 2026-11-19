@@ -19,7 +19,8 @@
 #include "include/idt.h"
 #include "include/types.h"
 #include "include/gui.h"     /* the display's geometry: what the scene is sized to */
-#include "include/bt.h"      /* the register dump and the walk out of a fault */
+#include "include/bt.h"     /* the register dump and the walk out of a fault */
+#include "include/power.h"   /* SYS_POWER: off and restart, disk first */
 #include "include/guiipc.h"
 #include "include/pmm.h"
 #include "include/errno.h"
@@ -3971,6 +3972,12 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
 
   switch (num) {
     case SYS_WRITE:  return sys_write(a0, a1, a2);
+    case SYS_POWER:
+      /* Logged before the attempt, because on success there is no "after". */
+      serial_puts("[power] task ");
+      serial_puts(task_name(task_current()));
+      serial_puts(a0 == POWER_RESET ? " asked for a restart\n" : " asked for power off\n");
+      return (a0 == POWER_RESET) ? power_reset() : power_off();
     case SYS_SANDBOX: return sys_sandbox(a0, a1);
     case SYS_FORK:   return sys_fork();
     case SYS_WAIT4:  return linux_wait4((int)a0, a1, (int)a2, a3);

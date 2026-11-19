@@ -4,6 +4,7 @@
  * With HD Wallpaper support and real dock icons
  */
 
+#include "../include/power.h"   /* the start menu's last two rows */
 #include "../include/e1000.h"
 #include "../include/font.h"
 #include "../include/gui.h"
@@ -2809,20 +2810,33 @@ static void files_size(size_t sz, int is_dir, char *out) {
 
 /* A folder glyph and a file glyph out of small filled rectangles: the web shell
  * uses SVG paths, and at this size a tab plus a body reads the same. */
+/* The row and place glyphs come from the same Remix masks the start menu uses -
+ * every other icon in the desktop was baked and this app was still drawing its
+ * folders out of rectangles, which read as a placeholder next to them. */
 static void files_glyph(int kx, int ky, int is_dir, uint32_t ink, uint32_t accent) {
-  int s = UI_SCALE_VAL(1);
-  if (is_dir) {
-    fb_fill_rect(kx, ky + 1 * s, 12 * s, 2 * s, accent);          /* tab  */
-    fb_fill_rect(kx, ky + 3 * s, 15 * s, 9 * s, accent);          /* body */
-    fb_fill_rect(kx + 1 * s, ky + 5 * s, 13 * s, 6 * s, ink);
-    return;
-  }
-  fb_fill_rect(kx + 2 * s, ky + 1 * s, 11 * s, 13 * s, ink);
-  for (int i = 0; i < 3; i++) fb_fill_rect(kx + 4 * s, ky + (4 + i * 3) * s, 7 * s, 1 * s, accent);
+  (void)accent;
+  meep_icon(is_dir ? ICON_FOLDER_OPEN : ICON_FILE, kx, ky, 15, ink);
 }
 
 static void draw_files(void) {
   meep_app_t *a = &mapp[APP_FILES];
+  /* Once per open: what the window thinks its geometry is, so a window that is
+   * open and invisible can be told apart from one that never drew. */
+  {
+    static int logged = 0;
+    if (a->open && !logged) {
+      logged = 1;
+      serial_puts("[files] drawing at ");
+      serial_puthex((uint64_t)(uint32_t)a->x);
+      serial_puts(",");
+      serial_puthex((uint64_t)(uint32_t)a->y);
+      serial_puts(" size ");
+      serial_puthex((uint64_t)(uint32_t)a->w);
+      serial_puts("x");
+      serial_puthex((uint64_t)(uint32_t)a->h);
+      serial_puts("\n");
+    }
+  }
   if (!a->open) return;
   if (!fsv.inited) { files_load("/"); fsv.inited = 1; }
 
@@ -2858,8 +2872,8 @@ static void draw_files(void) {
     }
     if (here) fb_fill_rect(px, py, pw, ph, MEEP_PRESS);
     else if (i == fsv.places_hot) fb_fill_rect(px, py, pw, ph, MEEP_LINE_SOFT);
-    files_glyph(px + UI_SCALE_VAL(3), py + UI_SCALE_VAL(3), 1,
-                here ? MEEP_INK : MEEP_INK_SOFT, MEEP_ACCENT);
+    meep_icon(i == 0 ? ICON_HOME : ICON_FOLDER_OPEN, px + UI_SCALE_VAL(3),
+              py + UI_SCALE_VAL(3), 15, here ? MEEP_INK : MEEP_INK_SOFT);
     meep_text(&meep_s130, px + UI_SCALE_VAL(22), py + UI_SCALE_VAL(3),
               fsv_places[i], here ? MEEP_INK : MEEP_INK_SOFT);
   }
@@ -2869,12 +2883,8 @@ static void draw_files(void) {
   files_up_rect(a, &ux, &uy, &uw, &uh);
   int at_root = (fsv.path[0] == '/' && !fsv.path[1]);
   fb_fill_rect(ux, uy, uw, uh, at_root ? MEEP_LINE_SOFT : MEEP_PAPER2);
-  {
-    /* an up chevron, drawn rather than fetched: no font glyph needed */
-    int cx2 = ux + uw / 2, cy2 = uy + uh / 2 - UI_SCALE_VAL(2);
-    for (int k = 0; k < 5; k++)
-      fb_fill_rect(cx2 - k, cy2 + k, 1 + 2 * k, 1, at_root ? MEEP_INK_SOFT : MEEP_INK);
-  }
+  meep_icon(ICON_UP, ux + UI_SCALE_VAL(3), uy + UI_SCALE_VAL(3), 15,
+            at_root ? MEEP_INK_SOFT : MEEP_INK);
 
   int bx = ux + uw + UI_SCALE_VAL(10);
   int has_room = a->x + a->w - bx > UI_SCALE_VAL(60);
@@ -4089,6 +4099,15 @@ static int wg_at(int x, int y) {
 
 static int start_open = 0, start_hover = -1, tb_hover = -2;
 
+/* For MENU_DEMO builds: open the menu without a mouse, so a screenshot taken at
+ * first paint shows it. Driving a guest pointer through QEMU's relative mouse is
+ * unreliable enough that a self-opening menu is the honest way to look at it. */
+void gui_open_start_menu(void) {
+  start_open = 1;
+  start_hover = -1;
+}
+
+
 static int taskbar_h(void) { return UI_SCALE_VAL(TB_BASE_H); }
 static int taskbar_y(void) { return (int)screen_height - taskbar_h(); }
 
@@ -4147,7 +4166,9 @@ static int start_button_hit(int x, int y) {
 }
 
 /* ---- start menu ------------------------------------------------------- */
-/* kind: 0 = separator, 1 = app, 2 = widget, 3 = appearance */
+/* kind: 0 = separator, 1 = app, 2 = widget, 3 = appearance, 4 = switch off,
+ * 5 = restart. The last two are not toggles: they end the session, and they sit
+ * below a rule at the bottom of the menu, where every desktop puts them. */
 typedef struct { const char *label; int kind; int arg; } sm_item;
 
 static const sm_item sm_rows[] = {
@@ -4163,6 +4184,9 @@ static const sm_item sm_rows[] = {
   {"sticky note",    2, WG_STICKY},
   {0, 0, 0},
   {"appearance",     3, 0},
+  {0, 0, 0},
+  {"shut down",      4, 0},
+  {"restart",        5, 0},
 };
 #define SM_N ((int)(sizeof(sm_rows) / sizeof(sm_rows[0])))
 
@@ -4204,6 +4228,40 @@ static void sm_activate(int i) {
   if (sm_rows[i].kind == 1) app_toggle(sm_rows[i].arg);
   else if (sm_rows[i].kind == 2) wg_toggle(sm_rows[i].arg);
   else if (sm_rows[i].kind == 3) meep_apply_appearance(!appearance_dark);
+  else if (sm_rows[i].kind == 4 || sm_rows[i].kind == 5) {
+    /* Close the menu first: if the machine does not go anywhere, the desktop it
+     * comes back to should not have a menu stuck open over it. Both calls flush
+     * the disk and both return only when nothing worked, which is a machine with a
+     * firmware table it cannot use - the log says what was tried. */
+    start_open = 0;
+    serial_puts(sm_rows[i].kind == 5 ? "[gui] restart, from the start menu\n"
+                                     : "[gui] shut down, from the start menu\n");
+    int rc = (sm_rows[i].kind == 5) ? power_reset() : power_off();
+    serial_puts("[gui] power request failed, rc=");
+    serial_puthex((uint64_t)rc);
+    serial_puts(" why=");
+    serial_puts(power_why());
+    serial_puts("\n");
+  }
+}
+
+/* For MENU_DEMO builds: run the power row the menu would run, without a mouse.
+ * Clicking after the ring-3 display server has taken the scene hits the display
+ * server's input path, not this one, so the only honest way to test the row is to
+ * call what the row calls. */
+void gui_activate_power_row(void) {
+  sm_activate(SM_N - 2);   /* the "shut down" row */
+}
+
+/* For MENU_DEMO builds: the Files app, open, so its icons can be looked at. */
+void gui_open_files_app(void) {
+  app_toggle(APP_FILES);
+  /* Park it in empty space and on top: the suites open their own windows over the
+   * middle of the screen, and a window nobody can see is not evidence. */
+  mapp[APP_FILES].x = (int)screen_width - mapp[APP_FILES].w - UI_SCALE_VAL(16);
+  mapp[APP_FILES].y = UI_SCALE_VAL(56);
+  mapp_focus = APP_FILES;
+  z_top(APP_FILES);
 }
 
 /* state string on the right of a row, so the menu says what it will do */
@@ -4211,6 +4269,8 @@ static const char *sm_state(int i) {
   if (sm_rows[i].kind == 1) return mapp[sm_rows[i].arg].open ? "open" : "";
   if (sm_rows[i].kind == 2) return mwg[sm_rows[i].arg].on ? "on" : "off";
   if (sm_rows[i].kind == 3) return appearance_dark ? "midnight" : "paper";
+  if (sm_rows[i].kind == 4) return "off";
+  if (sm_rows[i].kind == 5) return "now";
   return "";
 }
 
@@ -4255,6 +4315,10 @@ static void draw_start_menu(void) {
       ic = (w >= 0 && w < 3) ? wg_ic[w] : ICON_APPS;
     } else if (sm_rows[i].kind == 3) {
       ic = ICON_APPEARANCE;
+    } else if (sm_rows[i].kind == 4) {
+      ic = ICON_POWER;
+    } else if (sm_rows[i].kind == 5) {
+      ic = ICON_RESTART;
     }
     if (ic >= 0)
       meep_icon(ic, px + UI_SCALE_VAL(12),

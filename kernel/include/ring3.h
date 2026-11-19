@@ -177,6 +177,12 @@
 #define SYS_WAIT4       57  /* (pid, int *status, options, 0) -> pid reaped | -ECHILD.
                              * Status has wait4's shape: exit code in bits 8-15. */
 
+#define SYS_POWER       58  /* (what, 0, 0, 0) -> only returns on failure (-1).
+                             * 0 = switch off, 1 = restart. Both flush the disk
+                             * first. Requires no privilege beyond being a task: a
+                             * process that can already write the disk can already
+                             * stop the machine by writing to it badly. */
+
 /* the switch, the gates and the fault handler */
 void     ring3_init(void);
 int      ring3_ready(void);

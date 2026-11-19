@@ -707,3 +707,81 @@ and kills the task, which is right, but a user-mode crash report with a symbol
 walk through that task's own image is a different piece of work. And nothing
 unwinds past an interrupt frame yet, so a fault inside an IRQ shows the interrupt
 stub rather than the code that was interrupted.
+
+## 14. Switching off, and meaning it
+
+A machine that cannot switch itself off is the first thing anyone notices and the
+last thing anyone implements, because every other feature works without it.
+
+The path is the FADT: `PM1a_CNT_BLK` (and `PM1b_CNT_BLK` when there is a second
+control block), a 16-bit store of `SLP_TYP << 10 | SLP_EN`, and the disk flushed
+first. Two things are easy to get wrong and this got both wrong on the first
+attempt:
+
+- **The length gate.** The reset register is a revision-2 field at offset 116, so a
+  table shorter than 129 bytes has no reset register - but QEMU ships revision 1 at
+  116 bytes and can switch itself off perfectly well. Refusing the table unless it
+  had the *reset* field made this machine report "no FADT", which is a lie with
+  consequences: no S5, and the only thing left is the emulator's own exit port.
+- **SLP_TYP is a number from the firmware, not from the spec.** `\_S5` holds it, and
+  reading it needs an AML interpreter. Real hardware uses 5; the DSDT SeaBIOS
+  generates uses 0, which is why "write 0x2000 to port 0x604" is the idiom everyone
+  copies. Writing 5 alone left QEMU running. So: try 5, then 0, then the emulator's
+  exit ports, and report which one was reached.
+
+Reset has the same shape: the FADT reset register when the table is long enough to
+have one, the keyboard controller's 0xFE pulse next (works since 1984), and a null
+IDT plus `int3` last - a triple fault, which the CPU answers with a reset. Ugly,
+universal, and only reached when two better paths failed.
+
+Verified: `POWER_DEMO=1` exits QEMU with status 0, `POWER_DEMO=2` reboots the guest
+(eight banners in one serial log), and `POWER_DEMO=3` does the same from ring 3
+through `SYS_POWER 58` with a musl app on the ISO.
+
+What is missing: nothing suspends. There is no `\_S3`, no wake, and no shutdown
+sequence that tells the running processes anything - they are simply not scheduled
+again. S5 does not need that, but a machine that can suspend to RAM will.
+## 15. Power in the menu, and the files browser's icons
+
+The start menu ends with a rule and two rows - power off, restart - because that is
+where every desktop puts them, and a machine you cannot switch off from the place
+you open everything else is one nobody believes finishes booting.
+
+Both rows call `power_off()` / `power_reset()` from `drivers/power.c`. They are not
+toggles: they end the session, so the menu closes first and the call happens with
+the UI in a state it can come back to. If the machine stays up (a firmware table
+naming a block the chipset ignores), the log says what was tried and the desktop is
+exactly where it was.
+
+Verified twice, because clicking a menu is not something QEMU makes easy:
+
+- `MENU_DEMO=1` opens the menu at first paint; the screenshot shows the rows and
+  their glyphs in the right order.
+- `MENU_DEMO=2` runs the power-off row itself: the serial log says
+  `[gui] shut down, from the start menu` and QEMU exits 0 - the S5 store, not the
+  fallback ports.
+
+Worth knowing before chasing a click: **after the ring-3 display server takes the
+scene, the kernel's own chrome is no longer what is on screen.** A click then lands
+in the display server's input path, not in `handle_mouse_click`, which is why the
+menu can look open in one screenshot and take no clicks in the next. The menu above
+is the kernel compositor's; a shipped desktop's tray and menus have to live in the
+display server.
+
+Icons. Every row in the start menu comes from the baked Remix set, and the files
+browser was the last window still drawing its furniture out of rectangles - folders
+made of three `fb_fill_rect` calls, an up chevron of five more. It now uses the same
+masks: `folder-open-line` and `file-line` for the rows, `home-line` for the root
+place, `corner-left-up-line` for the up button. `MENU_DEMO=3` opens it in empty
+space for a look.
+
+Two glyph notes: Remix has no `shutdown-line` (it is `shut-down-line`, hyphen and a
+"down") and no power symbol at all - the first attempt baked one by hand before the
+right name turned up. `restart-line` is a circular arrow; `reset-left-line` is the
+straighter one the menu uses now. When suspend exists, `rest-time-line` is its
+glyph.
+
+Not built yet, but the groundwork is in: `audio_volume()` / `audio_mute()` in
+`drivers/hda.c` write the DAC output amp (0x7f scaled by the percentage, mute as
+gain 0), which is what a volume slider needs. There is no tray and no slider in the
+UI yet.

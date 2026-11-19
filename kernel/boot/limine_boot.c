@@ -5,6 +5,7 @@
 
 #include "../include/gui.h"
 #include "../include/bt.h"
+#include "../include/power.h"
 #include "../include/limine.h"
 #include "../include/gdt.h"
 #include "../include/idt.h"
@@ -618,6 +619,37 @@ void _start(void) {
     void panic_selftest_demo(void);
     panic_selftest_demo();
   }
+#endif
+
+#if OMI_POWER_DEMO == 3
+  /* POWER_DEMO=3: the same thing through the door, from ring 3 - the app asks, the
+   * kernel does it, and it costs the caller nothing but a task. */
+  serial_puts("[power-demo] spawning the ring-3 power app\n");
+  ring3_spawn_elf("power", "power.elf", 0);
+#elif OMI_POWER_DEMO
+  /* POWER_DEMO: the lifecycle path, exercised on a machine that is at rest. The
+   * suites have not run yet in this build - the point is to watch the box go down. */
+  serial_puts(OMI_POWER_DEMO == 2 ? "[power-demo] asking for a restart\n"
+                                  : "[power-demo] asking to switch off\n");
+  {
+    int rc = (OMI_POWER_DEMO == 2) ? power_reset() : power_off();
+    serial_puts("[power-demo] it came back: rc=");
+    serial_puthex((uint64_t)rc);
+    serial_puts(" why=");
+    serial_puts(power_why());
+    serial_puts("\n");
+  }
+#endif
+
+#if OMI_MENU_DEMO == 1
+  /* MENU_DEMO=1: the start menu, open at first paint. */
+  gui_open_start_menu();
+#elif OMI_MENU_DEMO == 2
+  /* MENU_DEMO=2: the menu's shut-down row, run. */
+  gui_activate_power_row();
+#elif OMI_MENU_DEMO == 3
+  /* MENU_DEMO=3: the files app, open, to look at its icons. */
+  gui_open_files_app();
 #endif
 
   serial_puts("Starting main loop...\n");

@@ -37,6 +37,16 @@ SET = [
     ("ICON_MIN",        "subtract-line",     "window minimise"),
     ("ICON_MAX",        "fullscreen-line",   "window maximise"),
     ("ICON_FILES",      "folder-line",       "files app"),
+    ("ICON_FILE",       "file-line",         "files app: a file"),
+    ("ICON_FOLDER_OPEN","folder-open-line",   "files app: a folder"),
+    ("ICON_HOME",       "home-line",          "files app: places root"),
+    ("ICON_UP",         "corner-left-up-line","files app: up one level"),
+    ("ICON_VOLUME",     "volume-up-line",     "tray: audio, audible"),
+    ("ICON_VOLUME_OFF", "volume-mute-line",   "tray: audio, muted"),
+    ("ICON_NET",        "wifi-line",          "tray: network, connected"),
+    ("ICON_NET_OFF",    "wifi-off-line",      "tray: network, down"),
+    ("ICON_POWER",      "shut-down-line",    "start menu: switch off"),
+    ("ICON_RESTART",    "reset-left-line",   "start menu: restart"),
 ]
 
 

@@ -22,6 +22,13 @@ int hda_init(void);
 /* 1 when init succeeded and both a DAC and an ADC were found. */
 int hda_ready(void);
 
+/* The tray's volume: 0-100, and mute as a gain of zero. Setting a level above
+ * zero clears mute, because moving a slider is how people unmute. */
+int  audio_volume(void);
+int  audio_muted(void);
+void audio_volume_set(int pct);
+void audio_mute(int on);
+
 /* Interleaved s16le playback at 48 kHz stereo. Blocks until queued audio has
    been consumed by the codec. Returns bytes played, -1 on error. */
 int hda_play(const int16_t *pcm, int bytes);

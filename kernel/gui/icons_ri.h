@@ -19,6 +19,16 @@ enum {
   ICON_MIN = 11,            /* ri/subtract-line - window minimise */
   ICON_MAX = 12,            /* ri/fullscreen-line - window maximise */
   ICON_FILES = 13,          /* ri/folder-line - files app */
+  ICON_FILE = 14,           /* ri/file-line - files app: a file */
+  ICON_FOLDER_OPEN = 15,    /* ri/folder-open-line - files app: a folder */
+  ICON_HOME = 16,           /* ri/home-line - files app: places root */
+  ICON_UP = 17,             /* ri/corner-left-up-line - files app: up one level */
+  ICON_VOLUME = 18,         /* ri/volume-up-line - tray: audio, audible */
+  ICON_VOLUME_OFF = 19,     /* ri/volume-mute-line - tray: audio, muted */
+  ICON_NET = 20,            /* ri/wifi-line - tray: network, connected */
+  ICON_NET_OFF = 21,        /* ri/wifi-off-line - tray: network, down */
+  ICON_POWER = 22,          /* ri/shut-down-line - start menu: switch off */
+  ICON_RESTART = 23,        /* ri/reset-left-line - start menu: restart */
   ICON_COUNT
 };
 
