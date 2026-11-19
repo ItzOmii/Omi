@@ -488,7 +488,11 @@ void _start(void) {
    * runs a normal write/yield/exit path; "probe" reads a kernel address and
    * must be killed for it, without taking the system down. */
   ring3_init();
-#if !OMI_DEV_BOOT
+#if !OMI_DEV_BOOT && OMI_TESTS
+  /* TESTS=0 (the default) skips this whole block: the suites, and with them the
+   * ring-3 display server that takes the scene at the end of them. What is left
+   * is the kernel's own desktop - taskbar, start menu, the app windows - which
+   * is the thing a person can actually use. TESTS=1 is the verification boot. */
   ring3_spawn_elf("init",  "init.elf", 0);
   ring3_spawn_elf("probe", "init.elf", 1);
   ring3_spawn_elf("spin",  "init.elf", 2);
@@ -639,6 +643,12 @@ void _start(void) {
     serial_puts(power_why());
     serial_puts("\n");
   }
+#endif
+
+#if OMI_TRAY_DEMO == 1 || OMI_TRAY_DEMO == 2 || OMI_TRAY_DEMO == 3
+  /* TRAY_DEMO=1 opens the audio panel, =2 the network one: the same reason the
+   * menu has a demo switch - a panel nobody can photograph is not evidence. */
+  gui_open_tray(OMI_TRAY_DEMO);
 #endif
 
 #if OMI_MENU_DEMO == 1

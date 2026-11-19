@@ -40,6 +40,15 @@ boot, and the shell apps (calculator, notes, media player, file manager, task ma
 not one of them: it is a ring-3 process that opens a window and does its own fetching, parsing and
 layout.
 
+**The tray reports the machine, not a picture of it.** Network and audio sit at the right end of
+the bar, left of the clock, in the order Windows has used for twenty years so a hand goes to the
+right place without reading. Both glyphs are status: the speaker becomes the struck-through face
+when the DAC is muted, the network one when DHCP has produced no address. Clicking either opens a
+flyout above the bar — a vertical slider that writes the codec's gain register through
+`audio_volume_set`, and a panel that names the link, says whether it holds an address, and prints
+the address and gateway it holds. Nothing in either panel is cached: every frame re-reads
+`audio_muted()` and `net_get()->valid`.
+
 **That is the part that has to change**, and it is the first item in the Chromium section below:
 the kernel composites and owns the frame's last pixels, so a client cannot draw its own scrollbar
 over the frame, every glyph crosses the syscall boundary, and a visual fix costs a kernel rebuild.
@@ -218,8 +227,12 @@ with specific properties. Here is the honest ledger, in the order the work has t
    is written against this kernel's own numbers, and the ABI switch would be a second door, so it is
    the violation. One filtered door is the point - it is also why a musl-linked binary cannot be run
    under a filter today.
-4. **A font stack beyond one 8×16 bitmap face**, and text shaping. Chromium renders through Skia and
-   HarfBuzz; the browser here has one bitmap face and no shaping at all.
+4. **A font stack beyond one 8×16 bitmap face**, and text shaping. Half of this is done: the shell
+   draws its headings with real TrueType — Bricolage for display, JetBrains Mono for anything that
+   has to line up — through stb_truetype, with the faces arriving as boot modules and a bitmap
+   fallback if they are missing. What is missing is the other half: Omi Net still lays its own text
+   out with the bitmap face, and no glyph is shaped (no kerning, no ligatures, no complex scripts).
+   Chromium renders through Skia and HarfBuzz and expects both.
 5. **A GPU or a fast software raster.** Every pixel is composed on the CPU today.
 6. **A JavaScript engine.** The largest single chunk, and the last to attempt: V8 wants the cage, the
    threads, the signal-based traps, and a memory model this kernel does not have yet.
@@ -276,8 +289,15 @@ build — that is what nasm is for — and its output stays in `limine/`, which 
 
 ```bash
 sudo apt install clang lld nasm xorriso qemu-system-x86
-make                 # -> omi.iso
+make                 # -> omi.iso: the desktop, no test suites
+make TESTS=1         # -> omi.iso: every suite, then the ring-3 display server
 ```
+
+The default build is the one a person uses. `TESTS=1` is the verification boot: roughly three
+hundred suites, the boot self-tests, and the display server that takes the screen at the end of
+them. Both are the same kernel and the same userland with one macro flipped, so a fix cannot land
+in one and rot in the other — but an ISO you boot to look at a desktop should not spend two minutes
+proving itself first. `DEV=1` goes further and spawns only the browser.
 
 ## Run
 

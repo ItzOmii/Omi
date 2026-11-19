@@ -32,7 +32,12 @@ KERNEL := $(BUILD_DIR)/kernel.elf
 # accident. The flag lives in a generated header, so switching costs one object
 # file rather than the whole kernel.
 DEV ?= 0
-$(shell mkdir -p $(KERNEL_DIR)/include; printf '#define OMI_DEV_BOOT %s\n' $(DEV) > /tmp/devboot.new.$$$$ 2>/dev/null; cmp -s /tmp/devboot.new.$$$$ $(KERNEL_DIR)/include/devboot.h 2>/dev/null || cp /tmp/devboot.new.$$$$ $(KERNEL_DIR)/include/devboot.h; rm -f /tmp/devboot.new.$$$$)
+# TESTS=0 is what an ISO someone actually uses looks like: the desktop, its apps
+# and the browser, with no two-minute suite run in front of them. TESTS=1 is the
+# verification boot - every suite, then the ring-3 display server - and it stays
+# one flag away because a boot nobody measures against is a boot that rots.
+TESTS ?= 0
+$(shell mkdir -p $(KERNEL_DIR)/include; printf '#define OMI_DEV_BOOT %s\n#define OMI_TESTS %s\n' $(DEV) $(TESTS) > /tmp/devboot.new.$$$$ 2>/dev/null; cmp -s /tmp/devboot.new.$$$$ $(KERNEL_DIR)/include/devboot.h 2>/dev/null || cp /tmp/devboot.new.$$$$ $(KERNEL_DIR)/include/devboot.h; rm -f /tmp/devboot.new.$$$$)
 ifeq ($(DEV),1)
 ISO := omi-dev.iso
 else
@@ -51,6 +56,7 @@ POWER_DEMO ?= 0
 
 # MENU_DEMO=1 opens the start menu at first paint, so a screenshot shows it.
 MENU_DEMO ?= 0
+TRAY_DEMO ?= 0
 
 CFLAGS := -target x86_64-unknown-none-elf \
           -ffreestanding \
@@ -71,6 +77,7 @@ CFLAGS := -target x86_64-unknown-none-elf \
           -DOMI_PANIC_DEMO=$(PANIC_DEMO) \
           -DOMI_POWER_DEMO=$(POWER_DEMO) \
           -DOMI_MENU_DEMO=$(MENU_DEMO) \
+          -DOMI_TRAY_DEMO=$(TRAY_DEMO) \
           -g
 
 # Use GCC-compatible flags if using cross compiler
@@ -93,6 +100,7 @@ CFLAGS := -ffreestanding \
           -DOMI_PANIC_DEMO=$(PANIC_DEMO) \
           -DOMI_POWER_DEMO=$(POWER_DEMO) \
           -DOMI_MENU_DEMO=$(MENU_DEMO) \
+          -DOMI_TRAY_DEMO=$(TRAY_DEMO) \
           -g
 endif
 

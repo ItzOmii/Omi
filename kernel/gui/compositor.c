@@ -10,6 +10,8 @@
 #include "../include/gui.h"
 #include "../include/kmalloc.h"
 #include "../include/media.h"
+#include "../include/hda.h"
+#include "../include/net.h"
 #include "../include/pci.h"
 #include "../include/ps2.h"
 #include "../include/usb.h"
@@ -4365,6 +4367,235 @@ static void draw_taskbar(void) {
   }
 }
 
+/* ---- the system tray --------------------------------------------------
+ *
+ * Right end of the bar, left of the clock: network, then audio. Windows has put
+ * them there for twenty years, and the point of copying that is that a hand goes
+ * to the right place without reading anything.
+ *
+ * The icons carry status rather than being decoration: a muted speaker is the
+ * speaker-with-a-cross mask, and a network with no address is the struck-through
+ * one. Both are read from live state on every frame - audio_muted() is the DAC's
+ * own gain, net_get()->valid is whether a DHCP ACK landed - so the picture cannot
+ * drift from what the machine is doing.
+ *
+ * Clicking either one opens a panel above the bar, anchored to its icon's right
+ * edge so it grows leftwards like a Windows flyout. The audio panel is a vertical
+ * slider with a mute row under it; the network panel says what the link is called,
+ * whether it has an address, and what that address is.
+ */
+static void handle_mouse_click(int x, int y, int button);
+
+static int tray_open = 0;      /* 0 none, 1 audio, 2 network */
+static int tray_hover = 0;
+
+#define TRAY_ICON_BASE 16
+
+static int tray_clock_w(void) {
+  char clock[32];
+  meep_clock_text(clock);
+  return meep_text_w(&meep_m115, clock);
+}
+
+static void tray_icon_rect(int which, int *x, int *y, int *w, int *h) {
+  int th = taskbar_h(), ty = taskbar_y();
+  int s = UI_SCALE_VAL(TRAY_ICON_BASE);
+  /* tray_clock_w() is a 1x text measurement; in the supersampled pass everything
+   * else here is scaled by ui_scale, so it has to be too - otherwise the icons are
+   * drawn at one place and their panel's blend region is computed at another. */
+  int right = (int)screen_width - UI_SCALE_VAL(16) - tray_clock_w() * ui_scale - UI_SCALE_VAL(14);
+  *w = s;
+  *h = s;
+  *y = ty + (th - s) / 2;
+  if (which == 1) *x = right - s;                          /* audio, by the clock */
+  else            *x = right - s - UI_SCALE_VAL(6) - s;    /* network, left of it */
+}
+
+static void tray_popup_rect(int which, int *x, int *y, int *w, int *h) {
+  int ix, iy, iw, ih;
+  tray_icon_rect(which, &ix, &iy, &iw, &ih);
+  if (which == 1) { *w = UI_SCALE_VAL(78);  *h = UI_SCALE_VAL(228); }
+  else            { *w = UI_SCALE_VAL(252); *h = UI_SCALE_VAL(126); }
+  *x = ix + iw - *w;                       /* right edge flush with the icon */
+  if (*x < UI_SCALE_VAL(8)) *x = UI_SCALE_VAL(8);
+  *y = taskbar_y() - *h - UI_SCALE_VAL(8);
+}
+
+static void tray_track_rect(int *x, int *y, int *w, int *h) {
+  int px, py, pw, ph;
+  tray_popup_rect(1, &px, &py, &pw, &ph);
+  *w = UI_SCALE_VAL(10);
+  *h = ph - UI_SCALE_VAL(86);
+  *x = px + (pw - *w) / 2;
+  *y = py + UI_SCALE_VAL(36);
+}
+
+static void tray_mute_rect(int *x, int *y, int *w, int *h) {
+  int px, py, pw, ph;
+  tray_popup_rect(1, &px, &py, &pw, &ph);
+  *w = pw - UI_SCALE_VAL(16);
+  *h = UI_SCALE_VAL(26);
+  *x = px + UI_SCALE_VAL(8);
+  *y = py + ph - *h - UI_SCALE_VAL(10);
+}
+
+/* A 16px target is small on a 1280 screen, so the hit box gets a few pixels of
+ * slack on every side - the same reason Windows' tray icons are bigger than they
+ * look. */
+static int tray_hit(int x, int y) {
+  for (int which = 1; which <= 2; which++) {
+    int ix, iy, iw, ih;
+    tray_icon_rect(which, &ix, &iy, &iw, &ih);
+    if (x >= ix - UI_SCALE_VAL(5) && x < ix + iw + UI_SCALE_VAL(5) &&
+        y >= iy - UI_SCALE_VAL(5) && y < iy + ih + UI_SCALE_VAL(5))
+      return which;
+  }
+  return 0;
+}
+
+static int tray_popup_has(int x, int y) {
+  if (!tray_open) return 0;
+  int px, py, pw, ph;
+  tray_popup_rect(tray_open, &px, &py, &pw, &ph);
+  return x >= px && x < px + pw && y >= py && y < py + ph;
+}
+
+static int tray_net_up(void) {
+  const net_cfg_t *c = net_get();
+  return c && c->valid;
+}
+
+static int tray_utoa(int v, char *out) {
+  char tmp[4];
+  int n = 0;
+  if (v <= 0) tmp[n++] = '0';
+  while (v > 0) { tmp[n++] = (char)('0' + v % 10); v /= 10; }
+  for (int i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+  return n;
+}
+
+static void tray_ip(char *out, const uint8_t ip[4]) {
+  char *p = out;
+  for (int i = 0; i < 4; i++) {
+    p += tray_utoa(ip[i], p);
+    if (i < 3) *p++ = '.';
+  }
+  *p = 0;
+}
+
+static void draw_tray(void) {
+  if (tray_open) {
+    int px, py, pw, ph;
+    tray_popup_rect(tray_open, &px, &py, &pw, &ph);
+    /* PAPER2, not PAPER: in midnight theme PAPER is the wallpaper's own value and
+     * the panel would be a rectangle of nothing. The start menu learned this
+     * already; this is the same fill. */
+    meep_box(px, py + UI_SCALE_VAL(2), pw, ph, UI_SCALE_VAL(10), MEEP_LINE, MEEP_PAPER2);
+    if (tray_open == 1) {
+      int tx, ty, tw, th;
+      tray_track_rect(&tx, &ty, &tw, &th);
+      meep_box(tx, ty, tw, th, tw / 2, MEEP_LINE_SOFT, MEEP_PAPER3);
+      int pct = audio_muted() ? 0 : audio_volume();
+      int fh = th * pct / 100;
+      if (fh > 0) meep_box(tx, ty + th - fh, tw, fh, tw / 2, MEEP_ACCENT, MEEP_ACCENT);
+      int knob = UI_SCALE_VAL(14);
+      int ky = ty + th - fh - knob / 2;
+      if (ky < ty) ky = ty - knob / 2;
+      if (ky > ty + th - knob / 2) ky = ty + th - knob / 2;
+      meep_box(tx + tw / 2 - knob / 2, ky, knob, knob, knob / 2, MEEP_ACCENT, MEEP_PAPER);
+      int mx, my, mw, mh;
+      tray_mute_rect(&mx, &my, &mw, &mh);
+      meep_box(mx, my, mw, mh, UI_SCALE_VAL(6), MEEP_LINE_SOFT,
+               audio_muted() ? MEEP_ACCENT : MEEP_PAPER3);
+      int g = UI_SCALE_VAL(13);
+      meep_icon(audio_muted() ? ICON_VOLUME_OFF : ICON_VOLUME,
+                mx + UI_SCALE_VAL(7), my + (mh - g) / 2, g, MEEP_INK);
+    }
+  }
+  for (int which = 1; which <= 2; which++) {
+    int ix, iy, iw, ih;
+    tray_icon_rect(which, &ix, &iy, &iw, &ih);
+    if (tray_open == which || tray_hover == which) {
+      meep_box(ix - UI_SCALE_VAL(5), iy - UI_SCALE_VAL(5), iw + UI_SCALE_VAL(10),
+               ih + UI_SCALE_VAL(10), UI_SCALE_VAL(6), MEEP_LINE_SOFT,
+               tray_open == which ? MEEP_PRESS : MEEP_PAPER3);
+    }
+    int ic;
+    if (which == 1)
+      ic = (audio_muted() || audio_volume() == 0) ? ICON_VOLUME_OFF : ICON_VOLUME;
+    else
+      ic = tray_net_up() ? ICON_NET : ICON_NET_OFF;
+    meep_icon(ic, ix, iy, iw, MEEP_INK);
+  }
+}
+
+static void draw_tray_text(void) {
+  if (!tray_open) return;
+  int px, py, pw, ph;
+  tray_popup_rect(tray_open, &px, &py, &pw, &ph);
+
+  if (tray_open == 1) {
+    char pct[8];
+    int v = audio_muted() ? 0 : audio_volume();
+    int n = tray_utoa(v, pct);
+    pct[n++] = '%';
+    pct[n] = 0;
+    int tw = meep_text_w(&meep_s130, pct);
+    meep_text(&meep_s130, px + (pw - tw) / 2, py + UI_SCALE_VAL(12), pct, MEEP_INK);
+    int mx, my, mw, mh;
+    tray_mute_rect(&mx, &my, &mw, &mh);
+    const char *lab = audio_muted() ? "unmute" : "mute";
+    meep_text(&meep_m115, mx + UI_SCALE_VAL(26), my + (mh - meep_line_h(&meep_m115)) / 2,
+              lab, MEEP_INK);
+    return;
+  }
+
+  /* the network panel: what it is, whether it is up, and what address it holds */
+  int up = tray_net_up();
+  const net_cfg_t *c = net_get();
+  meep_text(&meep_s130, px + UI_SCALE_VAL(12), py + UI_SCALE_VAL(10), "Ethernet", MEEP_INK);
+  meep_text(&meep_m115, px + UI_SCALE_VAL(12), py + UI_SCALE_VAL(36),
+            up ? "connected" : "no address", up ? MEEP_INK : MEEP_INK_SOFT);
+  if (up) {
+    char line[32], ip[20];
+    tray_ip(ip, c->ip);
+    int i = 0;
+    line[i++] = 'i'; line[i++] = 'p'; line[i++] = ' ';
+    for (const char *q = ip; *q; q++) line[i++] = *q;
+    line[i] = 0;
+    meep_text(&meep_m115, px + UI_SCALE_VAL(12), py + UI_SCALE_VAL(60), line, MEEP_INK);
+    tray_ip(ip, c->gw);
+    i = 0;
+    line[i++] = 'g'; line[i++] = 'w'; line[i++] = ' ';
+    for (const char *q = ip; *q; q++) line[i++] = *q;
+    line[i] = 0;
+    meep_text(&meep_m115, px + UI_SCALE_VAL(12), py + UI_SCALE_VAL(80), line, MEEP_INK_SOFT);
+    meep_text(&meep_m115, px + UI_SCALE_VAL(12), py + UI_SCALE_VAL(100),
+              "OmiNet", MEEP_INK_SOFT);
+  } else {
+    meep_text(&meep_m115, px + UI_SCALE_VAL(12), py + UI_SCALE_VAL(60),
+              "no link", MEEP_INK_SOFT);
+  }
+}
+
+/* TRAY_DEMO: open a panel without a pointer.
+ *
+ * =3 is the one that matters: it opens the audio panel and then spends a click on
+ * the slider a quarter of the way down, through handle_mouse_click - the same
+ * function the mouse driver calls. The screenshot then has to show 75%, which is
+ * only possible if the hit test, the clamp and audio_volume_set all really ran. */
+void gui_open_tray(int which) {
+  tray_hover = 0;
+  if (which == 3) {
+    tray_open = 1;
+    int tx, ty, tw, th;
+    tray_track_rect(&tx, &ty, &tw, &th);
+    handle_mouse_click(tx + tw / 2, ty + th / 4, 1);
+    return;
+  }
+  tray_open = which;
+}
+
 /* ---- text: stamped at 1x so the atlas' own coverage survives ----------- */
 static void draw_taskbar_text(void) {
   int th = taskbar_h(), ty = taskbar_y();
@@ -5634,6 +5865,8 @@ static void update_hover(void) {
         if (mouse_x >= xs[i] && mouse_x < xs[i] + ws[i]) nh = ids[i];
     }
   }
+  int th_hover = (mouse_y >= taskbar_y()) ? tray_hit(mouse_x, mouse_y) : 0;
+  if (th_hover != tray_hover) { tray_hover = th_hover; needs_redraw = 1; full_redraw = 1; }
   int sh = start_open ? sm_row_at(mouse_x, mouse_y) : -1;
   {
     int ch = ctm_open ? ctm_row_at(mouse_x, mouse_y) : -1;
@@ -6285,6 +6518,15 @@ static void handle_mouse_click(int x, int y, int button) {
 
   /* the taskbar is chrome: it sits above every window */
   if (y >= taskbar_y()) {
+    int tw = tray_hit(x, y);
+    if (tw) {                               /* an icon: its panel toggles */
+      tray_open = (tray_open == tw) ? 0 : tw;
+      tray_hover = tw;
+      start_open = 0;
+      needs_redraw = 1;
+      full_redraw = 1;
+      return;
+    }
     if (start_button_hit(x, y)) {
       start_open = !start_open;
       start_hover = -1;
@@ -6306,6 +6548,37 @@ static void handle_mouse_click(int x, int y, int button) {
     needs_redraw = 1;
     full_redraw = 1;
     return;
+  }
+
+  if (tray_popup_has(x, y)) {
+    if (tray_open == 1) {
+      int tx, ty, tw2, th2;
+      tray_track_rect(&tx, &ty, &tw2, &th2);
+      /* the whole column around the track takes a click: a 10px slider is not
+       * something to make a person aim at */
+      if (x >= tx - UI_SCALE_VAL(16) && x < tx + tw2 + UI_SCALE_VAL(16) &&
+          y >= ty && y < ty + th2) {
+        int pct = (ty + th2 - y) * 100 / th2;
+        audio_volume_set(pct);          /* writes the DAC's amp, not a flag */
+        needs_redraw = 1;
+        full_redraw = 1;
+        return;
+      }
+      int mx, my, mw, mh;
+      tray_mute_rect(&mx, &my, &mw, &mh);
+      if (x >= mx && x < mx + mw && y >= my && y < my + mh) {
+        audio_mute(audio_muted() ? 0 : 1);
+        needs_redraw = 1;
+        full_redraw = 1;
+        return;
+      }
+    }
+    return;                                 /* the panel swallows the rest */
+  }
+  if (tray_open) {                          /* a click anywhere else closes it */
+    tray_open = 0;
+    needs_redraw = 1;
+    full_redraw = 1;
   }
 
   if (start_open) {                        /* dismiss, and let the click land */
@@ -6867,9 +7140,11 @@ static void gui_draw_all(void) {
   ss_prepare();
   if (!ss_buf) {                    /* out of memory: fall back to hard edges */
     draw_taskbar();
+    draw_tray();
     draw_start_menu();
     draw_cursor(mouse_x, mouse_y);
     draw_taskbar_text();
+    draw_tray_text();
     draw_ctm_text();
     return;
   }
@@ -6882,6 +7157,9 @@ static void gui_draw_all(void) {
 
   /* the dropdown lives below the bar, so it needs a region of its own */
   int px = 0, py = 0, pw = 0, ph = 0;
+  if (!start_open && tray_open) {            /* a tray panel needs one too */
+    tray_popup_rect(tray_open, &px, &py, &pw, &ph);
+  }
   if (start_open) {                          /* the start menu needs its own region */
     sm_rect(&px, &py, &pw, &ph);
     px -= 4; py -= 4; pw += 8; ph += 8;      /* slack for the radius + shadow */
@@ -6910,6 +7188,7 @@ static void gui_draw_all(void) {
   draw_start_menu();                       /* under the bar, above the windows */
   draw_ctm();
   draw_taskbar();
+  draw_tray();                             /* icons in the bar, panel above it */
   draw_cursor(mouse_x * SX, mouse_y * SX);
 
   backbuffer = rb;
@@ -6936,6 +7215,7 @@ static void gui_draw_all(void) {
 
   /* 7. type on top, at 1x, with the atlas' own anti-aliasing */
   draw_taskbar_text();
+  draw_tray_text();
   draw_ctm_text();
   draw_cursor(mouse_x, mouse_y);        /* keep the pointer above the windows */
 
