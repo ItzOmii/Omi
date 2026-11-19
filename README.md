@@ -161,8 +161,9 @@ with specific properties. Here is the honest ledger, in the order the work has t
    draws as proof of life - merges the ones that touch, repaints only those, and flushes only those
    to the display. A whole screen is 1,024,000 pixels; an idle frame sends 3,840 (the sweep's strip).
    Over a 3,000-frame run: **3,001 patches, 12,586,421 pixels painted, against 3,072,000,000 if
-   every frame had been whole - four pixels in a thousand**. Every drawing primitive takes a clip rectangle and computes
-   its bounds from it, so repainting a 20x20 blink does not walk a 438x328 surface.
+   every frame had been whole - four pixels in a thousand**. Every drawing primitive takes the patch
+   as a clip and works its bounds out from that, so repainting a 20x20 blink does not walk a 438x328
+   surface.
 
    What is still missing from this item: a window that has no surface is not a window yet. The server
    discovers windows through their surfaces (`SYS_SURF_LIST`), so a window exists for it only once
