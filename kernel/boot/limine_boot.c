@@ -574,11 +574,19 @@ void _start(void) {
   ring3_spawn_elf("mem",      "memtest.elf", 0);
   ring3_spawn_elf("surftest", "surftest.elf", 0);
 
-  /* The scene: the screen's pixels handed to a ring-3 process. It waits for
-   * the boot tests to finish before it takes anything over - see scene.c. */
+  /* The screen: the first ring-3 owner of it, which holds it while the boot
+   * tests paint, then paints its own phases, then leaves.
+   *
+   * The order between this and the display server is settled by who asks for
+   * the scene first, and it has to be this program: the display server turns
+   * the kernel's painting off when it takes the screen, and the boot tests
+   * above are still being drawn. So this asks first and the server waits on
+   * -EBUSY until it leaves. It used to ask 35 seconds in - after the boot tests
+   * were done - and by then the server had taken the scene and this program
+   * could only print `FAIL map: -16`. */
   ring3_spawn_elf("scene", "scene.elf", 0);
-  /* And then the display server, which waits for scene to give the screen back
-   * and composites every window itself. */
+  /* And then the display server, which waits for the screen to come free and
+   * composites every window's pixels itself, with furniture of its own. */
   ring3_spawn_elf("comp", "comp.elf", 0);
   ring3_spawn_elf("omirender", "omirender.elf", 0);
   ring3_spawn_elf("surfexit", "surfexit.elf", 0);

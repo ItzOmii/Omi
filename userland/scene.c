@@ -22,6 +22,7 @@
  * from outside, by sampling the framebuffer at the coordinates and colours it
  * prints below.
  */
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <time.h>
@@ -143,11 +144,15 @@ static long own_rect(long x, long y, long w, long h) {
 }
 
 int main(void) {
-  /* The boot tests own the screen for their first half-minute and their
-   * windows are the point of them; this program waits its turn. */
-  ms(35000);
-
+  /* Not part of a stock boot any more: the display server takes the scene and
+   * this program is the older owner of it. If comp got there first this says so
+   * and leaves; run it on a boot without comp to check the kernel's side of the
+   * mapping - writable, the same address twice, the pixels in a rectangle. */
   long addr = sys0(SYS_SCENE_MAP);
+  if (addr == -EBUSY) {
+    printf("[scene] skip: the display server owns the screen (run this without comp)\n");
+    return 0;
+  }
   if (addr < 0) { printf("[scene] FAIL map: %ld\n", addr); return 1; }
   uint32_t geom[3] = {0, 0, 0};
   long gi = sys1(SYS_SCENE_INFO, (long)geom);
@@ -168,6 +173,15 @@ int main(void) {
   for (uint32_t y = 0; y < sh; y += 64)
     sum += ((uint32_t *)((uint8_t *)scene + (size_t)y * stride))[0];
   printf("[scene] read back %u rows, sum %lu, writable\n", (sh + 63) / 64, sum);
+
+  /* Claimed before the wait, not after it. The scene has one owner and the
+   * display server asks for it at boot too, so whoever asks first settles the
+   * order; asking 35 seconds late settled it the wrong way and this program
+   * could only ever print a failure. Nothing here is painted while it waits:
+   * the mapping is claimed, the handoff stays off, and the kernel goes on
+   * compositing the boot tests' windows exactly as before. The wait is for the
+   * phases below, which do paint. */
+  ms(35000);
 
   /* ---- phase one: a rectangle of our own, with the kernel's desktop alive
    * around it. Nothing stops the kernel compositing while it runs, and that was
