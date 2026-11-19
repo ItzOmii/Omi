@@ -41,6 +41,9 @@
 #define SYS_WIN_PLACE     52   /* (id, x, y, (w<<16)|h): the server placing a window */
 #define SYS_WIN_CLOSE     10
 #define SYS_WIN_TITLE     53   /* (id, char *out, max) -> length */
+#define SYS_SURF_DAMAGE   54   /* (win, int32_t out[4]) -> 1 a rect changed,
+                                * 0 nothing new. Takes the damage: the caller
+                                * is the thing that will paint it. */
 
 #define MAXWIN 12
 #define BG      0x00101828u   /* the server's own desktop */
@@ -89,32 +92,111 @@ static void ms(int m) {
 static uint32_t *scene;
 static uint32_t sw, sh, stride;
 
-static void rect(long x, long y, long w, long h, uint32_t c) {
-  for (long j = 0; j < h; j++) {
-    long ty = y + j;
-    if (ty < 0 || ty >= (long)sh) continue;
-    uint32_t *row = (uint32_t *)((uint8_t *)scene + (size_t)ty * stride);
-    for (long i = 0; i < w; i++) {
-      long tx = x + i;
-      if (tx < 0 || tx >= (long)sw) continue;
-      row[tx] = c;
+struct win {
+  int      id;
+  uint32_t *px;
+  long     w, h, stride;
+  long     x, y;          /* where the last frame put it */
+  long     ww, hh;        /* and at what size */
+  int      placed;        /* 0 until it has been on screen once */
+  char     title[32];
+};
+
+/* ---- what changed ----
+ * The frame is not rebuilt from the wallpaper any more. The server keeps a list
+ * of the rectangles that changed and repaints those, and only those reach the
+ * display. Every primitive below draws through g_clip, so the same code that
+ * used to paint a whole frame repaints one damaged patch of it - and the patch
+ * is a bounds computation, not a per-pixel test, because a display server that
+ * walks a 438x328 surface to repaint a 20x20 blink is not damage-limited in any
+ * way that matters. */
+struct rect { long x, y, w, h; };
+static struct rect g_clip;             /* the patch being repaired */
+/* The scene as this frame sees it, in stack order: geometry read once, drawn
+ * once per patch. */
+static struct { struct win *w; long x, y, ww, hh; } g_frame[MAXWIN];
+static int  g_nframe;
+static int  g_focus_drawn = -1;
+static long g_mx_drawn = -100000, g_my_drawn = -100000;
+static long g_sweep_drawn = -1;
+static uint64_t dmg_px_total, dmg_frames, dmg_full_px;
+static struct rect g_dmg[MAXWIN * 6];  /* what has changed since the last frame */
+static int  g_ndmg;
+static int  g_full = 1;                /* nothing known yet: paint everything */
+
+static void dmg_add(long x, long y, long w, long h) {
+  if (w <= 0 || h <= 0) return;
+  if (x < 0) { w += x; x = 0; }
+  if (y < 0) { h += y; y = 0; }
+  if (x + w > (long)sw) w = (long)sw - x;
+  if (y + h > (long)sh) h = (long)sh - y;
+  if (w <= 0 || h <= 0) return;
+  /* Merged with anything it touches. Merging is what keeps a frame with a
+   * moving pointer and a scrolling client from spilling the list: touching
+   * rectangles become one, and the list only runs out when the damage really is
+   * everywhere. */
+  for (int i = 0; i < g_ndmg; i++) {
+    if (x <= g_dmg[i].x + g_dmg[i].w && x + w >= g_dmg[i].x &&
+        y <= g_dmg[i].y + g_dmg[i].h && y + h >= g_dmg[i].y) {
+      long x1 = x < g_dmg[i].x ? x : g_dmg[i].x;
+      long y1 = y < g_dmg[i].y ? y : g_dmg[i].y;
+      long x2 = x + w > g_dmg[i].x + g_dmg[i].w ? x + w : g_dmg[i].x + g_dmg[i].w;
+      long y2 = y + h > g_dmg[i].y + g_dmg[i].h ? y + h : g_dmg[i].y + g_dmg[i].h;
+      g_dmg[i].x = x1; g_dmg[i].y = y1; g_dmg[i].w = x2 - x1; g_dmg[i].h = y2 - y1;
+      return;
     }
+  }
+  if (g_ndmg == (int)(sizeof g_dmg / sizeof g_dmg[0])) { g_full = 1; return; }
+  g_dmg[g_ndmg].x = x; g_dmg[g_ndmg].y = y;
+  g_dmg[g_ndmg].w = w; g_dmg[g_ndmg].h = h;
+  g_ndmg++;
+}
+
+/* A window's whole frame: the bar, the edges, the client. What a move, a
+ * raise, a focus change or a close has to repaint. */
+#define FRAME_X(w) ((w)->x - 3)
+#define FRAME_Y(w) ((w)->y - BAR_H)
+#define FRAME_W(w) ((w)->ww + 6)
+#define FRAME_H(w) ((w)->hh + BAR_H + 3)
+static void dmg_frame(const struct win *w) {
+  dmg_add(FRAME_X(w), FRAME_Y(w), FRAME_W(w), FRAME_H(w));
+}
+
+/* A rectangle against the screen and the patch being repaired. */
+static int clip_rect(long *r) {
+  long x = r[0], y = r[1], x1 = r[0] + r[2], y1 = r[1] + r[3];
+  if (x < 0) x = 0;
+  if (y < 0) y = 0;
+  if (x1 > (long)sw) x1 = (long)sw;
+  if (y1 > (long)sh) y1 = (long)sh;
+  if (x < g_clip.x) x = g_clip.x;
+  if (y < g_clip.y) y = g_clip.y;
+  if (x1 > g_clip.x + g_clip.w) x1 = g_clip.x + g_clip.w;
+  if (y1 > g_clip.y + g_clip.h) y1 = g_clip.y + g_clip.h;
+  if (x1 <= x || y1 <= y) return 0;
+  r[0] = x; r[1] = y; r[2] = x1 - x; r[3] = y1 - y;
+  return 1;
+}
+
+static void rect(long x, long y, long w, long h, uint32_t c) {
+  long r[4] = {x, y, w, h};
+  if (!clip_rect(r)) return;
+  for (long ty = r[1]; ty < r[1] + r[3]; ty++) {
+    uint32_t *row = (uint32_t *)((uint8_t *)scene + (size_t)ty * stride);
+    for (long tx = r[0]; tx < r[0] + r[2]; tx++) row[tx] = c;
   }
 }
 
 /* Rows, from whatever address the map handed over. */
 static void blit(const uint32_t *px, long src_stride, long src_w, long src_h,
                  long dx, long dy) {
-  for (long y = 0; y < src_h; y++) {
-    long ty = dy + y;
-    if (ty < 0 || ty >= (long)sh) continue;
-    const uint32_t *srow = (const uint32_t *)((const uint8_t *)px + (size_t)y * src_stride);
-    uint32_t *drow = (uint32_t *)((uint8_t *)scene + (size_t)ty * stride);
-    for (long x = 0; x < src_w; x++) {
-      long tx = dx + x;
-      if (tx < 0 || tx >= (long)sw) continue;
-      drow[tx] = srow[x];
-    }
+  long r[4] = {dx, dy, src_w, src_h};
+  if (!clip_rect(r)) return;
+  long sx = r[0] - dx, sy = r[1] - dy;
+  for (long y = 0; y < r[3]; y++) {
+    const uint32_t *srow = (const uint32_t *)((const uint8_t *)px + (size_t)(sy + y) * src_stride);
+    uint32_t *drow = (uint32_t *)((uint8_t *)scene + (size_t)(r[1] + y) * stride);
+    for (long x = 0; x < r[2]; x++) drow[r[0] + x] = srow[sx + x];
   }
 }
 
@@ -131,7 +213,8 @@ static void glyphs_draw(long x, long y, const char *t, uint32_t col) {
       for (int c = 0; c < GLYPH_W; c++)
         if (bits & (0x80u >> c)) {
           long ty = y + r, tx = x + c;
-          if (ty < 0 || ty >= (long)sh || tx < 0 || tx >= (long)sw) continue;
+          if (ty < g_clip.y || ty >= g_clip.y + g_clip.h) continue;
+          if (tx < g_clip.x || tx >= g_clip.x + g_clip.w) continue;
           *(uint32_t *)((uint8_t *)scene + (size_t)ty * stride + (size_t)tx * 4) = col;
         }
     }
@@ -142,13 +225,6 @@ static void glyphs_draw(long x, long y, const char *t, uint32_t col) {
 /* One window: the pixels the map gave us, and the size they arrived in. A
  * window's contents can change size under us, so the size is re-checked each
  * frame from the list; the stride is not, because a surface never moves. */
-struct win {
-  int      id;
-  uint32_t *px;
-  long     w, h, stride;
-  long     x, y;          /* where the last frame put it */
-  char     title[32];
-};
 
 /* Find the record for a window, or make one: map its pixels read-only once and
  * read its title once. The pixels never move for the life of the window; the
@@ -212,11 +288,12 @@ static void stack_add(int id) {
   if (stack_index(id) < 0 && g_nstack < MAXWIN) g_stack[g_nstack++] = id;
 }
 
-static void stack_raise(int id) {
+static int stack_raise(int id) {          /* 1 when the order actually changed */
   int i = stack_index(id);
-  if (i < 0) return;
+  if (i < 0 || i == g_nstack - 1) return 0;
   for (; i + 1 < g_nstack; i++) g_stack[i] = g_stack[i + 1];
   g_stack[g_nstack - 1] = id;
+  return 1;
 }
 
 /* Forget windows that closed. Called with the list the kernel just handed over,
@@ -229,7 +306,7 @@ static void stack_prune(const int32_t *list, int n) {
     if (found) g_stack[keep++] = g_stack[i];
     else {
       struct win *w = byid(g_stack[i]);
-      if (w) w->id = 0;                 /* the record goes with the window */
+      if (w) { if (w->placed) dmg_frame(w); w->id = 0; w->placed = 0; }
       if (g_focus == g_stack[i]) g_focus = 0;
       if (g_drag == g_stack[i]) g_drag = 0;
     }
@@ -299,12 +376,13 @@ int main(void) {
   printf("[comp] the screen is this process's; the kernel paints nothing\n");
 
   int frames = 0, bad_geom = 0;
-  int worst = -1;
+  int worst = -1;   /* kept for the closing report below */
 
   long got = sys1(SYS_INPUT_TAKE, 1);
   printf("[comp] input: %s\n", got ? "the keyboard and pointer are this process's"
                                     : "refused - somebody else is serving");
   int keys = 0, clicks = 0, fwd = 0, refused = 0, moves = 0, drag_said = 0;
+  int client_dmg = 0, dmg_said = 0;
 
   for (int f = 0; f < 3000; f++) {           /* ~3 min at 60 ms */
     /* First the events, against the geometry of the frame that is on screen. */
@@ -344,7 +422,7 @@ int main(void) {
         g_mx = a; g_my = b; g_have_mouse = 1;
         int id = hit(g_mx, g_my);
         struct win *w = id ? byid(id) : 0;
-        if (w) stack_raise(id);              /* clicking a window brings it forward */
+        if (w && stack_raise(id)) dmg_frame(w);   /* clicking brings it forward */
         g_focus = id;
         int at = w ? frame_hit(w, g_mx, g_my) : AT_OUTSIDE;
         if (at == AT_CLOSE && w) {
@@ -390,13 +468,15 @@ int main(void) {
       }
     }
 
+    /* ---- what changed since the last frame ---- */
     int32_t list[3 * MAXWIN];
     int n = (int)sys3(SYS_SURF_LIST, (long)list, MAXWIN, 0);
-    stack_prune(list, n);
+    stack_prune(list, n);        /* a window that went away damages where it was */
     for (int i = 0; i < n; i++) stack_add(list[i * 3 + 0]);
 
-    rect(0, 0, sw, sh, BG);
-
+    /* The scene, read once: where every window is this frame, in stack order. A
+     * move, a resize or a first appearance damages the place it left and the
+     * place it took. */
     int drawn = 0;
     for (int i = 0; i < g_nstack; i++) {
       struct win *w = win_map(g_stack[i]);
@@ -404,40 +484,114 @@ int main(void) {
       int32_t g[4] = {0, 0, 0, 0};
       if (sys3(SYS_WIN_GEOM, w->id, (long)g, 0) != 0) { bad_geom++; continue; }
       long x = g[0], y = g[1], ww = g[2], hh = g[3];
+      int moved = !w->placed || x != w->x || y != w->y || ww != w->ww || hh != w->hh;
+      if (moved && w->placed) dmg_frame(w);          /* where it was */
+      w->x = x; w->y = y; w->ww = ww; w->hh = hh;
+      if (moved) { dmg_frame(w); w->placed = 1; }    /* and where it is now */
 
-      /* Furniture first, and it is the server's: the edge, the title bar, the
-       * title text out of the kernel's own glyph table, a close box. Then the
-       * client's pixels, which the server never drew. */
-      rect(x - 3, y - 3, ww + 6, hh + 6, EDGE);
-      rect(x - 3, y - BAR_H, ww + 6, BAR_H - 2, w->id == g_focus ? FOCUS : TITLE);
-      glyphs_draw(x + 4, y - BAR_H + 2, w->title, TEXT);
-      rect(x + ww - 19, y - 19, 16, 16, CLOSE);
-      glyphs_draw(x + ww - 15, y - 17, "x", CLOSEX);
-      blit(w->px, w->stride, w->w, w->h, x, y);
-      w->x = x; w->y = y;
+      /* The client's own damage: the rectangle it presented with. The kernel
+       * clips that to the client rect it works out from its own frame
+       * convention - a pixel of border, a title bar - which is two pixels
+       * narrower than the surface the server blits, so the edge columns are
+       * repainted with it instead of going stale. */
+      int32_t d[4] = {0, 0, 0, 0};
+      long dr = sys3(SYS_SURF_DAMAGE, w->id, (long)d, 0);
+      if (dr > 0) {
+        dmg_add(x + d[0] - 1, y + d[1] - 1, d[2] + 2, d[3] + 2);
+        client_dmg++;
+        if (client_dmg < 6)
+          printf("[comp] win %d damage %ld,%ld %ldx%ld\n", w->id, (long)d[0], (long)d[1], (long)d[2], (long)d[3]);
+      } else if (dr < 0 && dmg_said++ < 3) {
+        printf("[comp] damage ask for win %d -> %ld\n", w->id, dr);
+      }
+
+      g_frame[drawn].w = w; g_frame[drawn].x = x; g_frame[drawn].y = y;
+      g_frame[drawn].ww = ww; g_frame[drawn].hh = hh;
       drawn++;
-      if (y > worst) worst = (int)y;
     }
-    /* The pointer, drawn by the server: the kernel's cursor stood down with the
-     * rest of its shell. A crosshair, because a screenshot has to be able to
-     * find it without knowing what an arrow looks like. */
-    if (g_have_mouse) {
-      rect(g_mx - 7, g_my, 15, 2, CURSOR);
-      rect(g_mx, g_my - 7, 2, 15, CURSOR);
+    g_nframe = drawn;
+
+    /* Focus and pointer are furniture too: both change what is on the screen and
+     * neither is the client's business. */
+    if (g_focus != g_focus_drawn) {
+      struct win *a = g_focus_drawn ? byid(g_focus_drawn) : 0;
+      struct win *b = g_focus ? byid(g_focus) : 0;
+      if (a && a->placed) dmg_frame(a);
+      if (b && b->placed) dmg_frame(b);
+      g_focus_drawn = g_focus;
+    }
+    if (g_have_mouse && (g_mx != g_mx_drawn || g_my != g_my_drawn)) {
+      dmg_add(g_mx_drawn - 8, g_my_drawn - 8, 17, 17);
+      dmg_add(g_mx - 8, g_my - 8, 17, 17);
+      g_mx_drawn = g_mx; g_my_drawn = g_my;
+    }
+    /* The sweep along the bottom is this server's proof of life, and it damages
+     * its own strip and nothing else. */
+    long sweep = (long)((sw * (double)(f % 200)) / 200.0);
+    if (sweep != g_sweep_drawn) {
+      dmg_add(0, (long)sh - 6, sweep > g_sweep_drawn ? sweep : g_sweep_drawn, 6);
+      g_sweep_drawn = sweep;
     }
 
-    /* A sweep along the bottom: whatever is on the screen is this frame's. */
-    long len = (long)((sw * (double)(f % 200)) / 200.0);
-    rect(0, (long)sh - 6, len, 6, SWEEP);
-    sys3(SYS_SCENE_FLUSH, 0, 0, 0);
+    if (g_full) {                          /* nothing is known yet: everything */
+      g_ndmg = 1;
+      g_dmg[0].x = 0; g_dmg[0].y = 0; g_dmg[0].w = sw; g_dmg[0].h = sh;
+    }
+    int patches = g_ndmg;
+
+    /* ---- paint the patches, and send only those ---- */
+    long px = 0;
+    for (int i = 0; i < patches; i++) {
+      g_clip = g_dmg[i];
+      rect(0, 0, sw, sh, BG);              /* the wallpaper under this patch */
+      for (int k = 0; k < g_nframe; k++) {
+        struct win *w = g_frame[k].w;
+        long x = g_frame[k].x, y = g_frame[k].y;
+        long ww = g_frame[k].ww, hh = g_frame[k].hh;
+        /* Furniture first, and it is the server's: the edge, the title bar, the
+         * title out of the kernel's own glyph table, a close box. Then the
+         * client's pixels, which the server never drew. */
+        rect(x - 3, y - 3, ww + 6, hh + 6, EDGE);
+        rect(x - 3, y - BAR_H, ww + 6, BAR_H - 2, w->id == g_focus ? FOCUS : TITLE);
+        glyphs_draw(x + 4, y - BAR_H + 2, w->title, TEXT);
+        rect(x + ww - 19, y - 19, 16, 16, CLOSE);
+        glyphs_draw(x + ww - 15, y - 17, "x", CLOSEX);
+        blit(w->px, w->stride, w->w, w->h, x, y);
+      }
+      /* The pointer, drawn by the server: the kernel's cursor stood down with
+       * the rest of its shell. A crosshair, so a screenshot can find it without
+       * knowing what an arrow looks like. */
+      if (g_have_mouse) {
+        rect(g_mx - 7, g_my, 15, 2, CURSOR);
+        rect(g_mx, g_my - 7, 2, 15, CURSOR);
+      }
+      rect(0, (long)sh - 6, sweep, 6, SWEEP);
+      sys3(SYS_SCENE_FLUSH,
+           ((g_clip.x & 0xFFFF) << 16) | (g_clip.y & 0xFFFF),
+           ((g_clip.w & 0xFFFF) << 16) | (g_clip.h & 0xFFFF), 0);
+      px += g_clip.w * g_clip.h;
+    }
+    dmg_px_total += (uint64_t)px;
+    dmg_frames += (uint64_t)patches;
+    dmg_full_px += (uint64_t)sw * (uint64_t)sh;
+    g_full = 0;
+    g_ndmg = 0;
     frames++;
     if (f == 0) printf("[comp] first frame: %d windows composited\n", drawn);
+    if (f && (f % 100) == 0)
+      printf("[comp] frame %d: %d patches, %ld px to the display (a whole screen is %ld)\n",
+             f, patches, px, (long)sw * (long)sh);
     ms(60);
   }
 
   printf("[comp] %d frames, %d windows mapped, geometry errors %d, "
          "clicks %d forwarded, keys %d forwarded, %d with no focus\n",
          frames, g_mapped, bad_geom, clicks, fwd, refused);
+  printf("[comp] %lu patches for %d frames, %lu px painted, %lu px if every "
+         "frame had been whole (%lu per thousand of that)\n",
+         (unsigned long)dmg_frames, frames, (unsigned long)dmg_px_total,
+         (unsigned long)dmg_full_px,
+         (unsigned long)(dmg_full_px ? (dmg_px_total * 1000 / dmg_full_px) : 0));
   sys1(SYS_INPUT_TAKE, 0);
   sys1(SYS_SCENE_HANDOFF, 0);
   printf("[comp] gave the screen back; the kernel repaints\n");

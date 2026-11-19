@@ -4024,6 +4024,18 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
       int r = winipc_set_rect((int)a0, (int32_t)a1, (int32_t)(a1 >> 32), wh >> 16, wh & 0xFFFF);
       return r < 0 ? -EBADF : 0;
     }
+    case SYS_SURF_DAMAGE: {
+      /* The server asks what changed in a client's pixels. Whoever paints the
+       * screen is the one that gets to clear the damage, so the kernel's own
+       * compositor path and this one cannot both take it and each paint half. */
+      int me = (int)task_current();
+      if (!gui_input_owns(me)) return -EPERM;
+      int x = 0, y = 0, w = 0, h = 0;
+      if (!surf_take_damage((int)a0, &x, &y, &w, &h)) return 0;
+      int32_t out[4] = {x, y, w, h};
+      if (user_put(a1, out, sizeof out) != 0) return -EFAULT;
+      return 1;
+    }
     case SYS_WIN_TITLE: {
       char t[40];
       int n = winipc_title((int)a0, t, (int)((a2 < 40) ? a2 : 40));

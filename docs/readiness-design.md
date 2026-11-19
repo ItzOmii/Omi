@@ -135,7 +135,9 @@ never "idle" in the hlt sense; `sched_tick` only switches when it interrupted ri
 are `task_yield` calls from the compositor loop and from yield/sleep syscalls.
 That is the whole inventory — so as of today there is **no** mechanism providing
 network progress independent of ring-3 activity, and the compositor is the sole
-heartbeat. The experiment below confirms it empirically before any doorbell is
+heartbeat. Note that the compositor is in ring 3 now (`userland/comp.c`): while it
+owns the screen the kernel's own compositor loop returns early, so the heartbeat is
+the display server's sleep between frames, which is still a voluntary switch. The experiment below confirms it empirically before any doorbell is
 built; the doorbell is then justified by evidence rather than by a hunch.
 
 Note that milestone 1 does not depend on this: with the fake backend the writer

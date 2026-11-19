@@ -161,6 +161,9 @@
                               * places a window it did not open: authority comes from
                               * owning the pointer, not from owning the window.     */
 #define SYS_WIN_TITLE   53  /* (id, char *out, max) -> length | -1: a window's title */
+#define SYS_SURF_DAMAGE 54  /* (win, int32_t out[4]) -> 1 a rect changed, 0 nothing
+                             * new, -EPERM if you are not the display server. It
+                             * takes the rectangle: the caller paints it.       */
 
 /* the switch, the gates and the fault handler */
 void     ring3_init(void);
