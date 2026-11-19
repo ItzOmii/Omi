@@ -5,6 +5,7 @@
  */
 
 #include "../include/kmalloc.h"
+#include "../include/spinlock.h"
 #include "../include/string.h"
 
 /* Heap configuration - 64MB heap */
@@ -102,13 +103,22 @@ static void coalesce(block_t *block) {
   }
 }
 
+/* One heap, and now more than one core: the free list is a linked structure, so
+ * two cores inside find_free_block at the same time both take the same block and
+ * both split it. The lock is the whole allocator, not a fast path - a per-arena
+ * heap is the real answer, this is the correct one. */
+static spinlock_t heap_lock = SPINLOCK_INIT;
+
 /* Allocate memory */
 void *kmalloc(size_t size) {
+  int irq = irq_save();
+  spin_lock(&heap_lock);
   if (!heap_initialized) {
     kmalloc_init();
   }
   
   if (size == 0) {
+    spin_unlock(&heap_lock); irq_restore(irq);
     return NULL;
   }
   
@@ -118,6 +128,7 @@ void *kmalloc(size_t size) {
   /* Find a free block */
   block_t *block = find_free_block(size);
   if (!block) {
+    spin_unlock(&heap_lock); irq_restore(irq);
     return NULL; /* Out of memory */
   }
   
@@ -129,6 +140,7 @@ void *kmalloc(size_t size) {
   heap_used += block->size;
   
   /* Return pointer to data (after header) */
+  spin_unlock(&heap_lock); irq_restore(irq);
   return (void *)((uint8_t *)block + sizeof(block_t));
 }
 
@@ -173,7 +185,10 @@ void *krealloc(void *ptr, size_t new_size) {
 
 /* Free memory */
 void kfree(void *ptr) {
+  int irq = irq_save();
+  spin_lock(&heap_lock);
   if (!ptr) {
+    spin_unlock(&heap_lock); irq_restore(irq);
     return;
   }
   
@@ -182,6 +197,7 @@ void kfree(void *ptr) {
   
   /* Validate magic */
   if (block->magic != BLOCK_MAGIC) {
+    spin_unlock(&heap_lock); irq_restore(irq);
     return; /* Invalid pointer */
   }
   
@@ -191,6 +207,7 @@ void kfree(void *ptr) {
   
   /* Merge adjacent free blocks */
   coalesce(block);
+  spin_unlock(&heap_lock); irq_restore(irq);
 }
 
 /* Get heap statistics */

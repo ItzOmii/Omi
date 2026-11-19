@@ -252,6 +252,34 @@ static void free_region(uint64_t *pml4, int i1) {
   pml4[i1] = 0;
 }
 
+/* Resident bytes for one address space - the task manager's memory column.
+ * Present pages only: a process that reserves a gigabyte and touches one page
+ * reads as one page, which is the number that answers "who is eating the RAM".
+ * Frames shared with a forked child count in every space that maps them, the
+ * way RSS does on Unix. Only tables this space owns are walked, so the kernel's
+ * inherited identity map is never billed to a process; a 2 MB page counts as
+ * 512 pages because it is resident whatever its granularity. */
+uint64_t mm_rss_bytes(mm_t *mm) {
+  if (!mm || !mm->cr3) return 0;
+  uint64_t pages = 0;
+  uint64_t *pml4 = (uint64_t *)(hhdm_offset + (mm->cr3 & ~0xFFFULL));
+  for (int i1 = 0; i1 < 2; i1++) {
+    if (!(pml4[i1] & PTE_P) || !(pml4[i1] & PTE_OWNED)) continue;
+    uint64_t *pdpt = (uint64_t *)(hhdm_offset + (pml4[i1] & ~0xFFFULL));
+    for (int i2 = 0; i2 < 512; i2++) {
+      if (!(pdpt[i2] & PTE_P) || !(pdpt[i2] & PTE_OWNED)) continue;
+      uint64_t *pd = (uint64_t *)(hhdm_offset + (pdpt[i2] & ~0xFFFULL));
+      for (int i3 = 0; i3 < 512; i3++) {
+        if (!(pd[i3] & PTE_P) || !(pd[i3] & PTE_OWNED)) continue;
+        if (pd[i3] & 0x80ULL) { pages += 512; continue; }
+        uint64_t *pt = (uint64_t *)(hhdm_offset + (pd[i3] & ~0xFFFULL));
+        for (int i4 = 0; i4 < 512; i4++) if (pt[i4] & PTE_P) pages++;
+      }
+    }
+  }
+  return pages * 4096ULL;
+}
+
 static void mm_free_tables(mm_t *mm) {
   /* Before the tables go: a process that exits holding shared regions must give
    * its references back, or the frames are never freed and a browser that opens
@@ -1477,6 +1505,22 @@ fail:
 
 /* ------------------------------------------------------------- wait4 (61) */
 
+/* A task that has been asked to stop must stop wherever it is parked. The
+ * syscall door checks the flag between calls, but a task asleep inside a wait
+ * never reaches a door - it wakes, finds its condition still false, and sleeps
+ * again forever. Every blocking loop calls this after its block returns, so an
+ * ended task's stack is left between calls, which is the only place it is safe
+ * to unwind. */
+static void r3_exit_now(uint64_t code);   /* the one exit path, defined below */
+
+static void kill_if_requested(void) {
+  task_t *me = task_at(task_current());
+  /* Through the ordinary exit, not straight to task_kill_current: that path
+   * also closes the windows this task owns. A kill that skipped it freed the
+   * address space and left the client's last frame on screen forever. */
+  if (me && me->kill_req) r3_exit_now(0);
+}
+
 #define WNOHANG_L 1
 #define ECHILD_L  10   /* no child exists: the answer a shell expects */
 
@@ -1513,6 +1557,7 @@ static long linux_wait4(int pid, uint64_t status_u, int options, uint64_t rusage
     if (!mine) return -ECHILD_L;
     if (options & WNOHANG_L) return 0;
     task_block_current();
+    kill_if_requested();
   }
 }
 
@@ -1656,6 +1701,7 @@ static long sys_futex(uint64_t addr, uint64_t op, uint64_t val, uint64_t timeout
     } else {
       task_block_current();
     }
+    kill_if_requested();
     int timed_out = t->timed_out;
     t->timed_out = 0;
     t->wait_addr = 0;
@@ -3651,13 +3697,7 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
    * requested exit is checked before the call is even looked at. Doing it here
    * rather than in the scheduler means the task is between calls: its own stack,
    * its descriptors and the window table are all in a state it can leave. */
-  task_t *me = task_at(task_current());
-  if (me && me->kill_req) {
-    serial_puts("[ring3] task ");
-    serial_puts(task_name(task_current()));
-    serial_puts(" was asked to stop and is exiting\n");
-    task_kill_current(0);
-  }
+  kill_if_requested();
   if (abi == ABI_LINUX) {
     r3_cur_syscall = ~num;      /* distinguishable from our own numbers in a crash report */
     r3_cur_arg0 = a0;
@@ -3743,6 +3783,7 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
         }
         if (r < 0) return -EBADF;          /* window gone: nothing to wait for */
         task_block_current();              /* sleeps until an event is queued */
+        kill_if_requested();               /* an ended task must not sleep on */
       }
     }
     case SYS_WIN_RECT: {

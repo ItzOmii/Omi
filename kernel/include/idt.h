@@ -17,7 +17,13 @@ typedef struct interrupt_frame {
 
 typedef void (*isr_handler_t)(interrupt_frame_t *frame);
 
+typedef struct {
+  uint16_t limit;
+  uint64_t base;
+} __attribute__((packed)) idt_ptr_t;
+
 void idt_init(void);
+void idt_get_idtr(idt_ptr_t *out);   /* for a core that has none loaded yet */
 void idt_register_handler(uint8_t vector, isr_handler_t handler);
 void idt_set_gate_raw(uint8_t vector, void *handler, int dpl3);
 

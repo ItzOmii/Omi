@@ -20,8 +20,13 @@
 #include "include/gdt.h"
 #include "include/ring3.h"
 #include "include/socket.h"
+#include "include/smp.h"
+#include "include/lapic.h"
+#include "include/spinlock.h"
+#include "include/percpu.h"
 
 extern void serial_puts(const char *s);
+extern void serial_puthex(uint64_t v);
 
 /* The saved frame. Order must match the push order in the stubs below. */
 typedef struct {
@@ -139,8 +144,21 @@ static task_t tasks[TASK_MAX];
  * task slots ever get reused; today task_alloc appends and never frees. */
 static uint32_t task_gen_counter;
 static int ntasks;
-static int cur = -1;
+/* `cur` used to be one global. A scheduler per core cannot share it: two cores
+ * picking at the same time would each think they own the other's task, and the
+ * first switch would save one core's frame into the other's slot. Indexed by
+ * APIC id so that every use below reads the same as it did, and each core only
+ * ever touches its own entry. */
+static int cur_by_apic[SMP_MAX_CPUS];
+static inline int *cur_slot(void) {
+  uint32_t id = lapic_this_id();
+  return &cur_by_apic[(id < SMP_MAX_CPUS) ? id : 0];
+}
+#define cur (*cur_slot())
 static volatile uint64_t total_ticks;
+/* The task table is appended to by whichever core spawns; a task's own fields
+ * are only ever touched by the core running it. */
+static spinlock_t task_lock = SPINLOCK_INIT;
 
 /* The FXSAVE area of whichever task is running, so the asm stubs can save the
  * incoming xmm state before any C code touches it. */
@@ -152,6 +170,7 @@ static inline void outb(uint16_t port, uint8_t v) {
 }
 
 void task_init(void) {
+  for (int i = 0; i < SMP_MAX_CPUS; i++) cur_by_apic[i] = -1;
   for (int i = 0; i < TASK_MAX; i++) {
     tasks[i].state = TASK_FREE;
     tasks[i].rsp = 0;
@@ -185,11 +204,21 @@ const char *task_state_name(int st) {
 }
 
 /* The compositor (0) is always eligible; everything else has to be READY. */
+/* May this core run that task? An unpinned task (-1) belongs to the bootstrap
+ * processor: every task that existed before SMP did, and moving one now would
+ * carry its stack and its %fs to a core that never saved them. */
+static int mine(int i) {
+  int c = tasks[i].cpu;
+  if (c < 0) return lapic_this_id() == 0;
+  return (uint32_t)c == lapic_this_id();
+}
+
 static int pick_next(int from) {
   if (ntasks < 2) return -1;
   for (int k = 1; k < ntasks; k++) {
     int i = (from + k) % ntasks;
     if (i == from) continue;
+    if (!mine(i)) continue;
     if (i == 0 || tasks[i].state == TASK_READY) return i;
   }
   return -1;
@@ -216,10 +245,22 @@ static void switch_to(int next, ctx_t *frame) {
   __asm__ volatile("wrmsr" :: "c"(0xC0000100), "a"((uint32_t)tasks[next].fs_base),
                    "d"((uint32_t)(tasks[next].fs_base >> 32)));
 #endif
-  if (tasks[next].kstack_top) gdt_set_kernel_stack(tasks[next].kstack_top);
+  /* There is one TSS and it is shared, so only the core that owns it may write
+   * its rsp0. An AP runs kernel threads only; when a ring-3 task is allowed to
+   * run there it will need a TSS of its own rather than this guard. */
+  if (lapic_this_id() == 0 && tasks[next].kstack_top)
+    gdt_set_kernel_stack(tasks[next].kstack_top);
+  /* cr3 == 0 means "the kernel's own space", and the kernel is mapped in every
+   * space, so there is nothing to load: the live tables already reach this core's
+   * code and stack. Writing ring3_kernel_cr3() here is only a convenience, and
+   * doing it unconditionally cost a boot loop - that value is still 0 until
+   * ring3_init() runs, so an AP starting earlier wrote CR3=0 and the next
+   * instruction fetch faulted. Never write a zero page table. */
+  percpu_set_cur(next);
   uint64_t want = tasks[next].cr3 ? tasks[next].cr3 : ring3_kernel_cr3();
-  if (ring3_read_cr3() != want) ring3_write_cr3(want);
-  mm_reap();        /* a space whose last thread died is safe to free now */
+  if (want && ring3_read_cr3() != want) ring3_write_cr3(want);
+  /* mm_reap walks the process list, which is still single-core state. */
+  if (lapic_this_id() == 0) mm_reap();
 }
 
 /* Called from the int 0x81 stub. Returns the frame to iretq into. */
@@ -238,7 +279,29 @@ static void wake_deadlines(void);
 
 /* Called from the IRQ0 stub. Ticks, acks the PIC, and preempts ring 3 only. */
 ctx_t *sched_tick(ctx_t *frame) {
-  total_ticks++;
+  __atomic_add_fetch(&total_ticks, 1, __ATOMIC_RELAXED);
+
+  /* Sample every core from the one place that already runs at a known rate.
+   * Windows Task Manager's per-core graph is a sampling profiler too; the only
+   * difference is it gets a hardware counter and we count ticks. */
+  percpu_set_cur(cur);
+  int ncpu = smp_cpu_count();
+  for (int i = 0; i < ncpu; i++) {
+    percpu_t *c = percpu_by_index(i);
+    if (!c || !c->online) continue;
+    int busy = c->idle ? 0 : 1;
+    c->recent[1] = (c->recent[1] << 1) | (c->recent[0] >> 63);
+    c->recent[0] = (c->recent[0] << 1) | (uint64_t)busy;
+    if (busy) {
+      c->busy_ticks++;
+      /* Credit the task on that core. Only the core itself ever runs it, so
+       * this is the single writer for any one task's count. */
+      if (i > 0 && c->cur_task >= 0 && c->cur_task < ntasks)
+        tasks[c->cur_task].ticks++;
+    } else {
+      c->idle_ticks++;
+    }
+  }
   if (cur >= 0 && cur < ntasks) tasks[cur].ticks++;
   outb(0x20, 0x20);                        /* EOI: PIC1, IRQ0 */
   wake_deadlines();                        /* futex deadlines fire here */
@@ -358,10 +421,20 @@ static void task_alloc_fail(const char *why, const char *name) {
  * change, which reads as a broken synchronisation primitive rather than a full
  * table. Name the resource. */
 static task_t *task_alloc(const char *name) {
-  if (ntasks >= TASK_MAX) { task_alloc_fail("no free slot (TASK_MAX)", name); return 0; }
+  int irq = irq_save();
+  spin_lock(&task_lock);
+  if (ntasks >= TASK_MAX) {
+    spin_unlock(&task_lock); irq_restore(irq);
+    task_alloc_fail("no free slot (TASK_MAX)", name);
+    return 0;
+  }
   task_t *t = &tasks[ntasks];
   uint8_t *mem = (uint8_t *)kmalloc(TASK_STACK);
-  if (!mem) { task_alloc_fail("kernel stack allocation failed", name); return 0; }
+  if (!mem) {
+    spin_unlock(&task_lock); irq_restore(irq);
+    task_alloc_fail("kernel stack allocation failed", name);
+    return 0;
+  }
   uintptr_t top = ((uintptr_t)mem + TASK_STACK) & ~(uintptr_t)15;
   for (int i = 0; i < TASK_STACK; i += 8) *(uint64_t *)(mem + i) = 0;
 
@@ -383,12 +456,15 @@ static task_t *task_alloc(const char *name) {
   t->timed_out = 0;
   t->wait_obj = 0;
   t->kill_req = 0;
+  t->cpu = -1;
   t->parent = (cur > 0 && cur < ntasks) ? tasks[cur].id : 0;
   t->tgen = ++task_gen_counter;   /* a fresh slot is a new identity */
   int i = 0;
   while (name[i] && i < 23) { t->name[i] = name[i]; i++; }
   t->name[i] = 0;
   ntasks++;
+  spin_unlock(&task_lock);
+  irq_restore(irq);
   return t;
 }
 
@@ -426,6 +502,43 @@ int task_spawn(const char *name, void (*fn)(void)) {
   prime(t, (uint64_t)(uintptr_t)k_task_entry, 0x08, (uint64_t)(uintptr_t)fn, 0, 0, 0);
   t->state = TASK_READY;
   return t->id;
+}
+
+/* ------------------------------------------------------- one core per task
+ *
+ * The switch itself is not core-specific: int 0x81 pushes a frame, sched_pick
+ * chooses, and the stub restores. What an application processor needs of its own
+ * is a `cur` slot (per APIC id, above), an idle task to own the cpu when nothing
+ * is ready, and the assurance that nothing it picks belongs to another core
+ * (mine()). With those three, the same scheduler runs on every core.
+ */
+int task_spawn_on(const char *name, void (*fn)(void), uint32_t apic_id) {
+  task_t *t = task_alloc(name);
+  if (!t) return -1;
+  t->fn = fn;
+  t->cpu = (int)apic_id;
+  prime(t, (uint64_t)(uintptr_t)k_task_entry, 0x08, (uint64_t)(uintptr_t)fn, 0, 0, 0);
+  t->state = TASK_READY;
+  return t->id;
+}
+
+int task_spawn_ap_idle(uint32_t apic_id, uint64_t stack_top) {
+  task_t *t = task_alloc("ap-idle");
+  if (!t) return -1;
+  t->cpu = (int)apic_id;
+  t->kstack_top = stack_top;
+  t->rsp = stack_top;
+  t->state = TASK_RUN;     /* the core is already running on that stack */
+  return t->id;
+}
+
+void sched_ap_enter(int idle_id) {
+  *cur_slot() = idle_id;
+  task_fpu_slot = tasks[idle_id].fpu;
+  for (;;) {
+    __asm__ volatile("sti");
+    task_yield();          /* int 0x81: pick, switch, and come back here */
+  }
 }
 
 int task_spawn_user(const char *name, uint64_t entry, uint64_t user_sp,

@@ -56,6 +56,14 @@ uint64_t gdt_syscall_rsp;
 
 void gdt_set_kernel_stack(uint64_t rsp0) { tss.rsp0 = rsp0; gdt_syscall_rsp = rsp0; }
 
+/* The trampoline's own table is only good enough to get into long mode: its
+ * selector 0x08 is a 32-bit segment, and every gate in the kernel's IDT names
+ * 0x08. An AP that keeps using it takes a #GP inside interrupt delivery and
+ * triple-faults the machine, so it has to adopt this table instead. */
+void gdt_get_gdtr(void *out10) {
+  for (int i = 0; i < 10; i++) ((uint8_t *)out10)[i] = ((const uint8_t *)&gdtr)[i];
+}
+
 void gdt_init(void) {
   set_entry(0, 0, 0, 0, 0);
   set_entry(1, 0, 0xFFFFF, 0x9A, 0xA0);   /* kernel code  */

@@ -121,3 +121,18 @@ uint64_t mmio_map_range(uint64_t phys_addr, size_t size) {
   flush_tlb();
   return virt_base;
 }
+
+int mmio_map_at(uint64_t virt, uint64_t phys, size_t size) {
+  if (!virt || size == 0) return 0;
+  if (!kernel_phys_base || !kernel_virt_base) return 0;
+
+  uint64_t start = phys & PAGE_MASK;
+  uint64_t vstart = virt & PAGE_MASK;
+  uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+  for (uint64_t i = 0; i < pages; i++) {
+    if (map_page(vstart + i * PAGE_SIZE, start + i * PAGE_SIZE, PTE_WRITE) != 0) return 0;
+  }
+  flush_tlb();
+  return 1;
+}

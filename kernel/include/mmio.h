@@ -12,4 +12,9 @@
  */
 uint64_t mmio_map_range(uint64_t phys_addr, size_t size);
 
+/* Map physical memory at a virtual address of the caller's choosing. Needed by
+ * anything that must live at a fixed low address - the AP startup trampoline,
+ * which a startup IPI can only reach through real mode. Returns 1 on success. */
+int mmio_map_at(uint64_t virt, uint64_t phys, size_t size);
+
 #endif /* _MMIO_H */

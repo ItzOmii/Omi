@@ -10,6 +10,9 @@
 #include "../include/task.h"
 #include "../include/devboot.h"   /* OMI_DEV_BOOT: 1 spawns the browser and nothing else */
 #include "../include/acpi.h"
+#include "../include/smp.h"
+#include "../include/lapic.h"
+#include "../include/percpu.h"
 #include "../include/string.h"
 #include "../include/types.h"
 #include "../include/limine_modules.h"
@@ -387,6 +390,10 @@ void _start(void) {
     acpi_init(NULL);
   }
 
+  /* How many cores this machine is, before anything tries to use them. */
+  smp_init();
+  lapic_init();
+
   serial_puts("Framebuffer acquired:\n");
   serial_puts("  Address: ");
   serial_puthex((uint64_t)fb->address);
@@ -452,6 +459,23 @@ void _start(void) {
   /* Enable interrupts globally - REQUIRED for USB/PS2 to work! */
   serial_puts("Enabling interrupts...\n");
   __asm__ volatile("sti");
+
+  /* The APIC path, end to end: one interrupt addressed to this core, taken on
+   * our own vector. If the count does not move, the register window or the
+   * vector is wrong and an AP would never hear a startup IPI either. */
+  if (lapic_ready()) {
+    lapic_self_ipi(LAPIC_VECTOR_IPI);
+    for (int i = 0; i < 2000000 && !lapic_ipi_count(); i++) __asm__ volatile("pause");
+    serial_puts("[lapic] self-ipi count=");
+    serial_puthex((uint64_t)lapic_ipi_count());
+    serial_puts(lapic_ipi_count() ? " taken\n" : " never arrived\n");
+  }
+
+  /* The other cores: INIT, SIPI, SIPI, and each one arrives in long mode with a
+   * stack of its own. They park; nothing is scheduled on them yet. */
+  percpu_init();
+  smp_start_aps();
+  smp_start_workers();
 
   task_demo_start();
 

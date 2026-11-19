@@ -4,6 +4,8 @@
 #include "../include/pmm.h"
 #include "../include/limine_modules.h"
 #include "../include/types.h"
+#include "../include/spinlock.h"
+#include "../include/percpu.h"
 
 extern uint64_t hhdm_offset;
 extern uint64_t kernel_phys_base;
@@ -88,7 +90,14 @@ void pmm_init(struct limine_memmap_response *mm, void *module_response) {
   for (uint64_t i = 0; i < PMM_PAGES; i++) if (!bit_get(i)) usable_pages++;
 }
 
+/* One bitmap, one hint, one lock. Without it two cores scanning at the same time
+ * both see a clear bit, both set it, and both hand out the same frame - which
+ * shows up much later as two subsystems corrupting each other. */
+static spinlock_t pmm_lock = SPINLOCK_INIT;
+
 uint64_t pmm_alloc_page(void) {
+  int irq = irq_save();
+  spin_lock(&pmm_lock);
   for (uint64_t i = first_free_hint; i < PMM_PAGES; i++) {
     if (!bit_get(i)) {
       bit_set(i);
@@ -98,20 +107,30 @@ uint64_t pmm_alloc_page(void) {
       /* hand out zeroed pages: a stale frame must never leak old memory */
       uint8_t *p = (uint8_t *)(uintptr_t)(hhdm_offset + phys);
       for (uint64_t b = 0; b < PMM_PAGE; b += 8) *(uint64_t *)(p + b) = 0;
+      spin_unlock(&pmm_lock);
+      irq_restore(irq);
+      percpu_t *me = percpu_self();
+      if (me) me->pages_allocated++;
       return phys;
     }
   }
   first_free_hint = 0;              /* wraps once, in case of a late free */
+  spin_unlock(&pmm_lock);
+  irq_restore(irq);
   return 0;
 }
 
 void pmm_free_page(uint64_t phys) {
   uint64_t i = phys / PMM_PAGE;
   if (i >= PMM_PAGES) return;
-  if (!bit_get(i)) return;          /* double free: ignore */
+  int irq = irq_save();
+  spin_lock(&pmm_lock);
+  if (!bit_get(i)) { spin_unlock(&pmm_lock); irq_restore(irq); return; } /* double free */
   bit_clr(i);
   usable_pages++;
   if (i < first_free_hint) first_free_hint = i;
+  spin_unlock(&pmm_lock);
+  irq_restore(irq);
 }
 
 uint64_t pmm_total_pages(void) { return total_pages; }

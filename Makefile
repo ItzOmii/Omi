@@ -105,6 +105,9 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/net/net.c \
            $(KERNEL_DIR)/drivers/hda.c \
            $(KERNEL_DIR)/drivers/acpi.c \
+           $(KERNEL_DIR)/drivers/smp.c \
+           $(KERNEL_DIR)/drivers/percpu.c \
+           $(KERNEL_DIR)/drivers/lapic.c \
            $(KERNEL_DIR)/drivers/usb.c \
            $(KERNEL_DIR)/drivers/usb_hid.c \
            $(KERNEL_DIR)/drivers/usb_xhci.c \
@@ -171,7 +174,8 @@ USER_ELF := $(BUILD_DIR)/init.elf
 
 OBJECTS := $(patsubst $(KERNEL_DIR)/%.c,$(BUILD_DIR)/%.o,$(SOURCES)) \
            $(patsubst $(BEARSSL)/src/%.c,$(BUILD_DIR)/lib/bearssl/%.o,$(BEARSSL_SOURCES)) \
-           $(GUMBO_OBJ)
+           $(GUMBO_OBJ) \
+           $(BUILD_DIR)/boot/ap_blob.o
 
 # Limine
 LIMINE_VERSION := 8.6.0
@@ -181,6 +185,24 @@ LIMINE_URL := https://github.com/limine-bootloader/limine/releases/download/v$(L
 # Default target
 .PHONY: all
 all: $(ISO)
+
+# The AP startup trampoline. It has to be reachable in real mode at 0x8000, so it
+# is assembled and linked as a flat binary, then pulled into the kernel with
+# .incbin - an object file in the kernel image would sit at the wrong address.
+AP_TRAMP_SRC := $(KERNEL_DIR)/boot/ap_trampoline.S
+AP_TRAMP_BIN := $(BUILD_DIR)/boot/ap_trampoline.bin
+AP_BLOB_SRC  := $(BUILD_DIR)/boot/ap_blob.S
+
+$(AP_TRAMP_BIN): $(AP_TRAMP_SRC) | $(BUILD_DIR)
+	as --64 -o $(BUILD_DIR)/boot/ap_trampoline.o $<
+	ld -Ttext=0x8000 --oformat=binary -o $@ $(BUILD_DIR)/boot/ap_trampoline.o
+
+$(AP_BLOB_SRC): $(AP_TRAMP_BIN)
+	printf '.section .rodata\n.globl ap_image_start_ro\nap_image_start_ro:\n.incbin "$(abspath $(AP_TRAMP_BIN))"\n.globl ap_image_end_ro\nap_image_end_ro:\n' > $@
+
+$(BUILD_DIR)/boot/ap_blob.o: $(AP_BLOB_SRC)
+	as --64 -o $@ $<
+
 
 # Create build directories
 $(BUILD_DIR):

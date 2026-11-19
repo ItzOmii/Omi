@@ -19,6 +19,8 @@
 #include "icons_ri.h"
 #include "omi_net.h"
 #include "../include/task.h"
+#include "../include/percpu.h"
+#include "../include/smp.h"
 #include "../include/elf.h"   /* ring3_spawn_elf: the dock starts the browser */
 #include "limine_modules.h"
 #include "mp3.h"
@@ -2997,10 +2999,86 @@ static int files_click(int x, int y, meep_app_t *a) {
   return 1;
 }
 
+/* Task Manager, in the shape Windows gives it: a tile per core with its own
+ * graph, the machine's total above them, then the process list.
+ *
+ * The numbers are not decoration. The tick handler samples every core once per
+ * tick and shifts one bit into that core's history, so a core's percentage is
+ * "how many of the last 100 samples were not idle" and its graph is the same
+ * number over 24 seconds. Nothing here is averaged and then smoothed into a
+ * shape that looks nice: an idle machine draws a flat line at zero. */
+#define TM_COLS 24
+static uint8_t  tm_hist[SMP_MAX_CPUS][TM_COLS];
+static uint64_t tm_hist_at;
+static int      tm_hist_n;
+
+/* One column a second, whether or not the window is being drawn: the history is
+ * the machine's, not the widget's. */
+static void tm_history_step(void) {
+  uint64_t now = task_total_ticks();
+  if (now < tm_hist_at + 100) return;         /* ticks are 100 hz */
+  tm_hist_at = now;
+  int nc = smp_cpu_count();
+  if (nc > SMP_MAX_CPUS) nc = SMP_MAX_CPUS;
+  for (int i = 0; i < nc; i++) {
+    int p = percpu_busy_pct(i);
+    for (int j = 0; j < TM_COLS - 1; j++) tm_hist[i][j] = tm_hist[i][j + 1];
+    tm_hist[i][TM_COLS - 1] = (uint8_t)(p < 0 ? 0 : p);
+  }
+  if (tm_hist_n < TM_COLS) tm_hist_n++;
+}
+
+static void tm_text_pct(int x, int y, int pct, const mface *f, uint32_t ink) {
+  char b[8];
+  int n = 0;
+  if (pct >= 100) { b[n++] = '1'; b[n++] = '0'; b[n++] = '0'; }
+  else if (pct >= 10) { b[n++] = (char)('0' + pct / 10); b[n++] = (char)('0' + pct % 10); }
+  else { b[n++] = (char)('0' + pct); }
+  b[n++] = '%'; b[n] = 0;
+  meep_text(f, x, y, b, ink);
+}
+
+/* Scroll and hit-test state for the process list. The geometry a paint used is
+ * remembered here so the click handler can invert it: a row is whatever was
+ * drawn at that y, even after the sort order shifts between frames. */
+static int  tm_scroll;            /* first visible row */
+static int  tm_row_h;             /* row pitch */
+static int  tm_list_top;          /* y of the first visible row */
+static int  tm_rows_vis;
+static int  tm_nrows;
+static int  tm_order[TASK_MAX];   /* pid for each row, as painted */
+static char tm_note[48];          /* last action, shown in the footer */
+
+/* bytes as kb/mb with one decimal - a column, not a number to do math on */
+static void tm_mem(char *o, uint64_t bytes) {
+  int n = 0;
+  if (!bytes) { o[0] = '-'; o[1] = 0; return; }
+  uint64_t unit = 1024ULL;
+  const char *suf = " kb";
+  if (bytes >= 1024ULL * 1024ULL * 1024ULL) { unit = 1024ULL * 1024ULL * 1024ULL; suf = " gb"; }
+  else if (bytes >= 1024ULL * 1024ULL)      { unit = 1024ULL * 1024ULL; suf = " mb"; }
+  uint64_t q = (bytes * 10ULL + unit / 2) / unit;   /* tenths */
+  uint64_t w = q / 10ULL, f = q % 10ULL;
+  char d[12]; int k = 0;
+  if (!w) d[k++] = '0';
+  else while (w) { d[k++] = (char)('0' + (int)(w % 10ULL)); w /= 10ULL; }
+  while (k) o[n++] = d[--k];
+  if (unit != 1024ULL) { o[n++] = '.'; o[n++] = (char)('0' + (int)f); }
+  for (int i = 0; suf[i] && n < 14; i++) o[n++] = suf[i];
+  o[n] = 0;
+}
+
 static void draw_tasks(void) {
   meep_app_t *a = &mapp[APP_TASKS];
   if (!a->open) return;
   int nt = task_count();
+
+  tm_history_step();
+
+  int ncpu = smp_cpu_count();
+  if (ncpu < 1) ncpu = 1;
+  if (ncpu > SMP_MAX_CPUS) ncpu = SMP_MAX_CPUS;
+
   char sub[24];
   u64s((uint64_t)nt, sub);
   int sl = 0; while (sub[sl]) sl++;
@@ -3009,18 +3087,90 @@ static void draw_tasks(void) {
   sub[sl] = 0;
   app_win(a->x, a->y, a->w, a->h, "task manager", sub, mapp_focus == APP_TASKS);
 
-  int x0 = a->x + UI_SCALE_VAL(14), y0 = a->y + APP_TITLE_H + UI_SCALE_VAL(14);
+  int pad = UI_SCALE_VAL(14);
+  int x0 = a->x + pad, y0 = a->y + APP_TITLE_H + UI_SCALE_VAL(12);
+  int bw = a->w - 2 * pad;
   int lh = meep_line_h(&meep_m100);
-  int cx_name = x0, cx_state = x0 + UI_SCALE_VAL(108);
-  int cx_ticks = x0 + UI_SCALE_VAL(196), cx_sw = x0 + UI_SCALE_VAL(268);
 
-  meep_text(&meep_m100, cx_name,  y0, "task",     MEEP_INK_SOFT);
-  meep_text(&meep_m100, cx_state, y0, "state",    MEEP_INK_SOFT);
-  meep_text(&meep_m100, cx_ticks, y0, "ticks",    MEEP_INK_SOFT);
-  meep_text(&meep_m100, cx_sw,    y0, "switches", MEEP_INK_SOFT);
-  y0 += lh + UI_SCALE_VAL(6);
-  fb_fill_rect(x0, y0, a->w - 2 * UI_SCALE_VAL(14), 1, MEEP_LINE_SOFT);
-  y0 += UI_SCALE_VAL(6);
+  /* ---- machine total ---- */
+  int cpu_pct = percpu_cpu_pct();
+  const char *tot_lbl = "all cores";
+  meep_text(&meep_m100, x0, y0 + UI_SCALE_VAL(3), tot_lbl, MEEP_INK_SOFT);
+  int lw = meep_text_w(&meep_m100, tot_lbl);
+  tm_text_pct(x0 + lw + UI_SCALE_VAL(10), y0, cpu_pct, &meep_s145, MEEP_INK);
+  int meter_x = x0 + lw + UI_SCALE_VAL(56);
+  int meter_w = x0 + bw - meter_x;
+  if (meter_w > 8) {
+    int my = y0 + UI_SCALE_VAL(5);
+    fb_fill_rect(meter_x, my, meter_w, UI_SCALE_VAL(6), MEEP_LINE_SOFT);
+    int fill = meter_w * cpu_pct / 100;
+    if (fill > 0) fb_fill_rect(meter_x, my, fill, UI_SCALE_VAL(6), MEEP_ACCENT);
+  }
+  y0 += UI_SCALE_VAL(22);
+
+  /* ---- one tile per core ---- */
+  int per_row = (ncpu >= 4) ? 4 : ncpu;
+  int gap = UI_SCALE_VAL(8);
+  int tw = (bw - gap * (per_row - 1)) / per_row;
+  int th = UI_SCALE_VAL(64);
+  for (int i = 0; i < ncpu; i++) {
+    int col = i % per_row, row = i / per_row;
+    int tx = x0 + col * (tw + gap);
+    int ty = y0 + row * (th + gap);
+    if (ty + th > a->y + a->h - UI_SCALE_VAL(70)) break;   /* list still needs room */
+    fb_fill_rect(tx, ty, tw, th, MEEP_PAPER2);
+
+    char lbl[12];
+    int ln = 0;
+    lbl[ln++] = 'c'; lbl[ln++] = 'p'; lbl[ln++] = 'u'; lbl[ln++] = ' ';
+    if (i >= 10) lbl[ln++] = (char)('0' + i / 10);
+    lbl[ln++] = (char)('0' + i % 10);
+    lbl[ln] = 0;
+    meep_text(&meep_m100, tx + UI_SCALE_VAL(7), ty + UI_SCALE_VAL(5), lbl, MEEP_INK_SOFT);
+
+    int p = percpu_busy_pct(i);
+    if (p < 0) p = 0;
+    /* right-aligned, so 7% and 100% do not jitter the tile */
+    char pb[8]; int pn = 0;
+    if (p >= 100) { pb[pn++]='1'; pb[pn++]='0'; pb[pn++]='0'; }
+    else if (p >= 10) { pb[pn++]=(char)('0'+p/10); pb[pn++]=(char)('0'+p%10); }
+    else pb[pn++]=(char)('0'+p);
+    pb[pn++]='%'; pb[pn]=0;
+    meep_text(&meep_s145, tx + tw - UI_SCALE_VAL(7) - meep_text_w(&meep_s145, pb),
+              ty + UI_SCALE_VAL(2), pb, p >= 50 ? MEEP_INK : MEEP_INK_SOFT);
+
+    /* graph: one column per second of the last TM_COLS seconds */
+    int gx = tx + UI_SCALE_VAL(7), gy = ty + UI_SCALE_VAL(26);
+    int gw = tw - UI_SCALE_VAL(14), gh = th - UI_SCALE_VAL(33);
+    if (gw > 4 && gh > 4) {
+      fb_fill_rect(gx, gy + gh - 1, gw, 1, MEEP_LINE_SOFT);
+      int cw = gw / TM_COLS; if (cw < 1) cw = 1;
+      for (int j = 0; j < TM_COLS; j++) {
+        int v = tm_hist[i][j];
+        if (v <= 0) continue;
+        int hh = gh * v / 100; if (hh < 1) hh = 1;
+        int cx = gx + j * cw;
+        if (cx + cw > gx + gw) break;
+        fb_fill_rect(cx, gy + gh - hh, cw > 1 ? cw - 1 : 1, hh, MEEP_ACCENT);
+      }
+    }
+  }
+  y0 += ((ncpu + per_row - 1) / per_row) * (th + gap) + UI_SCALE_VAL(2);
+
+  /* ---- process list ---- */
+  int cx_name = x0, cx_core = x0 + UI_SCALE_VAL(150), cx_pct = x0 + UI_SCALE_VAL(188);
+  int cx_state = x0 + UI_SCALE_VAL(234), cx_mem = x0 + UI_SCALE_VAL(304);
+  int cx_ticks = x0 + UI_SCALE_VAL(386);
+  int cx_kill  = x0 + bw - UI_SCALE_VAL(20);   /* the x that ends a process */
+  meep_text(&meep_m100, cx_name,  y0, "task",   MEEP_INK_SOFT);
+  meep_text(&meep_m100, cx_core,  y0, "core",   MEEP_INK_SOFT);
+  meep_text(&meep_m100, cx_pct,   y0, "cpu%",   MEEP_INK_SOFT);
+  meep_text(&meep_m100, cx_state, y0, "state",  MEEP_INK_SOFT);
+  meep_text(&meep_m100, cx_mem,   y0, "mem",    MEEP_INK_SOFT);
+  meep_text(&meep_m100, cx_ticks, y0, "ticks",  MEEP_INK_SOFT);
+  y0 += lh + UI_SCALE_VAL(5);
+  fb_fill_rect(x0, y0, bw, 1, MEEP_LINE_SOFT);
+  y0 += UI_SCALE_VAL(5);
 
   uint64_t total = 0;
   for (int i = 0; i < nt; i++) {
@@ -3029,15 +3179,42 @@ static void draw_tasks(void) {
   }
   if (!total) total = 1;
 
-  int drawn = 0;
-  for (int i = 0; i < nt && y0 + lh < a->y + a->h - UI_SCALE_VAL(10); i++) {
-    drawn++;
+  /* Busiest first, the way Task Manager sorts. Small enough to sort inline. */
+  int order[TASK_MAX];
+  int no = 0;
+  for (int i = 0; i < nt && no < TASK_MAX; i++) {
     task_t *t = task_at(i);
-    if (!t) break;
+    if (!t) continue;
+    int j = no++;
+    while (j > 0 && task_at(order[j - 1])->ticks < t->ticks) { order[j] = order[j - 1]; j--; }
+    order[j] = i;
+  }
+
+  /* The list scrolls: everything draws through one offset, and the click path
+   * hit-tests against the geometry this paint recorded, so a row is a row in
+   * both directions even after the order shifts under it. */
+  int rh = lh + UI_SCALE_VAL(3);
+  int list_top = y0;
+  int list_bot = a->y + a->h - UI_SCALE_VAL(24);
+  int vis = (list_bot - list_top) / rh;
+  if (vis < 1) vis = 1;
+  int max_scroll = no - vis;
+  if (max_scroll < 0) max_scroll = 0;
+  if (tm_scroll > max_scroll) tm_scroll = max_scroll;
+  if (tm_scroll < 0) tm_scroll = 0;
+  tm_list_top = list_top; tm_row_h = rh; tm_rows_vis = vis; tm_nrows = no;
+  for (int k = 0; k < no; k++) tm_order[k] = order[k];
+
+  int drawn = 0;
+  for (int k = tm_scroll; k < no && drawn < vis; k++) {
+    task_t *t = task_at(tm_order[k]);
+    int pid = tm_order[k];
+    if (!t) continue;
+    drawn++;
     uint32_t ink = (t->state == TASK_RUN) ? MEEP_INK : MEEP_INK_SOFT;
     if (t->state == TASK_RUN)
       fb_fill_rect(x0 - UI_SCALE_VAL(6), y0 + lh / 2 - 2, 4, 4, MEEP_ACCENT_INK);
-    /* a user-mode task carries a cr3: flag it, and show how it left */
+
     char nm[40];
     int np = 0;
     while (t->name[np] && np < 30) { nm[np] = t->name[np]; np++; }
@@ -3046,7 +3223,34 @@ static void draw_tasks(void) {
       for (int q = 0; tag[q] && np < 38; q++) nm[np++] = tag[q];
     }
     nm[np] = 0;
-    meep_text(&meep_m100, cx_name,  y0, nm, ink);
+    meep_text(&meep_m100, cx_name, y0, nm, ink);
+
+    /* Which core: -1 is "never pinned", which means the bootstrap processor. */
+    char cb[8];
+    int cn = 0;
+    if (t->cpu < 0) { cb[cn++] = '0'; }
+    else {
+      int idx = -1;
+      for (int i = 0; i < ncpu; i++) {
+        percpu_t *c = percpu_by_index(i);
+        if (c && (int)c->apic_id == t->cpu) { idx = i; break; }
+      }
+      if (idx < 0) { cb[cn++] = '-'; }
+      else if (idx >= 10) { cb[cn++] = (char)('0' + idx / 10); cb[cn++] = (char)('0' + idx % 10); }
+      else cb[cn++] = (char)('0' + idx);
+    }
+    cb[cn] = 0;
+    meep_text(&meep_m100, cx_core, y0, cb, ink);
+
+    char pb[8];
+    int pc = (int)((t->ticks * 100) / total);
+    int pn = 0;
+    if (pc >= 100) { pb[pn++]='1'; pb[pn++]='0'; pb[pn++]='0'; }
+    else if (pc >= 10) { pb[pn++]=(char)('0'+pc/10); pb[pn++]=(char)('0'+pc%10); }
+    else pb[pn++]=(char)('0'+pc);
+    pb[pn++]='%'; pb[pn]=0;
+    meep_text(&meep_m100, cx_pct, y0, pb, ink);
+
     if (t->state == TASK_DEAD && t->cr3) {
       char st[24];
       int sp2 = 0;
@@ -3066,38 +3270,108 @@ static void draw_tasks(void) {
     } else {
       meep_text(&meep_m100, cx_state, y0, task_state_name(t->state), ink);
     }
+
+    char mb[16];
+    tm_mem(mb, t->mm ? mm_rss_bytes(t->mm) : 0);
+    meep_text(&meep_m100, cx_mem, y0, mb, ink);
+
     char buf[24];
     u64s(t->ticks, buf);
     meep_text(&meep_m100, cx_ticks, y0, buf, ink);
-    u64s(t->switches, buf);
-    meep_text(&meep_m100, cx_sw, y0, buf, ink);
 
-    /* share of cpu, as a bar under the row */
-    int bw = a->w - 2 * UI_SCALE_VAL(14);
-    int filled = (int)((t->ticks * (uint64_t)bw) / total);
-    if (filled > bw) filled = bw;
-    int by = y0 + lh + 1;
-    fb_fill_rect(x0, by, bw, 2, MEEP_LINE_SOFT);
-    if (filled > 0) fb_fill_rect(x0, by, filled, 2, MEEP_ACCENT);
-    y0 += lh + UI_SCALE_VAL(8);
+    /* The x: only rows where ending it means something. pid 0 is the kernel and
+     * the compositor cannot end itself, so those rows keep a dim x instead of
+     * offering a control that would refuse. */
+    int killable = (pid > 0 && pid != task_current() && t->state != TASK_DEAD);
+    meep_text(&meep_m100, cx_kill, y0, "x", killable ? MEEP_INK_SOFT : MEEP_LINE_SOFT);
+    y0 += rh;
   }
 
-  /* Never let the window imply it is showing everything. */
-  if (drawn < nt) {
-    char more[24];
-    int mp = 0;
-    more[mp++] = '+';
-    char num[12];
-    u64s((uint64_t)(nt - drawn), num);
-    for (int q = 0; num[q] && mp < 20; q++) more[mp++] = num[q];
-    const char *tail2 = " more";
-    for (int q = 0; tail2[q] && mp < 22; q++) more[mp++] = tail2[q];
-    more[mp] = 0;
-    meep_text(&meep_m100, cx_sw, a->y + a->h - UI_SCALE_VAL(18), more, MEEP_INK_SOFT);
+  /* scrollbar: drawn only when there is somewhere to go */
+  if (max_scroll > 0) {
+    int sbx = x0 + bw - UI_SCALE_VAL(5);
+    int sbh = list_bot - list_top;
+    if (sbh > 8) {
+      fb_fill_rect(sbx, list_top, UI_SCALE_VAL(3), sbh, MEEP_LINE_SOFT);
+      int thumb = sbh * vis / no;
+      if (thumb < UI_SCALE_VAL(14)) thumb = UI_SCALE_VAL(14);
+      int travel = sbh - thumb;
+      int ty = list_top + (max_scroll > 0 ? travel * tm_scroll / max_scroll : 0);
+      fb_fill_rect(sbx, ty, UI_SCALE_VAL(3), thumb, MEEP_ACCENT);
+    }
   }
 
-  meep_text(&meep_m100, x0, a->y + a->h - UI_SCALE_VAL(18),
-            "round robin / 100 hz / (u) = ring 3", MEEP_INK_SOFT);
+  /* footer: where we are in the list, then the legend */
+  int fy = a->y + a->h - UI_SCALE_VAL(18);
+  {
+    char a1[12], a2[12], a3[12];
+    u64s((uint64_t)(tm_scroll + 1), a1);
+    u64s((uint64_t)(tm_scroll + drawn), a2);
+    u64s((uint64_t)no, a3);
+    char pos[40]; int pn = 0;
+    for (int q = 0; a1[q]; q++) pos[pn++] = a1[q];
+    pos[pn++] = '-';
+    for (int q = 0; a2[q]; q++) pos[pn++] = a2[q];
+    pos[pn++] = ' '; pos[pn++] = 'o'; pos[pn++] = 'f'; pos[pn++] = ' ';
+    for (int q = 0; a3[q] && pn < 36; q++) pos[pn++] = a3[q];
+    pos[pn] = 0;
+    meep_text(&meep_m100, cx_ticks, fy, pos, MEEP_INK_SOFT);
+  }
+
+  meep_text(&meep_m100, x0, fy,
+            tm_note[0] ? tm_note : "mem = resident / wheel scrolls / x ends a process",
+            MEEP_INK_SOFT);
+}
+
+static void tm_set_note(const char *pre, const char *nm) {
+  int n = 0;
+  for (int i = 0; pre[i] && n < 22; i++) tm_note[n++] = pre[i];
+  if (nm) for (int i = 0; nm[i] && n < 46; i++) tm_note[n++] = nm[i];
+  tm_note[n] = 0;
+  needs_redraw = 1;
+}
+
+/* A click inside the task manager's list. The geometry comes from the last
+ * paint, so only rows that were actually drawn can be hit - the same set a
+ * person could have aimed at, even though the sort shifts them between frames. */
+static void tasks_click(int x, int y, meep_app_t *a) {
+  if (tm_row_h <= 0 || tm_nrows <= 0) return;
+  int row = (y - tm_list_top) / tm_row_h;
+  if (row < 0 || row >= tm_rows_vis) return;
+  int k = tm_scroll + row;
+  if (k < 0 || k >= tm_nrows) return;
+  int pid = tm_order[k];
+  task_t *t = task_at(pid);
+  if (!t) return;
+
+  /* The x sits in the last few pixels of the row, clear of the scrollbar. */
+  int kx0 = a->x + a->w - UI_SCALE_VAL(44), kx1 = a->x + a->w - UI_SCALE_VAL(22);
+  if (x < kx0 || x > kx1) return;
+  if (pid <= 0 || pid == task_current() || t->state == TASK_DEAD) {
+    tm_set_note("cannot end: ", pid <= 0 ? "the kernel" : (pid == task_current() ? "this" : "already done"));
+    return;
+  }
+  char nm[40]; int np = 0;
+  while (t->name[np] && np < 30) { nm[np] = t->name[np]; np++; }
+  nm[np] = 0;
+  /* The flag, not a teardown: ring3.c turns kill_req into a real exit at the
+   * task's next syscall door, which is the only place it is safe to unwind a
+   * task's own frame. A task spinning in user code dies at its next call. */
+  task_request_kill(pid);
+  tm_set_note("kill sent: ", nm);
+}
+
+/* Wheel over the list. Returns 1 when it moved, so the caller can repaint. */
+static int tasks_wheel(int mx, int my, int dir) {
+  meep_app_t *a = &mapp[APP_TASKS];
+  if (!a->open || a->min) return 0;
+  if (mx < a->x || mx >= a->x + a->w || my < a->y || my >= a->y + a->h) return 0;
+  int max_scroll = tm_nrows - tm_rows_vis;
+  if (max_scroll <= 0) return 0;
+  tm_scroll -= dir * 3;
+  if (tm_scroll < 0) tm_scroll = 0;
+  if (tm_scroll > max_scroll) tm_scroll = max_scroll;
+  return 1;
 }
 
 static void draw_calc(void) {
@@ -3718,7 +3992,7 @@ static void app_defaults(int id, int *x, int *y, int *w, int *h) {
     case APP_CALC:  *x = 120; *y = 320; *w = 250; *h = APP_TITLE_H + 12 + 64 + 10 + 5 * 40 + 4 * 6 + 14; break;
     case APP_NOTES: *x = 400; *y = 300; *w = 430; *h = 360; break;
     case APP_MEDIA: *x = 300; *y = 190; *w = 420; *h = 260; break;
-    case APP_TASKS:   *x = 250; *y = 170; *w = 460; *h = 300; break;
+    case APP_TASKS:   *x = 210; *y = 120; *w = 570; *h = 470; break;
     case APP_FILES:   *x = 300; *y = 130; *w = 520; *h = 380; break;
     default:        *x = 240; *y = 140; *w = 520; *h = 340; break;
   }
@@ -4225,6 +4499,7 @@ static int apps_click(int x, int y, int button) {
     }
     if (y < a->y + APP_TITLE_H) { drag_app = e; drag_dx = x - a->x; drag_dy = y - a->y; needs_redraw = 1; return 1; }
     if (e == APP_CALC) calc_body_click(x, y);
+    if (e == APP_TASKS) tasks_click(x, y, a);
     if (e == APP_FILES) files_click(x, y, a);
     if (e == APP_MEDIA) {
       int bx = a->x + 14;
@@ -4268,6 +4543,22 @@ static int apps_key(int key) {
     }
     needs_redraw = 1;
     return 1;
+  }
+  if (mapp_focus == APP_TASKS) {
+    /* Page keys scroll the process list. The wheel does the same thing; this is
+     * the half that works without a mouse. */
+    int max_scroll = tm_nrows - tm_rows_vis;
+    if (key == KEY_PGUP || key == KEY_PGDN || key == KEY_HOME || key == KEY_END) {
+      if (max_scroll < 1) { needs_redraw = 1; return 1; }
+      if (key == KEY_PGUP) tm_scroll -= tm_rows_vis;
+      else if (key == KEY_PGDN) tm_scroll += tm_rows_vis;
+      else if (key == KEY_HOME) tm_scroll = 0;
+      else tm_scroll = max_scroll;
+      if (tm_scroll < 0) tm_scroll = 0;
+      if (tm_scroll > max_scroll) tm_scroll = max_scroll;
+      needs_redraw = 1;
+      return 1;
+    }
   }
   if (mapp_focus == APP_FILES) {
     /* Arrows move the selection, Enter opens a folder, Backspace goes up - the
@@ -5982,6 +6273,10 @@ static void gui_poll_input(void) {
     if (left_press || left_release || wheel) needs_redraw = 1;
     return;
   }
+
+  /* Wheel over the task manager's list scrolls it: ring-3 clients above get
+   * first refusal, this is the built-in path. */
+  if (wheel && tasks_wheel(new_x, new_y, wheel)) needs_redraw = 1;
   
   /* Handle window dragging */
   if (dragging_window != DRAG_NONE && left_held) {
@@ -6497,8 +6792,11 @@ void gui_compose(void) {
   }
 
   /* A frame caused only by clients presenting pixels does not need the scene
-   * rebuilt: patch the rectangles and put them on the screen. */
-  if (dmg_try_patch_frame()) {
+   * rebuilt: patch the rectangles and put them on the screen. But a pending
+   * scene rebuild has to win: a ring-3 client that presents every frame would
+   * otherwise swallow every needs_redraw forever, and built-in apps (the task
+   * manager's graphs, for one) would freeze at whatever they first drew. */
+  if (!needs_redraw && dmg_try_patch_frame()) {
     frame_count++;
     return;
   }
@@ -6525,6 +6823,16 @@ void gui_main_loop(void) {
       static int wx_tried = 0;
       if (!wx_tried && frame_count > 40 && e1000_link()) { wx_tried = 1; wx_fetch(); }
     }
+    /* Task Manager updates once a second like a real one, from the tick count.
+     * Only while it is open, and only its own redraw - a graph that refreshes at
+     * the compositor's frame rate would make the measurement the load. */
+    {
+      static uint64_t tm_last;
+      if (mapp[APP_TASKS].open) {
+        uint64_t now = task_total_ticks();
+        if (now >= tm_last + 100) { tm_last = now; needs_redraw = 1; }
+      }
+    }
     mp_pump();                       /* paces playback at real time */
     if (++idle > 3000000u) idle = 0;
     /* Poll input aggressively - USB legacy emulation requires frequent polling */
@@ -6549,7 +6857,11 @@ void gui_main_loop(void) {
      * halt, so an idle Omi held a full core, ran hot on real hardware, and left
      * every ring-3 client with a fraction of the machine. */
     if (!needs_redraw && !dmg_pending_n && !mp_playing) {
+      /* Tell the sampler the truth before halting, or an idle desktop reports
+       * a core pinned at 100% and Task Manager lies to the user. */
+      percpu_set_idle(1);
       __asm__ volatile("hlt");
+      percpu_set_idle(0);
     }
 
     /* Minimal yield - just a few pause instructions */

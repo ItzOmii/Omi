@@ -135,6 +135,12 @@ typedef struct {
   /* CLONE_CHILD_CLEARTID: the user address to zero on exit so a joiner's futex
    * wakes up, 0 = none. */
   uint64_t ctid;
+  /* Which core may run this task: an APIC id, or -1 for "the bootstrap
+   * processor". Nothing migrates today - a task stays on the core that first
+   * picked it - because the scheduler's state (a runqueue, a TSS, a saved FPU
+   * area) is only per core for the parts listed above, and a migration would
+   * quietly move a stack between them. */
+  int      cpu;
   int      parent;      /* the task that spawned this one, 0 for the kernel; the
                          * only thing wait4() looks for, and the only reason a
                          * dead child is not simply forgotten */
@@ -188,6 +194,7 @@ int  task_spawn_user_mm(const char *name, uint64_t entry, uint64_t user_sp,
 void task_sleep_ticks(uint64_t ticks);   /* block until the tick passes */
 void mm_on_exit(task_t *t);              /* ring3.c: drop the mm reference */
 void mm_reap(void);                      /* ring3.c: free dead spaces */
+uint64_t mm_rss_bytes(mm_t *mm);         /* ring3.c: present pages, 0 if none */
 void task_kill_current(uint64_t code);   /* does not return */
 /* Ask a task to exit at its next syscall boundary. Refuses the kernel task: the
  * scheduler cannot be killed from outside itself. */
@@ -208,6 +215,14 @@ int  task_current(void);
 const char *task_state_name(int st);
 void task_block(int blocked);   /* 1 = don't schedule this task */
 void task_system_start(void);
+/* Pin a new kernel thread to one core. Returns its id, -1 if the table is full. */
+int  task_spawn_on(const char *name, void (*fn)(void), uint32_t apic_id);
+/* The task a core owns when nothing is ready: its own C stack, no function.
+ * Created with state RUN, so the first pick by that core sees it as current. */
+int  task_spawn_ap_idle(uint32_t apic_id, uint64_t stack_top);
+/* Enter the scheduler on an application processor. Never returns: the core
+ * alternates between its idle task and whatever is ready for it. */
+void sched_ap_enter(int idle_id) __attribute__((noreturn));
 void task_demo_start(void);
 /* Does the timer switch tasks, or only tick? Runs spin.elf; see preempt_selftest.c */
 void preempt_selftest(void);
