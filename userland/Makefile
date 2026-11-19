@@ -35,6 +35,7 @@ PROGS += socktest.elf
 PROGS += tlsget.elf
 PROGS += surftest.elf
 PROGS += scene.elf
+PROGS += comp.elf
 PROGS += vmtest.elf
 PROGS += shmtest.elf
 PROGS += surfbig.elf
@@ -203,6 +204,13 @@ surftest.elf: surftest.c
 # than by the kernel. See the header of scene.c.
 scene.elf: scene.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping scene"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
+
+# The display server: it owns the frame and composites every window's pixels
+# itself, with furniture of its own. See the header of comp.c.
+comp.elf: comp.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping comp"; exit 0; }
 	musl-gcc -static -O2 -no-pie -o $@ $<
 	@echo "built $@"
 

@@ -577,6 +577,9 @@ void _start(void) {
   /* The scene: the screen's pixels handed to a ring-3 process. It waits for
    * the boot tests to finish before it takes anything over - see scene.c. */
   ring3_spawn_elf("scene", "scene.elf", 0);
+  /* And then the display server, which waits for scene to give the screen back
+   * and composites every window itself. */
+  ring3_spawn_elf("comp", "comp.elf", 0);
   ring3_spawn_elf("omirender", "omirender.elf", 0);
   ring3_spawn_elf("surfexit", "surfexit.elf", 0);
   }

@@ -28,6 +28,7 @@
 
 #define SYS_YIELD         3
 #define SYS_WIN_OPEN      6
+#define SYS_WIN_CLOSE     10
 #define SYS_SURF_CREATE   35
 #define SYS_SURF_PRESENT  36
 #define SYS_SCENE_MAP     42
@@ -268,6 +269,11 @@ int main(void) {
           ms(12000);
         }
       } else printf("[scene] no foreign surface to composite\n");
+
+      /* Close the window while an alias of it is still mapped: the frames go
+       * back to the allocator here, so the alias has to go first. */
+      sys1(SYS_WIN_CLOSE, win);
+      printf("[scene] window %ld closed; its alias should be gone before its frames are\n", win);
     }
   }
 

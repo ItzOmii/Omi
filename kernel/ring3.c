@@ -1004,6 +1004,7 @@ uint64_t surf_map_read(int win_id, int *out_w, int *out_h) {
       return (uint64_t)-ENOMEM;      /* no PTE_W: reads only, on purpose */
   }
   t->mm->surf_alias_bits |= 1ULL << pick;
+  t->mm->surf_alias_win[pick] = (int16_t)(win_id + 1);
   if (out_w) *out_w = surf[slot].w;
   if (out_h) *out_h = surf[slot].h;
   serial_puts("[surf] alias win=");
@@ -1027,9 +1028,37 @@ int surf_list(int32_t *out, int max) {
   return n;
 }
 
+/* The alias table has one entry per slot region, and the kernel's table of them
+ * has to be the same size or a window's pixels land somewhere unexpected. */
+_Static_assert(RING3_SURF_SLOTS == (int)(sizeof(((mm_t *)0)->surf_alias_win) / sizeof(int16_t)),
+               "surf_alias_win must have one entry per surface slot");
+
+/* A window closing takes its frames with it, and an alias is a page table entry
+ * in somebody else's address space that does not stop pointing at them just
+ * because the window is gone. Take every alias back first: left in place it is a
+ * use-after-free with the user on the wrong end of it. */
+static void surf_drop_aliases(int win_id, unsigned pages) {
+  for (int i = 0; i < TASK_MAX; i++) {
+    task_t *t = task_at(i);
+    if (!t || !t->cr3 || !t->mm) continue;
+    for (int j = 0; j < RING3_SURF_SLOTS; j++) {
+      if (t->mm->surf_alias_win[j] != win_id + 1) continue;
+      uint64_t base = RING3_SURF_BASE + (uint64_t)j * RING3_SURF_AREA;
+      for (unsigned k = 0; k < pages; k++) shm_unmap_page(t->cr3, base + (uint64_t)k * 4096);
+      t->mm->surf_alias_win[j] = 0;
+      t->mm->surf_alias_bits &= ~(1ULL << j);
+      serial_puts("[surf] reclaimed alias of win=");
+      serial_puthex((uint64_t)win_id);
+      serial_puts(" from pid "); serial_puthex((uint64_t)t->id);
+      serial_puts(" slot "); serial_puthex((uint64_t)j); serial_puts("\n");
+    }
+  }
+}
+
 void surf_release_window(int win_id) {
   int slot = surf_slot_for_win(win_id);
   if (slot < 0) return;
+  surf_drop_aliases(win_id, surf[slot].pages);
   for (int i = 0; i < surf[slot].pages; i++)
     if (surf[slot].kva[i]) pmm_free_page(to_phys(surf[slot].kva[i]));
   kfree(surf[slot].kva);
@@ -3826,6 +3855,12 @@ int scene_own(int x, int y, int w, int h) {
 }
 
 int scene_handoff(int on) {
+  /* A query, not a request: a second display server has to be able to see
+   * whether somebody is painting the display before it takes it over, and it
+   * must be able to ask without owning anything. The answer is about the
+   * handoff, not the mapping - plenty of processes may have the scene mapped,
+   * and only one of them can be the one the display is showing. */
+  if (on == -1) return gui_scene_handoff ? scene_owner_pid : 0;
   if (scene_owner_pid != (int)task_current()) return -EPERM;
   int was = gui_scene_handoff;
   gui_scene_handoff = on ? 1 : 0;

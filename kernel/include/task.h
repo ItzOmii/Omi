@@ -94,6 +94,10 @@ typedef struct {
    * pixels. Its own surfaces are writable and live at their own index, which is
    * why an alias needs a different one. */
   uint64_t  surf_alias_bits;
+  /* win_id + 1 per slot, 0 for free: which window's pixels each alias holds, so
+   * that closing a window can find every alias of it and take the mappings back
+   * before the frames are freed. RING3_SURF_SLOTS entries (checked in ring3.c). */
+  int16_t   surf_alias_win[8];
   /* brk: one lazily-populated area reserved on the first call, then a pointer
    * that moves inside it. Pages appear on touch, so the reservation is free. */
   uint64_t  brk_base, brk_cur, brk_end;

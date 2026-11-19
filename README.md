@@ -115,10 +115,20 @@ with specific properties. Here is the honest ledger, in the order the work has t
    display. Then it does it again with a window that belongs to a *different* process: it reads
    0x00FFFF00 and 0x00FF0000 out of that window's pixels, composites them, and the display shows
    those two colours where it put them. Draw and present are now separate jobs, which is the whole
-   point of the split. What is left
-   is the stacking and the plumbing: several rectangles instead of one claim, alias slots reclaimed
-   when a window closes instead of at exit, input and window furniture moved to the server, and the
-   kernel keeping nothing but the framebuffer, the page tables and the scanout.
+   point of the split. Aliases are reclaimed when their window closes, before its frames go back to
+   the allocator.
+   `userland/comp.c` is the other end of it: a display server in ring 3. It waits for whoever has
+   the screen to give it back (`SYS_SCENE_HANDOFF` with -1 asks who that is), takes it, then every
+   frame asks which windows have pixels, maps the ones it has not seen before, asks where each one
+   is (`SYS_WIN_GEOM`), and composites them into a desktop of its own - background, title bar and
+   edge drawn by the server, contents taken from the client's buffer and never drawn by it. Verified
+   from outside: 19 sampled frames of its output, the server's background in 78% of each, three
+   cascading title bars at x = 239, 285, 331 with widths 326, 386 and 446 (the windows are 320, 380
+   and 440 wide), window pixels underneath them, and a sweep along the bottom edge that moves from
+   frame to frame. What is left is the stacking and the plumbing: several rectangles instead of one
+   claim, input routed to the server rather than to the kernel's shell, a window list so surfaces
+   are not the only way to be a window, and the kernel keeping nothing but the framebuffer, the page
+   tables and the scanout.
 2. **More than one core.** Done — four cores, three APs, per-CPU scheduling.
 3. **A sandbox.** No seccomp, no namespaces, no capability model. Chromium's security posture
    assumes the platform takes something away from a renderer; here nothing is taken away, so a
@@ -249,7 +259,9 @@ kernel/
 └── user/        the first process
 userland/        ring-3 programs (musl-gcc): ominet (browser; omilayout.c is the engine),
                  imgdec, omirender, surftest, tlsget, socktest, scene (the screen as a
-                 ring-3 buffer: map, flush, own a rectangle, take the whole screen) and the tests
+                 ring-3 buffer: map, flush, own a rectangle, take the whole screen), comp (the
+                 display server: composites every window's pixels, with furniture of its own) and
+                 the tests
 docs/            ABI and design notes, and the landing page
 limine.conf      bootloader config
 Makefile         build
