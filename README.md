@@ -105,7 +105,8 @@ with specific properties. Here is the honest ledger, in the order the work has t
 
 **Missing, in the order it blocks progress.**
 1. **A userspace compositor** with client-owned buffers and damage-limited redraw. **Done**, with
-   one piece still missing (see the end of this entry). The inversion is proven. The scene is a ring-3 buffer now: a process maps it (`SYS_SCENE_MAP`),
+   one piece still missing (see the end of this entry). The inversion is proven. The scene is a ring-3
+   buffer now: a process maps it (`SYS_SCENE_MAP`),
    writes pixels into it with no syscall per glyph, flushes a rectangle (`SYS_SCENE_FLUSH`), claims
    that rectangle away from the kernel's own blits so both stay live on one screen
    (`SYS_SCENE_OWN`), or takes the screen outright (`SYS_SCENE_HANDOFF`) and gives it back on exit.
