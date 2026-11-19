@@ -192,10 +192,10 @@
       <a class="btn ghost" href="#inside">See the screens</a>
     </div>
     <div class="facts">
-      <div class="fact"><b>66,000</b><span>lines of our own</span></div>
-      <div class="fact"><b>12 MB</b><span>bootable ISO</span></div>
-      <div class="fact"><b>34</b><span>syscalls</span></div>
-      <div class="fact"><b>20</b><span>programs on the ISO</span></div>
+      <div class="fact"><b>59,631</b><span>lines of our own</span></div>
+      <div class="fact"><b>14.5 MB</b><span>bootable ISO</span></div>
+      <div class="fact"><b>54</b><span>syscalls</span></div>
+      <div class="fact"><b>37</b><span>programs on the ISO</span></div>
     </div>
   </div>
   <div class="hero-shot">
@@ -377,7 +377,7 @@
         <div class="layer"><b>gdt + tss</b><span>installed by the kernel; limine's table is not guaranteed</span></div>
         <div class="layer"><b>pit</b><span>100 hz on irq0, the only clock in the system</span></div>
         <div class="layer"><b>address space</b><span>one pml4 per program, kernel mapped supervisor-only</span></div>
-        <div class="layer"><b>syscalls</b><span>int 0x80 at dpl 3, 34 calls, args in rdi/rsi/rdx/r8</span></div>
+        <div class="layer"><b>syscalls</b><span>int 0x80 at dpl 3, 54 calls, args in rdi/rsi/rdx/r8</span></div>
         <div class="layer"><b>programs</b><span>elf files on the iso, loaded and mapped by the kernel</span></div>
         <div class="layer"><b>preemption</b><span>every task is an interrupt frame; irq0 switches at cpl 3</span></div>
         <div class="layer"><b>sleep</b><span>blocked state + wake on input, no busy polling</span></div>
@@ -413,11 +413,12 @@
       </div>
       <div class="hole">
         <div class="n">03</div>
-        <h4>The window server is in the kernel</h4>
-        <p>The kernel composites every window and owns the frame's last pixels: a client cannot draw
-          its own furniture, every glyph crosses the syscall boundary, and a visual fix costs a kernel
-          rebuild. A userspace compositor with client-owned buffers is the next structural change, and
-          the precondition for hosting a modern browser engine.</p>
+        <h4>A compromised renderer is the machine</h4>
+        <p>The window server is out of the kernel now — a ring-3 process owns the screen, the stacking
+          order, the furniture and the input, and composites only what changed. What is missing is the
+          other half of a browser's threat model: there is no seccomp, no namespaces and no capability
+          model, so nothing is taken away from a renderer that gets compromised. That sandbox is the
+          next structural change, and the precondition for hosting a modern browser engine.</p>
       </div>
     </div>
   </div>

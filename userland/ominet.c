@@ -112,6 +112,17 @@ static int  hist_silent;          /* set while moving through history */
  * viewports tall, with links to follow. */
 #define HOST0 "www.iana.org"
 #define PATH0 "/domains/reserved"
+/* Where the page checks get their page. It has to be a real page over real TLS -
+ * that is part of what is being tested - and it has to have text, links and
+ * height. It does not get to be one host: iana.org is served by Cloudflare, and
+ * Cloudflare refuses this machine's SYNs some days while answering the host's
+ * curl in the same minute (`connect`, three attempts, then nine red checks that
+ * look like a browser bug and are not). So the second one is on a different
+ * CDN, and the suite says which one it used. */
+static const struct { const char *host, *path; } PAGE_TARGETS[] = {
+  { HOST0, PATH0 },
+  { "en.wikipedia.org", "/wiki/Chromium_(web_browser)" },
+};
 
 static unsigned *pix;
 static int checks, fails;
@@ -512,16 +523,25 @@ static long load_page(void) {
    * minutes with its keyboard dead, and looked exactly like a hang. */
   long status = -1;
   char sb[64];
-  for (int attempt = 1; attempt <= 3; attempt++) {
-    blen = 0;
-    why = "not tried";
-    snprintf(sb, sizeof sb, "loading %s (%d/3)", cur_host, attempt);
-    show_status(sb);
-    status = https_get(cur_host, 443, cur_path, page, (size_t)page_cap, &why, &blen, ip);
-    printf("[net] https://%s%s -> %s attempt %d status=%ld body=%ld %s\n",
-           cur_host, cur_path, ip[0] ? ip : "?", attempt, status, blen, why);
-    if (status > 0 && blen > 0) break;   /* 200, or a redirect to follow */
-    sys3(SYS_YIELD, 0, 0, 0);
+  for (unsigned ti = 0; ti < sizeof PAGE_TARGETS / sizeof PAGE_TARGETS[0]; ti++) {
+    if (ti) {                       /* the next host, and say so in the log */
+      snprintf(cur_host, sizeof cur_host, "%s", PAGE_TARGETS[ti].host);
+      snprintf(cur_path, sizeof cur_path, "%s", PAGE_TARGETS[ti].path);
+      snprintf(cur_url, sizeof cur_url, "https://%s%s", cur_host, cur_path);
+      printf("[net] %s did not answer, trying %s\n", PAGE_TARGETS[ti - 1].host, cur_host);
+    }
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      blen = 0;
+      why = "not tried";
+      snprintf(sb, sizeof sb, "loading %s (%d/3)", cur_host, attempt);
+      show_status(sb);
+      status = https_get(cur_host, 443, cur_path, page, (size_t)page_cap, &why, &blen, ip);
+      printf("[net] https://%s%s -> %s attempt %d status=%ld body=%ld %s\n",
+             cur_host, cur_path, ip[0] ? ip : "?", attempt, status, blen, why);
+      if (status > 0 && blen > 0) break;   /* 200, or a redirect to follow */
+      sys3(SYS_YIELD, 0, 0, 0);
+    }
+    if (status > 0 && blen > 0) break;
   }
   last_status = status; last_blen = blen;
   memcpy(last_ip, ip, sizeof ip);

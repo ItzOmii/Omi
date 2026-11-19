@@ -12,10 +12,13 @@ the browser, audio, a disk — happened here.
 
 ![Omi desktop](screenshots/omi-desktop.png)
 
-By the numbers, measured from the tree: **36,272 lines** of first-party kernel C (plus 20,829 lines
-of headers), **8,391 lines** of user-mode C, **104,115 lines** of vendored BearSSL and Gumbo, and
-**51 native syscalls** in front of the Linux ABI. A stock boot prints **334 `ok` lines** in the
-serial log.
+By the numbers, measured from the tree (`find kernel -name '*.c'` and so on, vendored directories
+counted separately): **32,252 lines** of first-party kernel C (plus **17,733** lines of its headers),
+**9,646 lines** of user-mode C, **103,958 lines** of vendored BearSSL and Gumbo, **101,195 lines** of
+vendored audio decoders in `kernel/media/`, and **54 native syscalls** in front of the Linux ABI. A
+stock boot prints **334 `ok` lines** in the serial log - a couple of those checks talk to the public
+internet, and when it refuses them they print a skip instead of a failure, which is why the count
+moves by a few lines from one boot to the next.
 
 ---
 
@@ -101,8 +104,8 @@ with specific properties. Here is the honest ledger, in the order the work has t
   CPU, so threads are no longer pinned to one processor.
 
 **Missing, in the order it blocks progress.**
-1. **A userspace compositor** with client-owned buffers and damage-limited redraw. Under way, and
-   the inversion is proven. The scene is a ring-3 buffer now: a process maps it (`SYS_SCENE_MAP`),
+1. **A userspace compositor** with client-owned buffers and damage-limited redraw. **Done**, with
+   one piece still missing (see the end of this entry). The inversion is proven. The scene is a ring-3 buffer now: a process maps it (`SYS_SCENE_MAP`),
    writes pixels into it with no syscall per glyph, flushes a rectangle (`SYS_SCENE_FLUSH`), claims
    that rectangle away from the kernel's own blits so both stay live on one screen
    (`SYS_SCENE_OWN`), or takes the screen outright (`SYS_SCENE_HANDOFF`) and gives it back on exit.
@@ -122,10 +125,11 @@ with specific properties. Here is the honest ledger, in the order the work has t
    frame asks which windows have pixels, maps the ones it has not seen before, asks where each one
    is (`SYS_WIN_GEOM`), and composites them into a desktop of its own - background, title bar and
    edge drawn by the server, contents taken from the client's buffer and never drawn by it. Verified
-   from outside: 19 sampled frames of its output, the server's background in 78% of each, three
-   cascading title bars at x = 239, 285, 331 with widths 326, 386 and 446 (the windows are 320, 380
-   and 440 wide), window pixels underneath them, and a sweep along the bottom edge that moves from
-   frame to frame.
+   from outside, by reading pixels out of a screenshot rather than asking the program: three windows
+   composited, title bars 326, 386 and 446 pixels wide (the windows are 320, 380 and 440), the
+   server's own colours in every bar, a close box at the right end of each, the titles `surface`,
+   `render` and `Omi Net` read back out of the kernel with `SYS_WIN_TITLE` and drawn from the
+   kernel's 8x16 glyph table, and a sweep along the bottom edge that moves from frame to frame.
 
    Input went the same way. `SYS_INPUT_TAKE` hands one process the keyboard and pointer and the
    shell stops routing; `SYS_INPUT_POLL` gives the server events as four ints (move, down, up, key,
@@ -135,10 +139,35 @@ with specific properties. Here is the honest ledger, in the order the work has t
    more. Verified end to end, from outside: click the browser's address bar, type and press Enter,
    and the browser's own log says `[net] typed -> example.com` while the page area fills with
    example.com's text. The keystroke the machine acted on passed through the server, and the shell
-   never saw it. What is left is the stacking and the plumbing: several rectangles instead of one
-   claim, a window list so a window without a surface can still be a window, window furniture the
-   server owns outright (the drag, the resize edge, the close box) rather than draws, and the kernel
-   keeping nothing but the framebuffer, the page tables and the scanout.
+   never saw it.
+
+   Stacking is the server's too, and so is the furniture. It keeps the order windows are painted in
+   (`SYS_SURF_LIST` says which windows exist; the order is a list in the server), a click brings a
+   window forward, and it draws the frame itself: a 22-pixel bar above each client, the title text
+   out of the kernel's own 8x16 glyph table (`SYS_WIN_TITLE`), a close box, a drag on the bar and a
+   close on the box. Moving or closing a window the server did not open needs authority, and the
+   authority is owning the pointer: `SYS_WIN_PLACE` and `SYS_WIN_CLOSE` answer to
+   `gui_input_owns()`, so the only process that may rearrange the desktop is the one the user is
+   pointing with. That also closed a hole - `SYS_WIN_CLOSE` used to take any id from any task.
+
+   Verified from outside, one screenshot and one log line per claim: dragging the browser by its bar
+   moved it from y=280 to y=392; clicking a window behind another raised it, which cut the title bar
+   of the window it now covers from 386 pixels wide to 106; clicking a close box logged
+   `close box on win 12 -> 0` and the window left the stack.
+
+   And the frame is damage-limited. The server keeps a list of the rectangles that changed - a window
+   that moved (where it was and where it is), a client that presented (`SYS_SURF_DAMAGE` takes the
+   rectangle the kernel recorded), the pointer (old and new), a focus change, a raise, the sweep it
+   draws as proof of life - merges the ones that touch, repaints only those, and flushes only those
+   to the display. A whole screen is 1,024,000 pixels; an idle frame sends 3,840 (the sweep's strip).
+   Over a 3,000-frame run: **3,001 patches, 12,586,421 pixels painted, against 3,072,000,000 if
+   every frame had been whole - four pixels in a thousand**. Every drawing primitive takes a clip rectangle and computes
+   its bounds from it, so repainting a 20x20 blink does not walk a 438x328 surface.
+
+   What is still missing from this item: a window that has no surface is not a window yet. The server
+   discovers windows through their surfaces (`SYS_SURF_LIST`), so a window exists for it only once
+   there are pixels to composite - there is no window list independent of the buffers. The kernel is
+   out of the pixel business, but it is still the only thing that knows a window was opened.
 2. **More than one core.** Done — four cores, three APs, per-CPU scheduling.
 3. **A sandbox.** No seccomp, no namespaces, no capability model. Chromium's security posture
    assumes the platform takes something away from a renderer; here nothing is taken away, so a
@@ -164,9 +193,13 @@ next year.
   partitions, no NVMe, no directories, 32 files of 64 KB, and a bump allocator instead of a free
   list. A torn write is caught by the superblock checksum and answered by reformatting.
 - **One core, no GPU.** Stated above; both are real ceilings rather than oversights.
-- **The compositor redraws the whole scene.** Damage rectangles are tracked and counted, but the
-  frame is rebuilt from the wallpaper, so the row copy covers the client rect rather than the part
-  that changed.
+- **The compositor's damage is rectangles, not a scene graph.** It repaints the changed rectangles
+  and nothing else, but it has no idea what is inside them: a patch that overlaps three windows
+  repaints all three, and a window that grows by one pixel repaints its whole frame. There is no
+  occlusion culling and no region arithmetic beyond merging rectangles that touch, and the damage
+  list is a fixed 72 entries before it gives up and repaints the screen.
+- **A window without pixels is not a window.** Windows are discovered through their surfaces, so one
+  that has opened but not yet allocated a buffer is invisible to the server.
 - **Omi Net is a reader, not a browser.** HTML and a subset of CSS, no JavaScript. Text is one 8×16
   bitmap face with Latin-1 and common typography folded to ASCII; Greek, Cyrillic, CJK and emoji are
   dropped rather than drawn as boxes. A page body is capped at 256 KB, larger ones are parsed to the
@@ -227,7 +260,8 @@ legacy mode.
 ## What proves it
 
 Everything above is the output of programs that run on the ISO at boot, not a description of intent.
-A stock boot prints 334 `ok` lines and these tallies:
+A stock boot prints 334 `ok` lines and these tallies (the count moves by a few lines between boots:
+the two checks that use somebody else's server say `skipped` when it throttles them):
 
 `surftest` 10/10 (mapping, present, damage, refusals) · `surfbig` 10/10 (1920×1200, shrink and grow,
 the slot pool's `-ENOSPC`) · `surfexit` (a window and its surface are reaped when the process exits) ·
@@ -237,7 +271,19 @@ the slot pool's `-ENOSPC`) · `surfexit` (a window and its surface are reaped wh
 `cred` 7/7 (`SO_PEERCRED`) · `scm` 15/15 (`SCM_RIGHTS`, `MSG_CTRUNC`) · `img` 10/10 · `form` 16/16 ·
 `mem` 2/2 · `disk` 6/6 (with a disk attached) · `linux3` 27/27 · `pipe`/`pipe3` 37/37, 30/30 ·
 `maptest` 24/24 · `epolltest` 24/24 · `memfdtest` 23/23 · `modtest` 15/15 · `dyntest` 14/14 ·
-`lives` 8/8 · `exectest` 7/7.
+`lives` 7/8 · `exectest` 7/7.
+
+Two of those depend on somebody else's machine, and say so instead of failing: `ominet` fetches a
+real page over TLS (it falls back to a second host on a different CDN when the first refuses the
+SYN, because Cloudflare does refuse this machine's SYNs some days while answering the host's curl in
+the same minute), and `socktest`'s second concurrent connection goes to a public resolver, which
+throttles the second one. When a peer refuses, the suite prints
+`(1 skipped: the peer refused, not this machine)` and its tally drops rather than going red.
+
+`lives` T5 is the one red line in a stock boot, and it has failed since before the display server
+existed - checked by building the commit before the compositor work and booting it, same failure,
+same count. A shared segment is copied at fork when it should not be: 115 bytes where 75 were
+written. It is in the memory path, not the display path.
 
 `scene` is the odd one out: it is not a self-check, because a program cannot see its own pixels. It
 maps the scene, proves the mapping is writable and re-entrant, then prints the colours and
@@ -269,9 +315,10 @@ kernel/
 └── user/        the first process
 userland/        ring-3 programs (musl-gcc): ominet (browser; omilayout.c is the engine),
                  imgdec, omirender, surftest, tlsget, socktest, scene (the screen as a
-                 ring-3 buffer: map, flush, own a rectangle, take the whole screen), comp (the
-                 display server: composites every window's pixels, with furniture of its own) and
-                 the tests
+                 ring-3 buffer: map, flush, own a rectangle, take the whole screen - the first
+                 owner of it, and now a program to run by hand, because the display server asks
+                 first), comp (the display server: stacking, furniture, input, damage-limited
+                 redraw) and the tests
 docs/            ABI and design notes, and the landing page
 limine.conf      bootloader config
 Makefile         build
