@@ -192,7 +192,8 @@ next year.
 - **The disk is a first step, not a filesystem.** One PIO drive on the primary channel, no
   partitions, no NVMe, no directories, 32 files of 64 KB, and a bump allocator instead of a free
   list. A torn write is caught by the superblock checksum and answered by reformatting.
-- **One core, no GPU.** Stated above; both are real ceilings rather than oversights.
+- **No GPU.** Four cores are online and scheduled per CPU, but every pixel is composed on the
+  processor; there is no accelerator of any kind.
 - **The compositor's damage is rectangles, not a scene graph.** It repaints the changed rectangles
   and nothing else, but it has no idea what is inside them: a patch that overlaps three windows
   repaints all three, and a window that grows by one pixel repaints its whole frame. There is no
