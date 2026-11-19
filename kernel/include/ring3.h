@@ -157,6 +157,11 @@
 #define SYS_SCENE_OWN    46  /* (x,y), (w,h) -> 0: a rect the kernel keeps out of
                               * Its own blits. 0,0 clears the claim.         */
 
+#define SYS_WIN_PLACE   52  /* (id, x, y, (w<<16)|h) -> 0 | -EPERM. The display server
+                              * places a window it did not open: authority comes from
+                              * owning the pointer, not from owning the window.     */
+#define SYS_WIN_TITLE   53  /* (id, char *out, max) -> length | -1: a window's title */
+
 /* the switch, the gates and the fault handler */
 void     ring3_init(void);
 int      ring3_ready(void);

@@ -4755,6 +4755,19 @@ int gui_input_poll(int32_t *out, int max) {
   return n;
 }
 
+/* Who is serving the display? The authority below - to place a window somebody
+ * else opened, to close it - hangs off this one answer. */
+int gui_input_owns(int pid) { return pid > 0 && input_owner_pid == pid; }
+
+int winipc_title(int id, char *out, int max) {
+  fwin_t *f = fwin_find(id);
+  if (!f || !out || max <= 0) return -1;
+  int n = 0;
+  while (n < max - 1 && f->title[n]) { out[n] = f->title[n]; n++; }
+  out[n] = 0;
+  return n;
+}
+
 void gui_input_owner_exited(int pid) {
   if (input_owner_pid != pid) return;
   input_owner_pid = 0;

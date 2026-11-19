@@ -4017,7 +4017,24 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
         kill_if_requested();               /* an ended task must not sleep on */
       }
     }
+    case SYS_WIN_PLACE: {                /* the display server, placing a window */
+      int me = (int)task_current();
+      if (!gui_input_owns(me)) return -EPERM;
+      int wh = (int)(uint32_t)a2;
+      int r = winipc_set_rect((int)a0, (int32_t)a1, (int32_t)(a1 >> 32), wh >> 16, wh & 0xFFFF);
+      return r < 0 ? -EBADF : 0;
+    }
+    case SYS_WIN_TITLE: {
+      char t[40];
+      int n = winipc_title((int)a0, t, (int)((a2 < 40) ? a2 : 40));
+      if (n < 0) return -EBADF;
+      if (user_put(a1, t, (uint64_t)n + 1) != 0) return -EFAULT;
+      return n;
+    }
     case SYS_WIN_RECT: {
+      int me = (int)task_current(), own = winipc_owner((int)a0);
+      if (own < 0) return -EBADF;
+      if (me != own && !gui_input_owns(me)) return -EPERM;
       int wh = (int)(uint32_t)a3;
       int r = winipc_set_rect((int)a0, (int32_t)a1, (int32_t)(a1 >> 32),
                               wh >> 16, wh & 0xFFFF);
@@ -4094,7 +4111,16 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
     case SYS_MEMINFO:
       return (long)(((pmm_total_pages() & 0xFFFFFFFFu) << 32) | (pmm_free_pages() & 0xFFFFFFFFu));
     case SYS_WIN_PRESENT: winipc_present((int)a0); return 0;
-    case SYS_WIN_CLOSE:   winipc_close((int)a0); return 0;
+    case SYS_WIN_CLOSE: {
+      /* Your own window, or anybody's if you are the display server. Closing the
+       * window under the pointer is the server's job now, and it used to be
+       * anybody's: any task could close any window by guessing an id. */
+      int me = (int)task_current(), own = winipc_owner((int)a0);
+      if (own < 0) return -EBADF;
+      if (me != own && !gui_input_owns(me)) return -EPERM;
+      winipc_close((int)a0);
+      return 0;
+    }
     case SYS_INPUT_TAKE:  return (long)gui_input_take((int)a0);
     case SYS_INPUT_POLL: {
       int32_t ev[4 * 32];

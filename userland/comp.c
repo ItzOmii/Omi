@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <time.h>
+#include "glyphs.h"   /* the kernel's 8x16 face: the server draws its own titles */
 
 #define SYS_GETPID        5
 #define SYS_WIN_GEOM      14   /* (id, int32_t out[4]) -> x, y, w, h */
@@ -37,14 +38,21 @@
 #define SYS_INPUT_TAKE    49   /* (on) -> 1 this process owns the keyboard and pointer */
 #define SYS_INPUT_POLL    50   /* (int32_t out[], max) -> count, kind/a/b/c each */
 #define SYS_WIN_INPUT     51   /* (win, int32_t ev[4]) -> 0 delivered, -1 no window */
+#define SYS_WIN_PLACE     52   /* (id, x, y, (w<<16)|h): the server placing a window */
+#define SYS_WIN_CLOSE     10
+#define SYS_WIN_TITLE     53   /* (id, char *out, max) -> length */
 
-#define MAXWIN 8
+#define MAXWIN 12
 #define BG      0x00101828u   /* the server's own desktop */
 #define TITLE   0x00B03050u   /* furniture it draws itself */
 #define EDGE    0x00E0E8F0u
 #define SWEEP   0x00FFFFFFu
 #define FOCUS   0x00E05070u   /* a title bar the server considers focused */
 #define CURSOR  0x00FFFFFFu
+#define BAR_H   22            /* the title bar, in pixels, drawn above the client */
+#define TEXT    0x00F0F4FAu
+#define CLOSE   0x00D84868u
+#define CLOSEX  0x00FFFFFFu
 
 #define IN_MOVE  1
 #define IN_DOWN  2
@@ -110,6 +118,27 @@ static void blit(const uint32_t *px, long src_stride, long src_w, long src_h,
   }
 }
 
+/* The kernel's 8x16 face, drawn into the frame by the server. Furniture the
+ * server renders needs the server to be able to write words, and this is the
+ * smallest way to have any. */
+static void glyphs_draw(long x, long y, const char *t, uint32_t col) {
+  for (; *t; t++) {
+    int ch = (unsigned char)*t;
+    if (ch < GLYPH_FIRST || ch > GLYPH_LAST) ch = '?';
+    const unsigned char *rows = glyphs[ch - GLYPH_FIRST];
+    for (int r = 0; r < GLYPH_H; r++) {
+      unsigned bits = rows[r];
+      for (int c = 0; c < GLYPH_W; c++)
+        if (bits & (0x80u >> c)) {
+          long ty = y + r, tx = x + c;
+          if (ty < 0 || ty >= (long)sh || tx < 0 || tx >= (long)sw) continue;
+          *(uint32_t *)((uint8_t *)scene + (size_t)ty * stride + (size_t)tx * 4) = col;
+        }
+    }
+    x += GLYPH_W;
+  }
+}
+
 /* One window: the pixels the map gave us, and the size they arrived in. A
  * window's contents can change size under us, so the size is re-checked each
  * frame from the list; the stride is not, because a surface never moves. */
@@ -118,31 +147,125 @@ struct win {
   uint32_t *px;
   long     w, h, stride;
   long     x, y;          /* where the last frame put it */
+  char     title[32];
 };
 
+/* Find the record for a window, or make one: map its pixels read-only once and
+ * read its title once. The pixels never move for the life of the window; the
+ * title can change, so it is re-read now and then. */
 /* The server's own idea of the scene, kept from the last frame: input is
  * handled against this before the new frame is painted, the way a compositor
  * with a scene graph hit-tests against what it drew most recently. */
-static struct win g_win[MAXWIN];   /* the scene graph, filled by the paint loop */
-static int        g_live[MAXWIN];     /* ids in draw order, topmost last */
-static int        g_nlive;
-static int        g_focus;            /* window id, 0 = none */
+static struct win g_win[MAXWIN];      /* the scene graph, filled by the paint loop */
+static int        g_stack[MAXWIN];   /* window ids, bottom of the stack first */
+static int        g_nstack;
+static int        g_focus;           /* window id, 0 = none */
+static int        g_drag;            /* window id being dragged by its title bar */
+static long       g_drag_x, g_drag_y;  /* where in the bar the pointer took hold */
+static int        g_close_hover;
 static long       g_mx = 640, g_my = 400;
 static int        g_have_mouse;
 
-/* Which window is under a point, topmost first. */
-static int hit(long x, long y) {
-  for (int i = g_nlive - 1; i >= 0; i--) {
-    struct win *w = 0;
-    for (int k = 0; k < MAXWIN; k++) if (g_win[k].id == g_live[i]) { w = &g_win[k]; break; }
-    if (!w) continue;
-    if (x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h) return w->id;
-  }
+static struct win *byid(int id) {
+  for (int k = 0; k < MAXWIN; k++) if (g_win[k].id == id) return &g_win[k];
   return 0;
 }
 
-static struct win *byid(int id) {
-  for (int k = 0; k < MAXWIN; k++) if (g_win[k].id == id) return &g_win[k];
+int g_mapped;                 /* windows mapped: a number for the closing report */
+
+static struct win *win_map(int id) {
+  static int map_calls;
+  struct win *w = byid(id);
+  if (w && w->px) {
+    if ((map_calls++ % 120) == 0) sys3(SYS_WIN_TITLE, id, (long)w->title, sizeof w->title);
+    return w;
+  }
+  if (!w) {
+    for (int k = 0; k < MAXWIN; k++) if (!g_win[k].id) { w = &g_win[k]; break; }
+    if (!w) return 0;
+  }
+  int32_t mi[3] = {0, 0, 0};
+  long a = sys3(SYS_SURF_MAP, id, (long)mi, 0);
+  if (a <= 0) return 0;                   /* closed between list and map */
+  w->id = id;
+  w->px = (uint32_t *)(uintptr_t)a;
+  w->w = mi[0]; w->h = mi[1]; w->stride = mi[2];
+  w->title[0] = 0;
+  sys3(SYS_WIN_TITLE, id, (long)w->title, sizeof w->title);
+  g_mapped++;
+  printf("[comp] win %d: %ldx%ld at 0x%lx, stride %ld, \"%s\"\n",
+         id, w->w, w->h, a, w->stride, w->title);
+  return w;
+}
+
+
+/* Stacking is the server's, not the kernel's. The list the kernel hands over
+ * says which windows have pixels; the order they are painted in is this one,
+ * and it changes when somebody clicks - a window comes to the front because the
+ * server says so. */
+static int stack_index(int id) {
+  for (int i = 0; i < g_nstack; i++) if (g_stack[i] == id) return i;
+  return -1;
+}
+
+static void stack_add(int id) {
+  if (stack_index(id) < 0 && g_nstack < MAXWIN) g_stack[g_nstack++] = id;
+}
+
+static void stack_raise(int id) {
+  int i = stack_index(id);
+  if (i < 0) return;
+  for (; i + 1 < g_nstack; i++) g_stack[i] = g_stack[i + 1];
+  g_stack[g_nstack - 1] = id;
+}
+
+/* Forget windows that closed. Called with the list the kernel just handed over,
+ * so the stack cannot drift away from what still exists. */
+static void stack_prune(const int32_t *list, int n) {
+  int keep = 0;
+  for (int i = 0; i < g_nstack; i++) {
+    int found = 0;
+    for (int k = 0; k < n; k++) if (list[k * 3 + 0] == g_stack[i]) { found = 1; break; }
+    if (found) g_stack[keep++] = g_stack[i];
+    else {
+      struct win *w = byid(g_stack[i]);
+      if (w) w->id = 0;                 /* the record goes with the window */
+      if (g_focus == g_stack[i]) g_focus = 0;
+      if (g_drag == g_stack[i]) g_drag = 0;
+    }
+  }
+  g_nstack = keep;
+}
+
+/* Where in a window's furniture a point lands. The frame is the server's: the
+ * bar above the client area, three pixels of edge around it, and a close box at
+ * the right end of the bar. */
+#define AT_OUTSIDE 0
+#define AT_CLIENT  1
+#define AT_TITLE   2
+#define AT_CLOSE   3
+
+static int frame_hit(struct win *w, long x, long y) {
+  /* The frame is the server's: a bar BAR_H tall above the client area, three
+   * pixels of edge around both, and a close box inside the right end of the bar.
+   * The close box has to be tested before the bar, or the bar swallows it - it
+   * did, and clicks on the x went to the title drag. */
+  if (x < w->x - 3 || x >= w->x + w->w + 3) return AT_OUTSIDE;
+  if (y >= w->y - BAR_H && y < w->y) {
+    if (x >= w->x + w->w - 19 && x < w->x + w->w - 3 &&
+        y >= w->y - 19 && y < w->y - 3) return AT_CLOSE;
+    return AT_TITLE;
+  }
+  if (y >= w->y && y < w->y + w->h + 3) return AT_CLIENT;
+  return AT_OUTSIDE;
+}
+
+/* Which window is under a point, topmost first: the stack read backwards. */
+static int hit(long x, long y) {
+  for (int i = g_nstack - 1; i >= 0; i--) {
+    struct win *w = byid(g_stack[i]);
+    if (w && frame_hit(w, x, y) != AT_OUTSIDE) return w->id;
+  }
   return 0;
 }
 
@@ -175,14 +298,13 @@ int main(void) {
   sys1(SYS_SCENE_HANDOFF, 1);
   printf("[comp] the screen is this process's; the kernel paints nothing\n");
 
-  struct win *cache = g_win;   /* the one table: the paint loop fills it, input reads it */
-  int frames = 0, mapped_total = 0;
-  int worst = -1, bad_geom = 0;
+  int frames = 0, bad_geom = 0;
+  int worst = -1;
 
   long got = sys1(SYS_INPUT_TAKE, 1);
   printf("[comp] input: %s\n", got ? "the keyboard and pointer are this process's"
                                     : "refused - somebody else is serving");
-  int keys = 0, clicks = 0, fwd = 0, refused = 0, moves = 0;
+  int keys = 0, clicks = 0, fwd = 0, refused = 0, moves = 0, drag_said = 0;
 
   for (int f = 0; f < 3000; f++) {           /* ~3 min at 60 ms */
     /* First the events, against the geometry of the frame that is on screen. */
@@ -193,7 +315,25 @@ int main(void) {
       int32_t out[4];
       if (kind == IN_MOVE) {
         g_mx = a; g_my = b; g_have_mouse = 1;
-        if ((moves++ % 25) == 0) printf("[comp] move %ld,%ld\n", g_mx, g_my);
+        moves++;
+        printf("[comp] move %ld,%ld\n", g_mx, g_my);   /* every move: the test harness reads this */
+        if (g_drag) {                        /* the title bar is the server's */
+          struct win *dw = byid(g_drag);
+          int32_t g[4];
+          if (!dw || sys3(SYS_WIN_GEOM, g_drag, (long)g, 0) != 0) {
+            g_drag = 0;
+          } else {
+            long nx = g_mx - g_drag_x, ny = g_my - g_drag_y;
+            /* x in the low half, y in the high: the same packing the kernel
+             * uses for SYS_WIN_RECT, with a syscall that lets the server move a
+             * window it did not open. */
+            long r = sys3(SYS_WIN_PLACE, g_drag,
+                          (nx & 0xFFFFFFFFL) | (ny << 32),
+                          ((long)g[2] << 16) | (long)g[3]);
+            if (r != 0 && drag_said++ < 3) printf("[comp] place refused: %ld\n", r);
+          }
+          continue;
+        }
         int id = hit(g_mx, g_my);
         struct win *w = id ? byid(id) : 0;
         if (w) {
@@ -203,9 +343,19 @@ int main(void) {
       } else if (kind == IN_DOWN) {
         g_mx = a; g_my = b; g_have_mouse = 1;
         int id = hit(g_mx, g_my);
-        g_focus = id;
         struct win *w = id ? byid(id) : 0;
-        if (w) {
+        if (w) stack_raise(id);              /* clicking a window brings it forward */
+        g_focus = id;
+        int at = w ? frame_hit(w, g_mx, g_my) : AT_OUTSIDE;
+        if (at == AT_CLOSE && w) {
+          long r = sys1(SYS_WIN_CLOSE, id);
+          printf("[comp] close box on win %d -> %ld\n", id, r);
+          clicks++;
+        } else if (at == AT_TITLE && w) {
+          g_drag = id; g_drag_x = g_mx - w->x; g_drag_y = g_my - w->y;
+          printf("[comp] drag win %d by its title bar at %ld,%ld\n", id, g_mx, g_my);
+        }
+        if (at == AT_CLIENT && w) {
           out[0] = EV_DOWN; out[1] = (int32_t)(g_mx - w->x); out[2] = (int32_t)(g_my - w->y); out[3] = 1;
           long dr = sys3(SYS_WIN_INPUT, id, (long)out, 0);
           if (dr == 0) fwd++;
@@ -215,6 +365,11 @@ int main(void) {
         if (id) printf("[comp] click %ld,%ld -> win %d, focus\n", g_mx, g_my, id);
         else    printf("[comp] click %ld,%ld -> no window, focus dropped\n", g_mx, g_my);
       } else if (kind == IN_UP) {
+        if (g_drag) {
+          struct win *dw = byid(g_drag);
+          if (dw) printf("[comp] drag of win %d ended at %ld,%ld\n", g_drag, dw->x, dw->y);
+          g_drag = 0;
+        }
         struct win *w = g_focus ? byid(g_focus) : 0;
         if (w && sys3(SYS_WIN_INPUT, g_focus, (long)(int32_t[4]){EV_UP,
                 (int32_t)(g_mx - w->x), (int32_t)(g_my - w->y), 0}, 0) == 0) fwd++;
@@ -237,45 +392,32 @@ int main(void) {
 
     int32_t list[3 * MAXWIN];
     int n = (int)sys3(SYS_SURF_LIST, (long)list, MAXWIN, 0);
+    stack_prune(list, n);
+    for (int i = 0; i < n; i++) stack_add(list[i * 3 + 0]);
+
     rect(0, 0, sw, sh, BG);
 
     int drawn = 0;
-    for (int i = 0; i < n; i++) {
-      int win = list[i * 3 + 0];
-      struct win *w = 0;
-      for (int k = 0; k < MAXWIN; k++)
-        if (cache[k].id == win) { w = &cache[k]; break; }
-
-      if (!w) {                              /* first sight of this window */
-        for (int k = 0; k < MAXWIN; k++)
-          if (!cache[k].id) { w = &cache[k]; break; }
-        if (!w) continue;
-        int32_t mi[3] = {0, 0, 0};
-        long a = sys3(SYS_SURF_MAP, win, (long)mi, 0);
-        if (a <= 0) continue;                /* closed between list and map */
-        w->id = win;
-        w->px = (uint32_t *)(uintptr_t)a;
-        w->w = mi[0]; w->h = mi[1]; w->stride = mi[2];
-        printf("[comp] win %d: %ldx%ld at 0x%lx, stride %ld\n", win, w->w, w->h, a, w->stride);
-        mapped_total++;
-      }
-
+    for (int i = 0; i < g_nstack; i++) {
+      struct win *w = win_map(g_stack[i]);
+      if (!w) continue;
       int32_t g[4] = {0, 0, 0, 0};
-      if (sys3(SYS_WIN_GEOM, win, (long)g, 0) != 0) { bad_geom++; continue; }
-      long x = g[0], y = g[1];
+      if (sys3(SYS_WIN_GEOM, w->id, (long)g, 0) != 0) { bad_geom++; continue; }
+      long x = g[0], y = g[1], ww = g[2], hh = g[3];
 
-      /* Furniture first: the server draws the frame, the client draws the
-       * contents. That split is what makes the title bar the server's to move. */
-      if (y > 24) rect(x - 3, y - 22, g[2] + 6, 22, win == g_focus ? FOCUS : TITLE);
-      rect(x - 3, y - 3, g[2] + 6, g[3] + 6, EDGE);
+      /* Furniture first, and it is the server's: the edge, the title bar, the
+       * title text out of the kernel's own glyph table, a close box. Then the
+       * client's pixels, which the server never drew. */
+      rect(x - 3, y - 3, ww + 6, hh + 6, EDGE);
+      rect(x - 3, y - BAR_H, ww + 6, BAR_H - 2, w->id == g_focus ? FOCUS : TITLE);
+      glyphs_draw(x + 4, y - BAR_H + 2, w->title, TEXT);
+      rect(x + ww - 19, y - 19, 16, 16, CLOSE);
+      glyphs_draw(x + ww - 15, y - 17, "x", CLOSEX);
       blit(w->px, w->stride, w->w, w->h, x, y);
       w->x = x; w->y = y;
-      g_live[drawn] = win;
       drawn++;
       if (y > worst) worst = (int)y;
     }
-
-    g_nlive = drawn;
     /* The pointer, drawn by the server: the kernel's cursor stood down with the
      * rest of its shell. A crosshair, because a screenshot has to be able to
      * find it without knowing what an arrow looks like. */
@@ -295,7 +437,7 @@ int main(void) {
 
   printf("[comp] %d frames, %d windows mapped, geometry errors %d, "
          "clicks %d forwarded, keys %d forwarded, %d with no focus\n",
-         frames, mapped_total, bad_geom, clicks, fwd, refused);
+         frames, g_mapped, bad_geom, clicks, fwd, refused);
   sys1(SYS_INPUT_TAKE, 0);
   sys1(SYS_SCENE_HANDOFF, 0);
   printf("[comp] gave the screen back; the kernel repaints\n");

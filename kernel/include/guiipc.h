@@ -172,5 +172,7 @@ int  winipc_focused(void);          /* window id with keyboard focus, or 0 */
 int  winipc_set_rect(int id, int32_t x, int32_t y, int32_t w, int32_t h);
 int  winipc_get_rect(int id, int32_t *x, int32_t *y, int32_t *w, int32_t *h);
 int  winipc_owner(int id);          /* task id that opened the window */
+int  winipc_title(int id, char *out, int max);
+int  gui_input_owns(int pid);             /* is this task the display server? */
 
 #endif
