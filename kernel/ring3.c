@@ -18,6 +18,7 @@
 #include "include/gdt.h"
 #include "include/idt.h"
 #include "include/types.h"
+#include "include/gui.h"     /* the display's geometry: what the scene is sized to */
 #include "include/guiipc.h"
 #include "include/pmm.h"
 #include "include/errno.h"
@@ -2793,6 +2794,7 @@ static void r3_exit_now(uint64_t code) {
   /* The windows a dying task opened go with it, before the log line, so that a
    * test can see both the exit and the reaping in one place. */
   winipc_close_owned((int)task_current());
+  scene_owner_exit((int)task_current());
 
   serial_puts("[ring3] task ");
   serial_puts(task_name(task_current()));
@@ -3688,6 +3690,104 @@ static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, 
 
 /* The number and arguments of the syscall in flight: without them a kernel fault
  * is a rip and a cr2 with no story. */
+/* ======================= the scene =======================
+ * A surface is one window's pixels; the scene is the screen those windows end
+ * up on. One process owns it at a time, and while it does the kernel paints no
+ * scene of its own (SCENE_HANDOFF) - otherwise two writers trade the screen
+ * back and forth and every frame tears. The frames and the write to the display
+ * live in framebuffer.c; what lives here is who owns it and where it appears.
+ */
+
+static int scene_owner_pid = 0;
+
+uint64_t scene_attach(void) {
+  int me = (int)task_current();
+  if (scene_owner_pid && scene_owner_pid != me) return -EBUSY;
+  task_t *t = task_at(me);
+  if (!t || !t->cr3 || !t->mm) return -EINVAL;
+  if (fb_scene_reserve() != 0) return -ENOMEM;
+  uint64_t pages = fb_scene_pages();
+  if (!pages || RING3_SCENE_BASE + pages * 4096 > RING3_SCENE_TOP) return -ENOMEM;
+  for (uint64_t i = 0; i < pages; i++) {
+    uint64_t phys = fb_scene_phys(i);
+    if (!phys) return -ENOMEM;
+    if (ring3_map_existing(t->cr3, RING3_SCENE_BASE + i * 4096, phys,
+                           PTE_P | PTE_W | PTE_U | PTE_SHARED) != 0) {
+      for (uint64_t j = 0; j < i; j++)
+        shm_unmap_page(t->cr3, RING3_SCENE_BASE + j * 4096);
+      return -ENOMEM;
+    }
+  }
+  scene_owner_pid = me;
+  serial_puts("[scene] pid=");
+  serial_puthex((uint64_t)me);
+  serial_puts(" owns the scene: ");
+  serial_puthex(pages);
+  serial_puts(" pages at ");
+  serial_puthex(RING3_SCENE_BASE);
+  serial_puts("\n");
+  return RING3_SCENE_BASE;
+}
+
+int scene_geometry(uint32_t *w, uint32_t *h, uint32_t *stride) {
+  if (!scene_owner_pid) return -EINVAL;
+  if (w) *w = screen_width;
+  if (h) *h = screen_height;
+  if (stride) *stride = screen_width * 4;
+  return 0;
+}
+
+int scene_flush(int x, int y, int w, int h) {
+  if (scene_owner_pid != (int)task_current()) return -EPERM;
+  fb_scene_flush_rect(x, y, w, h);
+  return 0;
+}
+
+/* Claim a rectangle the kernel's own blits will leave alone. It is the same
+ * screen, drawn by two owners at once, split by geometry instead of by time -
+ * which is how a shell keeps a desktop alive around an engine's window. */
+int scene_own(int x, int y, int w, int h) {
+  if (scene_owner_pid != (int)task_current()) return -EPERM;
+  if (x < 0 || y < 0) return -EINVAL;
+  if (w < 0 || h < 0) return -EINVAL;
+  if (w && h) {
+    if (x >= (int)screen_width || y >= (int)screen_height) return -EINVAL;
+    if (w > (int)screen_width - x)  w = (int)screen_width - x;
+    if (h > (int)screen_height - y) h = (int)screen_height - y;
+  }
+  fb_scene_own_rect(x, y, w, h);
+  serial_puts("[scene] own ");
+  if (!w || !h) serial_puts("cleared\n");
+  else {
+    serial_puthex((uint64_t)x); serial_puts(","); serial_puthex((uint64_t)y);
+    serial_puts(" "); serial_puthex((uint64_t)w); serial_puts("x");
+    serial_puthex((uint64_t)h); serial_puts("\n");
+  }
+  return 0;
+}
+
+int scene_handoff(int on) {
+  if (scene_owner_pid != (int)task_current()) return -EPERM;
+  int was = gui_scene_handoff;
+  gui_scene_handoff = on ? 1 : 0;
+  if (!on) gui_force_redraw();      /* the kernel's scene comes back */
+  serial_puts("[scene] handoff ");
+  serial_puts(on ? "on: the kernel paints nothing\n" : "off: the kernel repaints\n");
+  return was;
+}
+
+/* A task that dies still owns the screen until this runs: the frames go back to
+ * the allocator, the flag goes down, and the kernel repaints, or the machine
+ * would sit on a frozen frame of a program that no longer exists. */
+void scene_owner_exit(int pid) {
+  if (scene_owner_pid != pid) return;
+  scene_owner_pid = 0;
+  fb_scene_own_rect(0, 0, 0, 0);
+  fb_scene_release();
+  gui_force_redraw();
+  serial_puts("[scene] owner exited: the screen is the kernel's again\n");
+}
+
 uint64_t r3_cur_syscall, r3_cur_arg0;
 
 long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
@@ -3741,6 +3841,26 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
       int x = (int)((a1 >> 16) & 0xFFFF), y = (int)(a1 & 0xFFFF);
       int w = (int)((a2 >> 16) & 0xFFFF), h = (int)(a2 & 0xFFFF);
       return surf_present((int)a0, x, y, w, h);
+    }
+    case SYS_SCENE_MAP:
+      return (long)scene_attach();
+    case SYS_SCENE_INFO: {
+      uint32_t geom[3];
+      if (scene_geometry(&geom[0], &geom[1], &geom[2]) != 0) return -EINVAL;
+      if (user_put(a0, geom, sizeof geom) != 0) return -EFAULT;
+      return 0;
+    }
+    case SYS_SCENE_FLUSH: {
+      int x = (int)((a0 >> 16) & 0xFFFF), y = (int)(a0 & 0xFFFF);
+      int w = (int)((a1 >> 16) & 0xFFFF), h = (int)(a1 & 0xFFFF);
+      return scene_flush(x, y, w, h);
+    }
+    case SYS_SCENE_HANDOFF:
+      return scene_handoff((int)a0);
+    case SYS_SCENE_OWN: {
+      int x = (int)((a0 >> 16) & 0xFFFF), y = (int)(a0 & 0xFFFF);
+      int w = (int)((a1 >> 16) & 0xFFFF), h = (int)(a1 & 0xFFFF);
+      return scene_own(x, y, w, h);
     }
     case SYS_WIN_OPEN: {
       char title[32];

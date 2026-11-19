@@ -14,7 +14,7 @@ the browser, audio, a disk — happened here.
 
 By the numbers, measured from the tree: **36,272 lines** of first-party kernel C (plus 20,829 lines
 of headers), **8,391 lines** of user-mode C, **104,115 lines** of vendored BearSSL and Gumbo, and
-**41 native syscalls** in front of the Linux ABI. A stock boot prints **334 `ok` lines** in the
+**46 native syscalls** in front of the Linux ABI. A stock boot prints **334 `ok` lines** in the
 serial log.
 
 ---
@@ -78,7 +78,6 @@ and hostname verification, so the kernel never sees a key.
   resolver above had to be written and measured rather than borrowed.
 - **No socket pool per process worth the name** beyond the descriptor limit (4,096), and no
   `SO_REUSEPORT`, no per-process network namespace.
-- **One core.** No SMP. Every byte, from the NIC interrupt to the pixel, is handled by one CPU.
 - **Sixteen Unix-domain names**, no permissions, no `unlink` (a name dies with its listener), no
   abstract namespace.
 - **No persistent storage for anything network-shaped**: no cookie jar, no cache, no HSTS.
@@ -98,14 +97,20 @@ with specific properties. Here is the honest ledger, in the order the work has t
 - Shared memory (64 regions, 16 MB each, refcounted) and descriptor passing over Unix sockets —
   i.e. renderer-to-browser IPC's two prerequisites.
 - A real TLS stack above a real TCP stack, with keep-alive.
+- More than one core: four cores online, three application processors started and scheduled per
+  CPU, so threads are no longer pinned to one processor.
 
 **Missing, in the order it blocks progress.**
-1. **A userspace compositor** with client-owned buffers and damage-limited redraw. Today the kernel
-   composites the whole scene from the wallpaper each frame, and the client cannot draw its own
-   frame furniture. Chromium's own compositor (viz) would have to *become* the kernel's — the only
-   sane direction is the reverse: the kernel keeps scanout, a userspace process stacks windows.
-2. **More than one core.** Site isolation and the renderer/browser split are threads, and
-   compositing, decoding and JS all want one each. A single-core port runs, and runs badly.
+1. **A userspace compositor** with client-owned buffers and damage-limited redraw. Under way, and
+   the inversion is proven. The scene is a ring-3 buffer now: a process maps it (`SYS_SCENE_MAP`),
+   writes pixels into it with no syscall per glyph, flushes a rectangle (`SYS_SCENE_FLUSH`), claims
+   that rectangle away from the kernel's own blits so both stay live on one screen
+   (`SYS_SCENE_OWN`), or takes the screen outright (`SYS_SCENE_HANDOFF`) and gives it back on exit.
+   `userland/scene.c` exercises all four and the pixels were verified from outside the machine, not
+   from inside the program. What is left is the stacking: a list of rectangles instead of one
+   claim, and a display-server process holding the scene so the kernel keeps only the framebuffer,
+   the page tables and the scanout.
+2. **More than one core.** Done — four cores, three APs, per-CPU scheduling.
 3. **A sandbox.** No seccomp, no namespaces, no capability model. Chromium's security posture
    assumes the platform takes something away from a renderer; here nothing is taken away, so a
    renderer that is compromised *is* the machine.
@@ -205,6 +210,13 @@ the slot pool's `-ENOSPC`) · `surfexit` (a window and its surface are reaped wh
 `maptest` 24/24 · `epolltest` 24/24 · `memfdtest` 23/23 · `modtest` 15/15 · `dyntest` 14/14 ·
 `lives` 8/8 · `exectest` 7/7.
 
+`scene` is the odd one out: it is not a self-check, because a program cannot see its own pixels. It
+maps the scene, proves the mapping is writable and re-entrant, then prints the colours and
+coordinates it paints - `0x00204080` inside a 320x200 rectangle at 60,60 with the kernel's desktop
+alive everywhere else, then `0x0011EE33` over the whole screen after `SYS_SCENE_HANDOFF`. Those
+pixels were read back out of the framebuffer from outside the machine, which is the only way to know
+that the display is showing the process's frame and not the kernel's.
+
 The screen is checked from outside the OS, because a program cannot see its own pixels: a QEMU
 `screendump` of the running system is parsed and exact coordinates compared. Its colour bars are four
 pixels wide on purpose — a blit shifted by one pixel does not survive that check.
@@ -223,7 +235,8 @@ kernel/
 ├── lib/         BearSSL, Gumbo, string
 └── user/        the first process
 userland/        ring-3 programs (musl-gcc): ominet (browser; omilayout.c is the engine),
-                 imgdec, omirender, surftest, tlsget, socktest and the test suite
+                 imgdec, omirender, surftest, tlsget, socktest, scene (the screen as a
+                 ring-3 buffer: map, flush, own a rectangle, take the whole screen) and the tests
 docs/            ABI and design notes, and the landing page
 limine.conf      bootloader config
 Makefile         build

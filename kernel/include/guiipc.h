@@ -92,6 +92,47 @@ uint32_t *surf_row(int win_id, int y);
  * pages introduce. Prefer this to surf_row + memcpy: a row is wider than the
  * space left in a frame often enough that the plain copy reads the wrong memory. */
 int surf_copy_row(int win_id, int y, uint32_t *dst, int cols);
+/* ==================================================================== */
+/* The scene: the whole screen's pixels, owned by one process.            */
+/*                                                                      */
+/* A surface is one window's pixels. The scene is the frame those windows */
+/* are composited into, and the kernel has always owned it - it draws into */
+/* static_backbuffer and blits the result to the display. A Chromium-class */
+/* engine brings its own compositor and cannot be handed a surface and told */
+/* to stay inside one window, so the arrangement has to invert: a process */
+/* owns the scene, and the kernel keeps only the blit to the display and    */
+/* the input a display's owner needs.                                      */
+/*                                                                        */
+/* The buffer is a page list, like a surface, so a row is read a page at a  */
+/* time. SCENE_HANDOFF is what makes the transfer real rather than two      */
+/* writers fighting over the screen: while it is on, the kernel draws no    */
+/* scene of its own and paints nothing.                                     */
+/* ==================================================================== */
+
+/* framebuffer.c holds the frames and the blit. */
+int      fb_scene_reserve(void);          /* frames for the attached screen */
+uint64_t fb_scene_pages(void);
+uint64_t fb_scene_phys(uint64_t page);
+void     fb_scene_release(void);
+void     fb_scene_flush_rect(int x, int y, int w, int h);
+/* A rectangle of the scene the kernel keeps its hands off: its own blits skip
+ * it on the way out, then the owner's pixels go over it last, so the display
+ * shows one scene with the owner's window in it rather than two writers
+ * overwriting each other. w and h of 0 clear the claim. */
+void     fb_scene_own_rect(int x, int y, int w, int h);
+void     fb_scene_overlay(void);
+extern int gui_scene_handoff;             /* 1 while a process owns the screen */
+
+/* ring3.c holds the owner and the mapping. */
+uint64_t scene_attach(void);              /* -> address | -errno (one owner) */
+int      scene_geometry(uint32_t *w, uint32_t *h, uint32_t *stride);
+int      scene_flush(int x, int y, int w, int h);
+int      scene_handoff(int on);           /* -> previous state */
+int      scene_own(int x, int y, int w, int h);
+void     scene_owner_exit(int pid);       /* a dying task gives the screen back */
+/* compositor.c: repaint the kernel's own scene on the next frame. */
+void     gui_force_redraw(void);
+
 /* The rectangle presented since the last frame (client coordinates), cleared
  * by the read. 0 when nothing new was presented. */
 int       surf_take_damage(int win_id, int *x, int *y, int *w, int *h);

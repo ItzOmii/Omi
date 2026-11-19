@@ -34,6 +34,7 @@ PROGS += memfdtest.elf
 PROGS += socktest.elf
 PROGS += tlsget.elf
 PROGS += surftest.elf
+PROGS += scene.elf
 PROGS += vmtest.elf
 PROGS += shmtest.elf
 PROGS += surfbig.elf
@@ -195,6 +196,13 @@ vmtest.elf: vmtest.c
 # then by damage rectangle. Plain musl, no BearSSL, so it builds in one step.
 surftest.elf: surftest.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping surftest"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
+
+# The scene: the frame the display shows, owned by a ring-3 process rather
+# than by the kernel. See the header of scene.c.
+scene.elf: scene.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping scene"; exit 0; }
 	musl-gcc -static -O2 -no-pie -o $@ $<
 	@echo "built $@"
 

@@ -52,6 +52,7 @@
  *   16 MB .. 3.5 GB    mmap / SYS_VM_ALLOC, handed out from MMAP_BASE up
  *   3.5 GB .. 3.75 GB  shared-segment attaches, one 256 MB arena per process
  *   3.75 GB .. 3.875 GB pixel surfaces, RING3_SURF_SLOTS of RING3_SURF_AREA
+ *   3.875 GB .. 3.9375 GB the scene, mapped only in the process that owns it
  *   top 4 MB           the stack
  */
 #define RING3_MMAP_BASE   0x0000008000100000ULL  /* low, where musl expects it */
@@ -73,6 +74,14 @@
  */
 #define RING3_SURF_BASE   (RING3_USER_BASE + 0xF0000000ULL)   /* 3.75 GB */
 #define RING3_SURF_AREA   0x01000000ULL           /* 16 MB per slot */
+/* The scene: the frame the screen actually shows. A surface belongs to one
+ * window; the scene belongs to the display, and exactly one process holds it.
+ * 64 MB of address space covers 4K at four bytes a pixel (33 MB) with room to
+ * spare, and it is address space, not memory: frames are allocated for the
+ * screen that is actually attached. */
+#define RING3_SCENE_BASE  (RING3_USER_BASE + 0xF8000000ULL)   /* 3.875 GB */
+#define RING3_SCENE_AREA  (64ULL << 20)
+#define RING3_SCENE_TOP   (RING3_SCENE_BASE + RING3_SCENE_AREA)
 #define RING3_SURF_SLOTS  8                       /* 8 x 16 MB = 128 MB of address
                                                    * space, ending at 3.875 GB with
                                                    * the top 4 MB left for the stack.
@@ -133,6 +142,12 @@
  * memory on something discretionary - a page's images, say - should be able to ask
  * how much the machine has instead of carrying a guess around in a constant. */
 #define SYS_MEMINFO     41
+#define SYS_SCENE_MAP    42  /* (void) -> the scene's address | -errno      */
+#define SYS_SCENE_INFO   43  /* (uint32_t out[3]) -> 0: w, h, row stride    */
+#define SYS_SCENE_FLUSH  44  /* (x, y, w, h) -> 0: rect to the display      */
+#define SYS_SCENE_HANDOFF 45 /* (on) -> the previous state                  */
+#define SYS_SCENE_OWN    46  /* (x,y), (w,h) -> 0: a rect the kernel keeps out of
+                              * Its own blits. 0,0 clears the claim.         */
 
 /* the switch, the gates and the fault handler */
 void     ring3_init(void);

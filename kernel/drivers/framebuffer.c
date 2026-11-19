@@ -7,6 +7,8 @@
 #include "../include/gui.h"
 #include "../include/string.h"
 #include "../include/wc.h"
+#include "../include/pmm.h"
+#include "../include/guiipc.h" /* the scene: the display side of that interface */   /* the scene is a page list: frames, not one run */
 
 /* Maximum supported resolution (4K) - uses ~33MB memory */
 #define MAX_FB_WIDTH 3840
@@ -222,6 +224,117 @@ void fb_fill_gradient_v(int x, int y, int width, int height, color_t color1,
     uint32_t *row = backbuffer + py * screen_width;
     for (int px = x1; px < x2; px++) {
       row[px] = row_color;
+    }
+  }
+}
+
+/* ========== The scene: the screen's pixels, owned by a process ==========
+ *
+ * Everything above this line composites into a kernel buffer and hands the
+ * result to the display. That is the wrong shape for an engine that brings its
+ * own compositor, and no amount of porting fixes it: the engine has to own the
+ * frame. What the kernel keeps is the one thing a process cannot do for itself
+ * - the write to the display, and the knowledge of what the display is.
+ *
+ * The buffer is a page list rather than one run of memory, because frames come
+ * from the page allocator one at a time; a row is therefore addressed through
+ * scene_row(), exactly as a surface is. Nothing here draws: it decides who does.
+ */
+
+#define SCENE_MAX_PAGES 8448          /* 33 MB: 3840x2160 at four bytes */
+
+static uint64_t scene_phys[SCENE_MAX_PAGES];
+static uint64_t scene_pages = 0;
+int gui_scene_handoff = 0;            /* 1 while a process owns the screen */
+
+/* Address of byte `off` inside the scene, or NULL past its end. The HHDM is a
+ * direct map of physical memory, so a frame's address is its physical address
+ * plus the offset - one addition, no second allocation. */
+static uint8_t *scene_ptr(uint64_t off) {
+  uint64_t page = off >> 12;
+  if (page >= scene_pages || !scene_phys[page]) return NULL;
+  return (uint8_t *)(uintptr_t)(hhdm_offset + scene_phys[page]) + (off & 0xFFF);
+}
+
+uint64_t fb_scene_pages(void) { return scene_pages; }
+
+uint64_t fb_scene_phys(uint64_t page) {
+  return page < scene_pages ? scene_phys[page] : 0;
+}
+
+/* Frames for the screen that is attached. Called on the first attach, so a
+ * machine that never hands the screen over pays nothing for the ability. */
+int fb_scene_reserve(void) {
+  if (scene_pages) return 0;
+  if (!screen_width || !screen_height) return -1;
+  uint64_t bytes = (uint64_t)screen_width * (uint64_t)screen_height * 4;
+  uint64_t pages = (bytes + 4095) / 4096;
+  if (pages > SCENE_MAX_PAGES) return -1;
+  for (uint64_t i = 0; i < pages; i++) {
+    uint64_t phys = pmm_alloc_page();
+    if (!phys) { fb_scene_release(); return -1; }
+    scene_phys[i] = phys;             /* pages come zeroed */
+  }
+  scene_pages = pages;
+  return 0;
+}
+
+void fb_scene_release(void) {
+  for (uint64_t i = 0; i < scene_pages; i++)
+    if (scene_phys[i]) pmm_free_page(scene_phys[i]);
+  scene_pages = 0;
+  gui_scene_handoff = 0;
+}
+
+/* The rectangle a client owns while the kernel carries on drawing everywhere
+ * else. One is enough for the arrangement it exists to prove - one engine, one
+ * window - and a list is the obvious extension when a second appears. */
+static int own_x = 0, own_y = 0, own_w = 0, own_h = 0;
+
+void fb_scene_own_rect(int x, int y, int w, int h) {
+  own_x = x; own_y = y; own_w = w; own_h = h;
+}
+
+/* Put the owner's pixels back over the kernel's own blits. Called after the
+ * compositor has finished a frame, whichever path it took. */
+void fb_scene_overlay(void) {
+  if (own_w > 0 && own_h > 0) fb_scene_flush_rect(own_x, own_y, own_w, own_h);
+}
+
+/* Copy a rectangle out of the scene and onto the display. A row is wider than
+ * the space left in a page often enough that the copy walks page by page: one
+ * 8-byte store at a time would read the next frame at the wrong offset. */
+void fb_scene_flush_rect(int x, int y, int w, int h) {
+  if (!framebuffer || !scene_pages) return;
+  if (w <= 0 || h <= 0) { x = 0; y = 0; w = (int)screen_width; h = (int)screen_height; }
+  if (x < 0 || y < 0) return;
+  if (x >= (int)screen_width || y >= (int)screen_height) return;
+  if (x + w > (int)screen_width)  w = (int)screen_width - x;
+  if (y + h > (int)screen_height) h = (int)screen_height - y;
+  const uint64_t stride = (uint64_t)screen_width * 4;
+  for (int row = y; row < y + h; row++) {
+    uint64_t off = (uint64_t)row * stride + (uint64_t)x * 4;
+    volatile uint8_t *dst = (volatile uint8_t *)framebuffer + (uint64_t)row * screen_pitch + (uint64_t)x * 4;
+    int left = w;
+    while (left > 0) {
+      uint64_t page_left = 4096 - (off & 0xFFF);
+      int chunk = (int)(page_left / 4);
+      if (chunk > left) chunk = left;
+      const uint8_t *src = scene_ptr(off);
+      if (!src) return;
+      /* What is left of this row inside the frame, 8 bytes at a time. */
+      int i = 0;
+      for (; i + 2 <= chunk; i += 2) {
+        uint64_t v; __builtin_memcpy(&v, src + i * 4, 8);
+        __builtin_memcpy((void *)(dst + i * 4), &v, 8);
+      }
+      for (; i < chunk; i++) {
+        uint32_t v; __builtin_memcpy(&v, src + i * 4, 4);
+        __builtin_memcpy((void *)(dst + i * 4), &v, 4);
+      }
+      off += (uint64_t)chunk * 4;
+      dst += (uint64_t)chunk * 4;
+      left -= chunk;
     }
   }
 }

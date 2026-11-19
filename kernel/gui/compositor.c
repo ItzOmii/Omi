@@ -6768,8 +6768,18 @@ static void gui_draw_all(void) {
   full_redraw = 1;                  /* dirty rects are in ss coords; blit whole frames */
 }
 
+void gui_force_redraw(void) {
+  needs_redraw = 1;
+}
+
 void gui_compose(void) {
   gui_poll_input();
+
+  /* A process owns the screen: the kernel's scene is not the one being shown,
+   * and drawing it would only spend the frame. Input and window bookkeeping
+   * carry on - it is the pixels that have changed hands, and the owner still
+   * wants its keystrokes. */
+  if (gui_scene_handoff) return;
 
   if (ps2_take_ctrl_alt_del())    /* the shell owns this chord */
     open_task_manager();
@@ -6797,6 +6807,7 @@ void gui_compose(void) {
    * otherwise swallow every needs_redraw forever, and built-in apps (the task
    * manager's graphs, for one) would freeze at whatever they first drew. */
   if (!needs_redraw && dmg_try_patch_frame()) {
+    fb_scene_overlay();     /* the owner's rectangle survives every path */
     frame_count++;
     return;
   }
@@ -6807,6 +6818,11 @@ void gui_compose(void) {
     needs_redraw = 0;
     frame_count++;
   }
+
+  /* Last word on the frame: a rect a client owns goes over whatever the kernel
+   * just blitted there. The kernel keeps the rest of the screen alive, which is
+   * the whole point - the owner gets its window, not the machine. */
+  fb_scene_overlay();
 }
 
 
