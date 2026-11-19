@@ -292,6 +292,11 @@ and compiles its own symbol table into the image. To see what that looks like,
 `make PANIC_DEMO=1` faults on purpose three frames deep at the end of the boot
 (`PANIC_DEMO=2` calls `panic()` instead).
 
+To step through the kernel instead, `omi-dev gdb` boots it with QEMU's gdbserver
+on :1234: the kernel is an ordinary ELF built with `-g`, so `target remote :1234`
+and then `bt` gives the same chain the serial log prints, and `info threads` shows
+one entry per vCPU.
+
 By hand, serial log to a file — how it is tested here, with no display:
 
 ```bash
