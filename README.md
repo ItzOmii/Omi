@@ -14,7 +14,7 @@ the browser, audio, a disk — happened here.
 
 By the numbers, measured from the tree: **36,272 lines** of first-party kernel C (plus 20,829 lines
 of headers), **8,391 lines** of user-mode C, **104,115 lines** of vendored BearSSL and Gumbo, and
-**46 native syscalls** in front of the Linux ABI. A stock boot prints **334 `ok` lines** in the
+**48 native syscalls** in front of the Linux ABI. A stock boot prints **334 `ok` lines** in the
 serial log.
 
 ---
@@ -106,10 +106,19 @@ with specific properties. Here is the honest ledger, in the order the work has t
    writes pixels into it with no syscall per glyph, flushes a rectangle (`SYS_SCENE_FLUSH`), claims
    that rectangle away from the kernel's own blits so both stay live on one screen
    (`SYS_SCENE_OWN`), or takes the screen outright (`SYS_SCENE_HANDOFF`) and gives it back on exit.
-   `userland/scene.c` exercises all four and the pixels were verified from outside the machine, not
-   from inside the program. What is left is the stacking: a list of rectangles instead of one
-   claim, and a display-server process holding the scene so the kernel keeps only the framebuffer,
-   the page tables and the scanout.
+   `SYS_SURF_MAP` hands a process a read-only alias of *any* window's pixels, not just its own, and
+   `SYS_SURF_LIST` says which windows exist - the two things a display server needs before it can
+   draw somebody else's window. `userland/scene.c` exercises every one of them and the pixels were
+   verified from outside the machine, not from inside the program: it paints a checkerboard into a
+   window's surface, asks the kernel for that window's pixels, checks the alias agrees with the
+   surface it wrote (1856 samples, none wrong), and puts the *alias* on the screen while it owns the
+   display. Then it does it again with a window that belongs to a *different* process: it reads
+   0x00FFFF00 and 0x00FF0000 out of that window's pixels, composites them, and the display shows
+   those two colours where it put them. Draw and present are now separate jobs, which is the whole
+   point of the split. What is left
+   is the stacking and the plumbing: several rectangles instead of one claim, alias slots reclaimed
+   when a window closes instead of at exit, input and window furniture moved to the server, and the
+   kernel keeping nothing but the framebuffer, the page tables and the scanout.
 2. **More than one core.** Done — four cores, three APs, per-CPU scheduling.
 3. **A sandbox.** No seccomp, no namespaces, no capability model. Chromium's security posture
    assumes the platform takes something away from a renderer; here nothing is taken away, so a
@@ -216,6 +225,10 @@ coordinates it paints - `0x00204080` inside a 320x200 rectangle at 60,60 with th
 alive everywhere else, then `0x0011EE33` over the whole screen after `SYS_SCENE_HANDOFF`. Those
 pixels were read back out of the framebuffer from outside the machine, which is the only way to know
 that the display is showing the process's frame and not the kernel's.
+
+The last phase is the one that matters for a browser: a window's pixels are drawn, then fetched back
+through the kernel's read-only map, then composited - so the process that puts them on the screen
+never had to be the process that drew them.
 
 The screen is checked from outside the OS, because a program cannot see its own pixels: a QEMU
 `screendump` of the running system is parsed and exact coordinates compared. Its colour bars are four

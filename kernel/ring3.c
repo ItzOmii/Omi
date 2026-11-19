@@ -722,6 +722,7 @@ static void shm_drop_all(mm_t *mm) {
  * because the next resize usually grows it again. */
 static struct {
   int       used, win, w, h, pages, cap;
+  int       own_pid;            /* the process the writable mapping belongs to */
   void    **kva;
   uint64_t  presented;          /* present() calls, for the log */
   int       has_damage;         /* dam is the union of what was presented */
@@ -793,6 +794,7 @@ uint64_t surf_create(int win_id, int w, int h) {
   }
 
   surf[slot].used = 1;
+  surf[slot].own_pid = (int)task_current();
   surf[slot].win = win_id;
   surf[slot].w = w;
   surf[slot].h = h;
@@ -966,6 +968,63 @@ int surf_peek_damage(int win_id, int *x, int *y, int *w, int *h) {
   if (w) *w = surf[slot].dam_w;
   if (h) *h = surf[slot].dam_h;
   return 1;
+}
+
+/* Read-only access to a window's pixels, for a process that is not the one
+ * that draws them. The frames are the surface's, so the alias costs a page
+ * table entry each and nothing else; it is left alone until the process dies,
+ * because a display server holds its windows for as long as they exist.
+ *
+ * The address is the target's own slot index, unless this process owns that
+ * index (its own surface lives there, writable), in which case the next free
+ * one is used. That is why mapping your own surface is allowed and still
+ * useful: the alias is a second view of the same pages, and comparing the two
+ * is how the map path gets tested. */
+uint64_t surf_map_read(int win_id, int *out_w, int *out_h) {
+  int slot = surf_slot_for_win(win_id);
+  if (slot < 0) return (uint64_t)-EINVAL;
+  task_t *t = task_at(task_current());
+  if (!t || !t->cr3 || !t->mm) return (uint64_t)-EINVAL;
+  int me = (int)task_current();
+
+  int pick = -1;
+  for (int k = 0; k < RING3_SURF_SLOTS && pick < 0; k++) {
+    int j = (slot + k) % RING3_SURF_SLOTS;
+    if (surf[j].used && surf[j].own_pid == me) continue;   /* mine, and writable */
+    if (t->mm->surf_alias_bits & (1ULL << j)) continue;    /* already an alias */
+    pick = j;
+  }
+  if (pick < 0) return (uint64_t)-ENOSPC;
+
+  uint64_t base = RING3_SURF_BASE + (uint64_t)pick * RING3_SURF_AREA;
+  for (int i = 0; i < surf[slot].pages; i++) {
+    if (ring3_map_existing(t->cr3, base + (uint64_t)i * 4096,
+                           to_phys(surf[slot].kva[i]),
+                           PTE_P | PTE_U | PTE_SHARED) != 0)
+      return (uint64_t)-ENOMEM;      /* no PTE_W: reads only, on purpose */
+  }
+  t->mm->surf_alias_bits |= 1ULL << pick;
+  if (out_w) *out_w = surf[slot].w;
+  if (out_h) *out_h = surf[slot].h;
+  serial_puts("[surf] alias win=");
+  serial_puthex((uint64_t)win_id);
+  serial_puts(" at 0x"); serial_puthex(base);
+  serial_puts(" slot "); serial_puthex((uint64_t)pick);
+  serial_puts(" owner "); serial_puthex((uint64_t)surf[slot].own_pid);
+  serial_puts(me == surf[slot].own_pid ? " (self)\n" : " (other)\n");
+  return base;
+}
+
+int surf_list(int32_t *out, int max) {
+  int n = 0;
+  for (int i = 0; i < RING3_SURF_SLOTS && n < max; i++) {
+    if (!surf[i].used) continue;
+    out[n * 3 + 0] = surf[i].win;
+    out[n * 3 + 1] = surf[i].w;
+    out[n * 3 + 2] = surf[i].h;
+    n++;
+  }
+  return n;
 }
 
 void surf_release_window(int win_id) {
@@ -3833,6 +3892,22 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
     case SYS_SURF_CREATE: {
       uint64_t r = surf_create((int)a0, (int)a1, (int)a2);
       return (long)r;
+    }
+    case SYS_SURF_MAP: {
+      int w = 0, h = 0;
+      uint64_t base = surf_map_read((int)a0, &w, &h);
+      if ((int64_t)base < 0) return (int64_t)base;
+      int32_t info[3] = { w, h, w * 4 };
+      if (user_put(a1, info, sizeof info) != 0) return -EFAULT;
+      return (long)base;
+    }
+    case SYS_SURF_LIST: {
+      int32_t buf[RING3_SURF_SLOTS * 3];
+      int max = (int)a1;
+      if (max < 0 || max > RING3_SURF_SLOTS) max = RING3_SURF_SLOTS;
+      int n = surf_list(buf, max);
+      if (n > 0 && user_put(a0, buf, (uint64_t)n * 3 * sizeof(int32_t)) != 0) return -EFAULT;
+      return n;
     }
     case SYS_SURF_RESIZE: {
       return surf_resize((int)a0, (int)a1, (int)a2);

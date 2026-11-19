@@ -135,6 +135,18 @@ void     gui_force_redraw(void);
 
 /* The rectangle presented since the last frame (client coordinates), cleared
  * by the read. 0 when nothing new was presented. */
+/* A window's pixels, mapped read-only into the calling process - anybody's
+ * window, not just its own. This is the other half of client-owned buffers: the
+ * process that draws no longer has to be the process that puts pixels on the
+ * screen. Returns the address, or a negative error; out_w/out_h are the
+ * surface's size. The alias stays until the process exits. */
+uint64_t  surf_map_read(int win_id, int *out_w, int *out_h);
+
+/* Every surface in the table, as triples of (window, width, height). Returns
+ * how many were written, which is capped at `max`; the display server needs to
+ * know what exists before it can composite any of it. */
+int       surf_list(int32_t *out, int max);
+
 int       surf_take_damage(int win_id, int *x, int *y, int *w, int *h);
 /* The same rectangle without clearing it, so the compositor can decide whether
  * a frame is a patch before committing to copying it. */

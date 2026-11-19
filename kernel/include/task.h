@@ -90,6 +90,10 @@ typedef struct {
   uint64_t  shm_next;
   uint64_t  shm_bits;
   uint64_t  shm_addr[64];
+  /* Surface slots this process holds as a read-only alias of another window's
+   * pixels. Its own surfaces are writable and live at their own index, which is
+   * why an alias needs a different one. */
+  uint64_t  surf_alias_bits;
   /* brk: one lazily-populated area reserved on the first call, then a pointer
    * that moves inside it. Pages appear on touch, so the reservation is free. */
   uint64_t  brk_base, brk_cur, brk_end;

@@ -27,11 +27,16 @@
 #include <time.h>
 
 #define SYS_YIELD         3
+#define SYS_WIN_OPEN      6
+#define SYS_SURF_CREATE   35
+#define SYS_SURF_PRESENT  36
 #define SYS_SCENE_MAP     42
 #define SYS_SCENE_INFO    43
 #define SYS_SCENE_FLUSH   44
 #define SYS_SCENE_HANDOFF 45
 #define SYS_SCENE_OWN     46
+#define SYS_SURF_MAP      47
+#define SYS_SURF_LIST     48
 
 /* The panel: a corner of the screen this process owns while the kernel keeps
  * the rest. Both colours are chosen so a single pixel proves ownership: the
@@ -77,6 +82,14 @@ static void ms(int m) {
   nanosleep(&ts, 0);
 }
 
+/* The surface's own size, for the checkerboard, and where its pixels are put on
+ * the screen - away from the window itself, so what shows up there can only have
+ * come from the blit. */
+#define SURF_W 320
+#define SURF_H 200
+#define PASTE_X 120
+#define PASTE_Y 380
+
 static uint32_t *scene;
 static uint32_t sw, sh, stride;   /* pixels, rows, bytes per row */
 
@@ -93,6 +106,25 @@ static void rect(uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint32_t c) {
 /* The kernel's own ABI carries three arguments, so a rectangle rides in two of
  * them as 16-bit halves - the same packing SYS_SURF_PRESENT uses, and screen
  * coordinates fit in 16 bits. */
+/* Copy rows out of a surface and into the scene. The source is whatever address
+ * the map returned, so this is the same code whether those pixels were drawn by
+ * this process or by a browser in another one. Rows, because the frames are not
+ * contiguous and the surface's stride is its own. */
+static void blit(uint32_t *src, long src_stride, long src_w, long src_h,
+                 long dx, long dy) {
+  for (long y = 0; y < src_h; y++) {
+    long ty = dy + y;
+    if (ty < 0 || ty >= (long)sh) continue;
+    uint32_t *srow = (uint32_t *)((uint8_t *)src + (size_t)y * (size_t)src_stride);
+    uint32_t *drow = (uint32_t *)((uint8_t *)scene + (size_t)ty * (size_t)stride);
+    for (long x = 0; x < src_w; x++) {
+      long tx = dx + x;
+      if (tx < 0 || tx >= (long)sw) continue;
+      drow[tx] = srow[x];
+    }
+  }
+}
+
 static void flush_scene(long x, long y, long w, long h) {
   long xy = ((x & 0xFFFF) << 16) | (y & 0xFFFF);
   long wh = ((w & 0xFFFF) << 16) | (h & 0xFFFF);
@@ -165,6 +197,80 @@ int main(void) {
     flush_scene(0, 0, 0, 0);                       /* 0,0,0,0 is the whole screen */
     ms(50);
   }
+  /* ---- phase three: pixels that arrive through the kernel's map ----
+   * The screen is still ours. Open a window, give it a surface, paint a
+   * checkerboard into it, then ask for those same pixels through SYS_SURF_MAP -
+   * a read-only alias, which is exactly what a display server gets for a window
+   * it does not own - and put the alias's contents on the screen. Draw and put
+   * on screen have just come apart: nothing here looks at the surface it drew
+   * into, only at the mapping it was given. ---- */
+  int32_t list[24];
+  int nsurf = (int)sys3(SYS_SURF_LIST, (long)list, 8, 0);
+  printf("[scene] surfaces in the table: %d\n", nsurf);
+  for (int i = 0; i < nsurf && i < 8; i++)
+    printf("[scene]   win %d, %dx%d\n", list[i * 3], list[i * 3 + 1], list[i * 3 + 2]);
+
+  long win = sys3(SYS_WIN_OPEN, (long)"scene", SURF_W, SURF_H);
+  printf("[scene] window %ld\n", win);
+  long sbase = win >= 0 ? sys3(SYS_SURF_CREATE, win, SURF_W, SURF_H) : -1;
+  printf("[scene] surface at 0x%lx\n", sbase);
+  if (sbase > 0) {
+    uint32_t *mine = (uint32_t *)(uintptr_t)sbase;
+    for (long y = 0; y < SURF_H; y++)
+      for (long x = 0; x < SURF_W; x++)
+        mine[y * SURF_W + x] = ((((x / 16) + (y / 16)) & 1) ? 0x0000FFFFu : 0x00FF00FFu);
+    sys3(SYS_SURF_PRESENT, win, 0, ((long)SURF_W << 16) | SURF_H);
+
+    int32_t info[3] = {0, 0, 0};
+    long alias = sys3(SYS_SURF_MAP, win, (long)info, 0);
+    printf("[scene] map: 0x%lx, %dx%d, stride %d\n", alias, info[0], info[1], info[2]);
+    if (alias > 0) {
+      uint32_t *view = (uint32_t *)(uintptr_t)alias;
+      long bad = 0, seen = 0;
+      long vstride = info[2] / 4;
+      for (long y = 0; y < SURF_H; y += 7)
+        for (long x = 0; x < SURF_W; x += 5) {
+          seen++;
+          if (view[y * vstride + x] != mine[y * SURF_W + x]) bad++;
+        }
+      printf("[scene] alias agrees with the surface: %s (%ld samples, %ld bad)\n",
+             bad == 0 ? "yes" : "NO", seen, bad);
+
+      /* composite the alias, not the surface */
+      int sx = PASTE_X + 20, sy = PASTE_Y + 20, sx2 = PASTE_X + 44;
+      uint32_t c1 = ((((sx - PASTE_X) / 16) + ((sy - PASTE_Y) / 16)) & 1) ? 0x0000FFFFu : 0x00FF00FFu;
+      uint32_t c2 = ((((sx2 - PASTE_X) / 16) + ((sy - PASTE_Y) / 16)) & 1) ? 0x0000FFFFu : 0x00FF00FFu;
+      rect(0, 0, sw, sh, FULL_BG);
+      blit(view, info[2], info[0], info[1], PASTE_X, PASTE_Y);
+      flush_scene(0, 0, 0, 0);
+      printf("[scene] composited at %d,%d: (%d,%d) expect 0x%08X, (%d,%d) expect 0x%08X, (10,10) 0x%08X\n",
+             PASTE_X, PASTE_Y, sx, sy, c1, sx2, sy, c2, FULL_BG);
+      ms(8000);
+
+      /* And now somebody else's window: the first surface in the table that is
+       * not the one above. Its pixels are not ours to know, so the program
+       * prints what it read at two points and the screenshot has to agree. */
+      int fwin = -1;
+      for (int i = 0; i < nsurf && i < 8; i++)
+        if (list[i * 3] != (int)win) { fwin = list[i * 3]; break; }
+      if (fwin >= 0) {
+        int32_t finfo[3] = {0, 0, 0};
+        long falias = sys3(SYS_SURF_MAP, fwin, (long)finfo, 0);
+        printf("[scene] foreign win %d map: 0x%lx, %dx%d\n", fwin, falias, finfo[0], finfo[1]);
+        if (falias > 0) {
+          uint32_t *fv = (uint32_t *)(uintptr_t)falias;
+          long fstride = finfo[2] / 4;
+          uint32_t a1 = fv[10 * fstride + 10], a2 = fv[40 * fstride + 40];
+          blit(fv, finfo[2], finfo[0], finfo[1], 600, 400);
+          flush_scene(0, 0, 0, 0);
+          printf("[scene] foreign composited at 600,400: (610,410) expect 0x%08X, (640,440) expect 0x%08X\n",
+                 a1, a2);
+          ms(12000);
+        }
+      } else printf("[scene] no foreign surface to composite\n");
+    }
+  }
+
   printf("[scene] handoff off: the kernel's scene comes back\n");
   sys1(SYS_SCENE_HANDOFF, 0);
   ms(300);

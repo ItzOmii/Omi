@@ -146,6 +146,9 @@
 #define SYS_SCENE_INFO   43  /* (uint32_t out[3]) -> 0: w, h, row stride    */
 #define SYS_SCENE_FLUSH  44  /* (x, y, w, h) -> 0: rect to the display      */
 #define SYS_SCENE_HANDOFF 45 /* (on) -> the previous state                  */
+#define SYS_SURF_MAP     47  /* (win, int32_t out[3]) -> read-only base address, 0 = fail
+                              * out = w, h, stride. Another process's window pixels. */
+#define SYS_SURF_LIST    48  /* (int32_t out[], max) -> count, triples of win,w,h */
 #define SYS_SCENE_OWN    46  /* (x,y), (w,h) -> 0: a rect the kernel keeps out of
                               * Its own blits. 0,0 clears the claim.         */
 
