@@ -185,9 +185,11 @@ with specific properties. Here is the honest ledger, in the order the work has t
    What sixteen cores did expose is not the CPU path but the task table. `TASK_MAX` is 96 and slots
    are never reused - a task takes `tasks[ntasks]` and the counter only grows, 16 KB of stack each -
    so a sixteen-core boot spends 31 slots on per-CPU tasks (sixteen idle, fifteen workers) before the
-   first test runs, and then the boot starts printing `[task] no free slot (TASK_MAX)`: 24 failed
-   spawns, twelve suites red, where a four-core boot is green. The CPUs are fine at sixteen; the
-   scheduler's task table is sized like a four-core machine.
+   first test runs, and then the boot starts printing `[task] no free slot (TASK_MAX)` - 24 times -
+   and twelve suites go red that pass on four cores (`fork`, `exectest`, `memfdtest`, `cred`,
+   `maptest`, `scm`, `unixpair`, `unixname`, `socktest`, `tlsget`, `vfs`, `epolltest`; a thirteenth,
+   `lives`, fails on both). 253 of 265 suite checks pass instead of 300 of 300. The CPUs are fine at
+   sixteen; the scheduler's task table is sized like a four-core machine.
 
    And the per-CPU state is indexed by APIC id rather than by a dense index, so a core the firmware
    numbers 32 or higher claims no slot and falls back to the bootstrap processor's - harmless when
