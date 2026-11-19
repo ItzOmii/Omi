@@ -40,6 +40,12 @@ ISO := omi.iso
 endif
 
 # Compiler flags
+# -fno-omit-frame-pointer is not for speed, it is for the backtrace walk in
+# kernel/bt.c: without frame pointers a fault report is a stack scan and a guess.
+# PANIC_DEMO=1 builds a kernel that faults on purpose at the end of the boot,
+# to show the report. It is a test harness, not a feature.
+PANIC_DEMO ?= 0
+
 CFLAGS := -target x86_64-unknown-none-elf \
           -ffreestanding \
           -fno-stack-protector \
@@ -50,11 +56,13 @@ CFLAGS := -target x86_64-unknown-none-elf \
           -march=x86-64 \
           -mno-red-zone \
           -mcmodel=kernel \
+          -fno-omit-frame-pointer \
           -I$(KERNEL_DIR)/include \
           -I$(KERNEL_DIR)/lib/bearssl/port \
           -I$(KERNEL_DIR)/lib/bearssl/inc \
           -Wall -Wextra \
           -O2 \
+          -DOMI_PANIC_DEMO=$(PANIC_DEMO) \
           -g
 
 # Use GCC-compatible flags if using cross compiler
@@ -68,11 +76,13 @@ CFLAGS := -ffreestanding \
           -march=x86-64 \
           -mno-red-zone \
           -mcmodel=kernel \
+          -fno-omit-frame-pointer \
           -I$(KERNEL_DIR)/include \
           -I$(KERNEL_DIR)/lib/bearssl/port \
           -I$(KERNEL_DIR)/lib/bearssl/inc \
           -Wall -Wextra \
           -O2 \
+          -DOMI_PANIC_DEMO=$(PANIC_DEMO) \
           -g
 endif
 
@@ -97,6 +107,8 @@ SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/fs/vfs.c \
            $(KERNEL_DIR)/drivers/framebuffer.c \
            $(KERNEL_DIR)/drivers/idt.c \
+           $(KERNEL_DIR)/bt.c \
+           $(KERNEL_DIR)/bt_selftest.c \
            $(KERNEL_DIR)/drivers/wc.c \
            $(KERNEL_DIR)/drivers/ps2.c \
            $(KERNEL_DIR)/drivers/pci.c \
@@ -253,8 +265,23 @@ $(BUILD_DIR)/lib/bearssl/%.o: $(BEARSSL)/src/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -w -I$(BEARSSL)/port -I$(BEARSSL)/inc -I$(BEARSSL)/src -c $< -o $@
 
-# Link kernel
-$(KERNEL): $(OBJECTS)
+# Link kernel.
+#
+# Twice, and the order matters: the second link needs the symbol table of the
+# first, because the names have to be *in* the image for a fault to print them -
+# the ELF symtab is metadata that never gets loaded. The first link's text
+# addresses survive the second one because tools/gen_symtab.py only adds bytes to
+# .rodata, which the linker script places after .text and before .data.
+$(KERNEL): $(OBJECTS) $(BUILD_DIR)/symtab_gen.o
+	$(LD) $(LDFLAGS) $(OBJECTS) $(BUILD_DIR)/symtab_gen.o $(BUILTINS) -o $@
+
+$(BUILD_DIR)/symtab_gen.c: $(BUILD_DIR)/kernel.nosym
+	@python3 tools/gen_symtab.py $< $@
+
+$(BUILD_DIR)/symtab_gen.o: $(BUILD_DIR)/symtab_gen.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/kernel.nosym: $(OBJECTS)
 	$(LD) $(LDFLAGS) $(OBJECTS) $(BUILTINS) -o $@
 
 # Fetch and build Limine (x86_64 UEFI only). The 8.6.0 release ships source, not

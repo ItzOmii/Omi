@@ -661,3 +661,49 @@ children in it was enough to starve `lives` at four cores - which showed up as a
 "broken" shared page rather than as a failed fork. The budget shape is still wrong
 (a cap for the life of the boot, not a live count); raising it removes the symptom
 without fixing that.
+
+## 13. A fault report someone can act on
+
+The old path printed one line - vector, error code, rip, cr2 - and halted. That
+answers *what* happened and nothing about *where*, and on a scheduler bug the
+where is the whole question. Three pieces, and each one exists because the other
+two are useless without it:
+
+- **The names are in the image.** An ELF symbol table is metadata; the bootloader
+  never loads it, so a running kernel cannot name its own addresses. The build now
+  links twice: once without symbols, reads the text symbols out of that ELF, and
+  links again with them compiled in as data (`tools/gen_symtab.py`). The second
+  link is safe because the table only adds bytes to `.rodata`, which the linker
+  script places after `.text` - so every text address from the first link is still
+  correct in the second. The table is 1,784 symbols, about 40 KB.
+- **Frame pointers.** `-fno-omit-frame-pointer` for the whole kernel. It costs a
+  few percent and buys a walk that is a walk: rbp chain, [rbp] is the caller's
+  frame, [rbp+8] is the return address. Without it a backtrace is a stack scan and
+  a guess, and a wrong guess in a panic report is worse than no report - it sends
+  the next person to the wrong function with confidence.
+- **Suspicion in the walk.** Every candidate frame must be 8-byte aligned, in the
+  higher half, strictly above the frame that pointed at it, and its return address
+  must land inside `__text_start..__text_end`. A walk that breaks a rule stops. A
+  short true backtrace beats a long invented one, and this code runs when
+  something is already wrong.
+
+Where it plugs in: the page-fault path in `ring3.c` already distinguished user
+faults (kill that task, keep running - the isolation that makes a browser
+possible) from kernel faults (halt). The kernel-fault branch now dumps all fifteen
+general registers, the faulting task, and the walk. Every other exception vector
+gets the same treatment through new stubs in `idt.c`, which also fixes a latent
+bug: those vectors pointed at a stub that pushed nothing, so a fault *with* an
+error code left the stack unbalanced and the `iretq` returned into whatever was
+under it - a triple fault with no output at all.
+
+`panic()` is the other entrance, for "this state cannot happen" rather than "the
+hardware said so". It takes the frame pointer in the caller through a macro, which
+is the point: inside `panic_from()` the first frame would always be
+`panic_from`.
+
+What is not here: a fault taken in ring 3 still has no backtrace (its rbp points
+into the user stack, which leads nowhere in kernel terms) - it prints the user rip
+and kills the task, which is right, but a user-mode crash report with a symbol
+walk through that task's own image is a different piece of work. And nothing
+unwinds past an interrupt frame yet, so a fault inside an IRQ shows the interrupt
+stub rather than the code that was interrupted.

@@ -286,6 +286,12 @@ make run             # QEMU, UEFI
 make run-bios        # QEMU, legacy BIOS
 ```
 
+A fault prints the registers, the task it happened in, and the call chain with
+symbols — `[bt] #0 ... ata_read+0x42` — because the build links the kernel twice
+and compiles its own symbol table into the image. To see what that looks like,
+`make PANIC_DEMO=1` faults on purpose three frames deep at the end of the boot
+(`PANIC_DEMO=2` calls `panic()` instead).
+
 By hand, serial log to a file — how it is tested here, with no display:
 
 ```bash

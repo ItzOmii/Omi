@@ -4,6 +4,7 @@
  */
 
 #include "../include/gui.h"
+#include "../include/bt.h"
 #include "../include/limine.h"
 #include "../include/gdt.h"
 #include "../include/idt.h"
@@ -441,6 +442,9 @@ void _start(void) {
     for (int i = 0; i < 50; i++) row[70 + i] = 0xFF00FF00;
   }
 
+  /* Before anything else can fault: prove the machinery that will report it. */
+  bt_selftest();
+
   serial_puts("Initializing NIC...\n");
   net_selftest();
   serial_puts("Initializing HDA...\n");
@@ -603,6 +607,17 @@ void _start(void) {
   ring3_spawn_elf("form",     "formtest.elf", 0);
   ring3_spawn_elf("img",      "imgtest.elf", 0);
   ring3_spawn_elf("mem",      "memtest.elf", 0);
+#endif
+
+#if OMI_PANIC_DEMO == 1
+  /* PANIC_DEMO=1: the report path, end to end, on a real fault. */
+  panic_demo();
+#elif OMI_PANIC_DEMO == 2
+  /* PANIC_DEMO=2: the other entrance - panic() called from kernel code. */
+  {
+    void panic_selftest_demo(void);
+    panic_selftest_demo();
+  }
 #endif
 
   serial_puts("Starting main loop...\n");

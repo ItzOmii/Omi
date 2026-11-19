@@ -24,9 +24,12 @@ SECTIONS {
         KEEP(*(.limine_requests))
     } :limine
 
-    /* Code section */
+    /* Code section. The bounds are for the backtrace walk, which refuses to
+       treat an address outside them as a return address. */
     .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_VIRT + KERNEL_PHYS) {
+        __text_start = .;
         *(.text .text.*)
+        __text_end = .;
     } :text
 
     /* Read-only data */

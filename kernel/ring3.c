@@ -19,6 +19,7 @@
 #include "include/idt.h"
 #include "include/types.h"
 #include "include/gui.h"     /* the display's geometry: what the scene is sized to */
+#include "include/bt.h"      /* the register dump and the walk out of a fault */
 #include "include/guiipc.h"
 #include "include/pmm.h"
 #include "include/errno.h"
@@ -4470,6 +4471,11 @@ void ring3_fault(uint64_t *f) {
     serial_puthex(ct ? ct->cr3 : 0);
   }
   serial_puts("\n");
+  /* The full report: every register the stub saved, the task, and the walk out.
+   * The frame the stub passes starts at the hardware frame; the fifteen saved
+   * registers sit immediately below it. */
+  bt_fault_dump(f - 15, err, rip, cs, f[3], f[4], f[5]);
+  serial_puts("[ring3] halted\n");
   for (;;) __asm__ volatile("cli; hlt");
 }
 

@@ -5,6 +5,7 @@
 #include "../include/idt.h"
 #include "../include/gui.h"   /* serial_puts: the only way a fault can talk */
 #include "../include/lapic.h"   /* the APIC vector, above the PIC range */
+#include "../include/bt.h"      /* the frame pointer walk */
 
 #define PIC1_CMD 0x20
 #define PIC1_DATA 0x21
@@ -101,66 +102,171 @@ __attribute__((interrupt)) static void isr_apic(interrupt_frame_t *frame) {
 
 /* ------------------------------------------------------------ fault reporting
  *
- * Until now every exception vector pointed at a stub that did nothing, which on
- * a fault with an error code left the stack unbalanced: the iretq returned to
- * whatever was under the error code and the machine triple-faulted with no
- * output at all. A core that faults deserves one line on the serial port naming
- * the vector, the error code and the address, and then it can stop.
+ * Every exception vector used to point at a stub that did nothing, which on a
+ * fault with an error code left the stack unbalanced: the iretq returned to
+ * whatever was under the error code and the machine triple-faulted with no output
+ * at all. Then it printed one line - vector, error code, rip, cr2 - and stopped,
+ * which says what happened and nothing about where.
  *
- * The frame a fault leaves on the stack is the CPU's own: error code first (for
- * the vectors that push one), then the interrupted context.
+ * Now every exception lands in one place that saves all fifteen general
+ * registers, names the running task, and walks the frame pointers out to the
+ * caller chain with symbols attached. The CPU's own frame (error code, rip, cs,
+ * rflags, rsp, ss) sits on top of the saved registers, so the two together are one
+ * struct and the order of the pushes below is the order of the fields.
+ *
+ * The stubs are naked and never return: a fault is the end of this CPU's run, and
+ * printing is all that is left to do with it.
  */
 typedef struct {
+  /* Pushed by the stub, in this order - last pushed is lowest in memory. */
+  uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+  uint64_t rbp, rsi, rdi, rdx, rcx, rbx, rax;
+  /* Pushed by the CPU. */
   uint64_t err, rip, cs, rflags, rsp, ss;
-} fault_frame_t;
+} fault_ctx_t;
 
 static const char *fault_name(uint64_t v) {
   switch (v) {
     case 0:  return "divide by zero";
+    case 1:  return "debug";
+    case 2:  return "non-maskable interrupt";
+    case 3:  return "breakpoint";
+    case 4:  return "overflow";
+    case 5:  return "bound range";
     case 6:  return "invalid opcode";
+    case 7:  return "device not available";
     case 8:  return "double fault";
+    case 10: return "invalid tss";
+    case 11: return "segment not present";
+    case 12: return "stack segment";
     case 13: return "general protection";
     case 14: return "page fault";
+    case 16: return "x87 floating point";
     case 17: return "alignment check";
+    case 18: return "machine check";
+    case 19: return "simd floating point";
     case 21: return "control protection";
     default: return "exception";
   }
 }
 
-static void fault_report(fault_frame_t *f, uint64_t vector) {
+/* Four registers to a line: sixteen numbers on one line is worse than
+ * unreadable, it is unsearchable. */
+static void reg4(const char *n0, uint64_t v0, const char *n1, uint64_t v1,
+                 const char *n2, uint64_t v2, const char *n3, uint64_t v3) {
   serial_puts("[fault] ");
+  serial_puts(n0); serial_puts("="); serial_puthex(v0); serial_puts(" ");
+  serial_puts(n1); serial_puts("="); serial_puthex(v1); serial_puts(" ");
+  serial_puts(n2); serial_puts("="); serial_puthex(v2); serial_puts(" ");
+  serial_puts(n3); serial_puts("="); serial_puthex(v3); serial_puts("\n");
+}
+
+static void fault_report(fault_ctx_t *c, uint64_t vector) {
+  serial_puts("\n[fault] ");
   serial_puts(fault_name(vector));
-  serial_puts(" vector=0x");
+  serial_puts(" vector=");
   serial_puthex(vector);
-  serial_puts(" err=0x");
-  serial_puthex(f->err);
-  serial_puts(" rip=0x");
-  serial_puthex(f->rip);
+  serial_puts(" err=");
+  serial_puthex(c->err);
   if (vector == 14) {
     uint64_t cr2;
     __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-    serial_puts(" cr2=0x");
+    serial_puts(" cr2=");
     serial_puthex(cr2);
   }
   serial_puts(" apic=");
   serial_puthex((uint64_t)lapic_this_id());
   serial_puts("\n");
+
+  bt_who();
+
+  reg4("rax", c->rax, "rbx", c->rbx, "rcx", c->rcx, "rdx", c->rdx);
+  reg4("rsi", c->rsi, "rdi", c->rdi, "rbp", c->rbp, "rsp", c->rsp);
+  reg4("r8", c->r8, "r9", c->r9, "r10", c->r10, "r11", c->r11);
+  reg4("r12", c->r12, "r13", c->r13, "r14", c->r14, "r15", c->r15);
+  serial_puts("[fault] rip=0x");
+  serial_puthex(c->rip);
+  serial_puts(" cs=");
+  serial_puthex(c->cs);
+  serial_puts(" rflags=");
+  serial_puthex(c->rflags);
+  serial_puts("\n");
+
+  /* A fault taken from ring 3 has a user-mode rbp, which leads nowhere useful;
+   * say so rather than printing a walk through the user stack as if it were
+   * kernel frames. Killing just that task is the right answer and is not what
+   * this does yet - the kernel stops either way, which is why this is a
+   * limitation and not a feature. */
+  if (c->cs & 3) {
+    serial_puts("[fault] taken from user mode - no kernel backtrace from here\n");
+  } else {
+    bt_print(c->rbp, c->rip);
+  }
 }
 
-/* Naked so the compiler does not build a frame of its own over the CPU's. */
-__attribute__((naked)) static void isr_fault_df(void) {
-  __asm__ volatile("movb $0x44, %al\n\t outb %al, $0xE9\n\t"   /* 'D' to debugcon first */
-                   "pushq $8\n\t movq %rsp, %rdi\n\t call fault_enter\n\t"
-                   "1: cli\n\t hlt\n\t jmp 1b\n\t");
+/* Never returns. Called only from the naked stubs above, which is why it has to be
+ * marked used and to keep external linkage: from C's point of view nothing calls
+ * it, and the compiler is entitled to drop a static function like that. */
+__attribute__((used)) void fault_enter(fault_ctx_t *c, uint64_t vector) {
+  fault_report(c, vector);
+  serial_puts("[fault] halted\n");
+  for (;;) __asm__ volatile("cli; hlt");
 }
-__attribute__((naked)) static void isr_fault_gp(void) {
-  __asm__ volatile("movb $0x47, %al\n\t outb %al, $0xE9\n\t"   /* 'G' to debugcon first */
-                   "pushq $13\n\t movq %rsp, %rdi\n\t call fault_enter\n\t"
-                   "1: cli\n\t hlt\n\t jmp 1b\n\t");
-}
-__attribute__((naked)) static void isr_fault_pf(void) {
-  __asm__ volatile("movb $0x50, %al\n\t outb %al, $0xE9\n\t"   /* 'P' to debugcon first */
-                   "pushq $14\n\t movq %rsp, %rdi\n\t call fault_enter\n\t"
+
+/* Fifteen pushes and a call, so that fault_enter sees one contiguous struct. The
+ * stack is aligned by hand before the call: the CPU's frame is 40 or 48 bytes and
+ * fifteen registers is 120, so the sum is not 16-byte aligned and the ABI wants it
+ * to be. Nothing returns, so moving rsp is free. */
+__attribute__((used)) void fault_enter(fault_ctx_t *c, uint64_t vector);
+
+#define PUSH_GPRS                                                              \
+  "pushq %rax\n\t pushq %rbx\n\t pushq %rcx\n\t pushq %rdx\n\t"                \
+  "pushq %rdi\n\t pushq %rsi\n\t pushq %rbp\n\t"                               \
+  "pushq %r8\n\t  pushq %r9\n\t  pushq %r10\n\t pushq %r11\n\t"                \
+  "pushq %r12\n\t pushq %r13\n\t pushq %r14\n\t pushq %r15\n\t"
+
+#define FAULT_STUB_EC(fn, vec)                                                 \
+  __attribute__((naked)) static void fn(void) {                                \
+    __asm__ volatile(PUSH_GPRS                                                  \
+                     "movq %rsp, %rdi\n\t movq $" #vec ", %rsi\n\t"             \
+                     "andq $-16, %rsp\n\t call fault_enter\n\t"                 \
+                     "1: cli\n\t hlt\n\t jmp 1b\n\t");                          \
+  }
+
+#define FAULT_STUB(fn, vec)                                                    \
+  __attribute__((naked)) static void fn(void) {                                \
+    __asm__ volatile("pushq $0\n\t" PUSH_GPRS                                   \
+                     "movq %rsp, %rdi\n\t movq $" #vec ", %rsi\n\t"             \
+                     "andq $-16, %rsp\n\t call fault_enter\n\t"                 \
+                     "1: cli\n\t hlt\n\t jmp 1b\n\t");                          \
+  }
+
+FAULT_STUB(isr_exc_de, 0)
+FAULT_STUB(isr_exc_db, 1)
+FAULT_STUB(isr_exc_nmi, 2)
+FAULT_STUB(isr_exc_bp, 3)
+FAULT_STUB(isr_exc_of, 4)
+FAULT_STUB(isr_exc_br, 5)
+FAULT_STUB(isr_exc_ud, 6)
+FAULT_STUB(isr_exc_nm, 7)
+FAULT_STUB(isr_exc_mf, 16)
+FAULT_STUB(isr_exc_mc, 18)
+FAULT_STUB(isr_exc_xm, 19)
+FAULT_STUB_EC(isr_exc_ts, 10)
+FAULT_STUB_EC(isr_exc_np, 11)
+FAULT_STUB_EC(isr_exc_ss, 12)
+FAULT_STUB_EC(isr_exc_gp, 13)
+FAULT_STUB_EC(isr_exc_pf, 14)
+FAULT_STUB_EC(isr_exc_ac, 17)
+FAULT_STUB_EC(isr_exc_cp, 21)
+
+/* A double fault is reported the same way, but with one extra byte to the debug
+ * console first: the frame it arrives on is the only one left, and if anything in
+ * the reporting path faults again the log should at least show that it got here. */
+__attribute__((naked)) static void isr_exc_df(void) {
+  __asm__ volatile("movb $0x44, %al\n\t outb %al, $0xE9\n\t" PUSH_GPRS
+                   "movq %rsp, %rdi\n\t movq $8, %rsi\n\t"
+                   "andq $-16, %rsp\n\t call fault_enter\n\t"
                    "1: cli\n\t hlt\n\t jmp 1b\n\t");
 }
 
@@ -179,6 +285,28 @@ void idt_init(void) {
     idt_set_gate((uint8_t)i, isr_default);
     isr_handlers[i] = 0;
   }
+
+  /* Exceptions: every vector that means "this cpu is in trouble" now reports
+   * instead of pointing at an empty stub. */
+  idt_set_gate(0, isr_exc_de);
+  idt_set_gate(1, isr_exc_db);
+  idt_set_gate(2, isr_exc_nmi);
+  idt_set_gate(3, isr_exc_bp);
+  idt_set_gate(4, isr_exc_of);
+  idt_set_gate(5, isr_exc_br);
+  idt_set_gate(6, isr_exc_ud);
+  idt_set_gate(7, isr_exc_nm);
+  idt_set_gate(8, isr_exc_df);
+  idt_set_gate(10, isr_exc_ts);
+  idt_set_gate(11, isr_exc_np);
+  idt_set_gate(12, isr_exc_ss);
+  idt_set_gate(13, isr_exc_gp);
+  idt_set_gate(14, isr_exc_pf);
+  idt_set_gate(16, isr_exc_mf);
+  idt_set_gate(17, isr_exc_ac);
+  idt_set_gate(18, isr_exc_mc);
+  idt_set_gate(19, isr_exc_xm);
+  idt_set_gate(21, isr_exc_cp);
 
   /* IRQ vectors 0x20 - 0x2F */
   idt_set_gate(0x20, isr_irq0);
@@ -200,11 +328,6 @@ void idt_init(void) {
 
   /* Above the PIC's range, so a stray IRQ cannot land on it. */
   idt_set_gate(LAPIC_VECTOR_IPI, isr_apic);
-
-  /* Faults report and stop; the do-nothing stub left the stack unbalanced. */
-  idt_set_gate(8,  isr_fault_df);
-  idt_set_gate(13, isr_fault_gp);
-  idt_set_gate(14, isr_fault_pf);
 
   idt_ptr_t idtr;
   idtr.limit = (uint16_t)(sizeof(idt) - 1);
@@ -258,9 +381,3 @@ void pic_clear_mask(uint8_t irq) {
   outb(port, value);
 }
 
-/* Called from the naked stubs with the pushed vector at (%rdi). */
-void fault_enter(uint64_t *sp) {
-  uint64_t vector = sp[0];
-  fault_report((fault_frame_t *)&sp[1], vector);
-  for (;;) __asm__ volatile("cli; hlt");
-}
