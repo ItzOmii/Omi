@@ -605,6 +605,14 @@ int task_spawn_clone(const char *name, mm_t *mm, const uint64_t *frame,
   t->rsp = (uint64_t)(uintptr_t)c;
   t->fs_base = fs_base;
   t->ctid = ctid;
+  /* The filter comes with the child. A process that confined itself and then
+   * forked or made a thread would otherwise hand the new one an unfiltered door,
+   * which is the whole escape the mask is meant to close. */
+  task_t *par = task_at(task_current());
+  if (par) {
+    t->sbx_on = par->sbx_on;
+    for (int i = 0; i < 4; i++) t->sbx[i] = par->sbx[i];
+  }
   t->state = TASK_READY;
   return t->id;
 }

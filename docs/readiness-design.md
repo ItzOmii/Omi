@@ -619,3 +619,45 @@ by the same sweep that clears its waiters.
 - **`e1000_send` tri-state** is implemented (§10c), but its `-2` outcome is
   unexercised: it needs fault injection below the NIC driver. Until then the policy
   is a decision recorded in code, not a behaviour observed under test.
+## 12. The syscall filter, and what it is not
+
+The sandbox starts with the one piece that is cheap and is the foundation of the
+rest: the door. `SYS_SANDBOX 55` takes a bitmap of syscall numbers - 256 of them in
+four words, one bit per number - and from then on `syscall_dispatch` checks it
+before it looks at the number. A call outside the mask does not fail, it ends the
+task, at code 159 (what an uncaught `SIGSYS` does on Linux), for the same reason
+`kill_req` is checked in that spot: between calls is the one point where ending a
+task leaves nothing half-torn.
+
+Three decisions worth recording, because each could reasonably have gone another
+way:
+
+- **Per task, not per address space.** seccomp is per thread, and that is not an
+  accident: the mask is a property of the code that is running. A process that
+  confined itself and then forked or made a thread would otherwise hand the new
+  task an unfiltered door, which is the entire escape the mask exists to close, so
+  `task_spawn_clone` copies it. `SYS_EXIT` is exempt in the check itself rather
+  than in every mask: a sandboxed process has to be able to die.
+- **Narrow only.** A second install ANDs with the first. Without it, "install a
+  filter" would be a formality a process could undo one call later - and the test
+  that proves otherwise (mask, then `~0ULL`, then a forbidden call) is the one that
+  would otherwise pass.
+- **The Linux ABI is the violation.** The filter is written against this kernel's
+  numbers, and a confined task calling through the `syscall` instruction would be
+  making the same call under a number the mask never saw. Refusing the door is
+  honest - one filtered door is the point - and it is why a musl-linked binary
+  cannot run under a filter yet. When that matters, the fix is a second bitmap over
+  Linux numbers, not a translation table pretending the two numberings are one.
+
+What it is not: a capability model. A permitted `write` writes to any descriptor
+the task already holds, `mmap` is unconstrained, and there are no namespaces, so the
+filter is exactly as strong as the handles a process holds at the moment it
+confines itself. Handing a renderer a socket and then filtering `socket()` is the
+shape a real sandbox needs, and that is the next piece, not this one.
+
+`TASK_MAX` went from 96 to 256 in the same change, and not speculatively: a
+sixteen-core boot spends 31 slots on per-CPU tasks, and one new test with six
+children in it was enough to starve `lives` at four cores - which showed up as a
+"broken" shared page rather than as a failed fork. The budget shape is still wrong
+(a cap for the life of the boot, not a live count); raising it removes the symptom
+without fixing that.

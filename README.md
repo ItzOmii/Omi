@@ -15,8 +15,8 @@ the browser, audio, a disk — happened here.
 By the numbers, measured from the tree (`find kernel -name '*.c'` and so on, vendored directories
 counted separately): **32,252 lines** of first-party kernel C (plus **17,733** lines of its headers),
 **9,646 lines** of user-mode C, **103,958 lines** of vendored BearSSL and Gumbo, **101,195 lines** of
-vendored audio decoders in `kernel/media/`, and **54 native syscalls** in front of the Linux ABI. A
-stock boot prints **334 `ok` lines** in the serial log - a couple of those checks talk to the public
+vendored audio decoders in `kernel/media/`, and **57 native syscalls** in front of the Linux ABI. A
+stock boot prints **340 `ok` lines** in the serial log - a couple of those checks talk to the public
 internet, and when it refuses them they print a skip instead of a failure, which is why the count
 moves by a few lines from one boot to the next.
 
@@ -182,22 +182,42 @@ with specific properties. Here is the honest ledger, in the order the work has t
    workers each reporting `ran_on` its own APIC id - one per core, each core running its own thread.
    Nothing in that path counts to three.
 
-   What sixteen cores did expose is not the CPU path but the task table. `TASK_MAX` is 96 and slots
-   are never reused - a task takes `tasks[ntasks]` and the counter only grows, 16 KB of stack each -
-   so a sixteen-core boot spends 31 slots on per-CPU tasks (sixteen idle, fifteen workers) before the
-   first test runs, and then the boot starts printing `[task] no free slot (TASK_MAX)` - 24 times -
-   and twelve suites go red that pass on four cores (`fork`, `exectest`, `memfdtest`, `cred`,
-   `maptest`, `scm`, `unixpair`, `unixname`, `socktest`, `tlsget`, `vfs`, `epolltest`; a thirteenth,
-   `lives`, fails on both). 253 of 265 suite checks pass instead of 300 of 300. The CPUs are fine at
-   sixteen; the scheduler's task table is sized like a four-core machine.
+   What sixteen cores did expose is not the CPU path but the task table. `TASK_MAX` was 96, and a
+   slot is a slot for the life of the boot: a task takes `tasks[ntasks]`, the counter only grows, and
+   the stack behind it is 16 KB. A sixteen-core boot spends 31 of those on per-CPU tasks before the
+   first test runs, and that boot printed `[task] no free slot (TASK_MAX)` 24 times and turned twelve
+   suites red that pass on four cores. The table is 256 now and the sixteen-core boot is green - 305
+   of 305 suite checks and no failed `fork` - and raising it fixed one failure nobody had attributed
+   to it: `lives` went from 7/8 to 8/8, because the generations it forks had been losing their slots
+   and the lost fork looked like a broken shared page.
+
+   That number is still a budget rather than a live count, and that is the shape to fix: slots are
+   never handed back, so a long-lived system holding a browser's process count - renderer, GPU
+   process, network service, threads - spends the table once and never recovers it.
 
    And the per-CPU state is indexed by APIC id rather than by a dense index, so a core the firmware
    numbers 32 or higher claims no slot and falls back to the bootstrap processor's - harmless when
    the ids are 0 to 15, and a shared accounting slot on a dual-socket machine (ids 0-15 and 32-47).
    x2APIC itself is handled; that indexing is the thing to fix before claiming bigger iron.
-3. **A sandbox.** No seccomp, no namespaces, no capability model. Chromium's security posture
-   assumes the platform takes something away from a renderer; here nothing is taken away, so a
-   renderer that is compromised *is* the machine.
+3. **A sandbox.** Started. The kernel has the piece Chromium's renderer sandbox is built on: a
+   per-task filter over which syscall numbers that task may make (`SYS_SANDBOX 55`). A process
+   installs a bitmap of the calls it wants; any other call ends it at the door with code 159, which
+   is what an uncaught SIGSYS does on Linux and arrives in the status word like any exit code. It
+   narrows only - a second install is ANDed with the first, so a confined process cannot widen its
+   own - it is inherited by fork and by threads, and `SYS_EXIT` is always allowed, because a
+   sandboxed process has to be able to die. `sandtest` checks five things: the allowed calls still
+   run and the exit code still arrives, a forbidden call ends the task, a second mask cannot widen
+   the first, a fork inherits the filter, and the call that was fatal under one mask is ordinary
+   under another. 5/5.
+
+   What it does not do is the rest of what a sandbox is. There is no capability model over
+   descriptors: a permitted `write` writes to any descriptor the task already holds, so a filter is
+   only as good as what the process was handed before it confined itself. There are no namespaces -
+   every process still sees one filesystem. `mmap` is not constrained, so permitted calls can still
+   ask for the whole address space. And a confined task may not use the Linux ABI at all: the filter
+   is written against this kernel's own numbers, and the ABI switch would be a second door, so it is
+   the violation. One filtered door is the point - it is also why a musl-linked binary cannot be run
+   under a filter today.
 4. **A font stack beyond one 8×16 bitmap face**, and text shaping. Chromium renders through Skia and
    HarfBuzz; the browser here has one bitmap face and no shaping at all.
 5. **A GPU or a fast software raster.** Every pixel is composed on the CPU today.
@@ -220,9 +240,9 @@ next year.
   list. A torn write is caught by the superblock checksum and answered by reformatting.
 - **No GPU.** Every pixel is composed on the processor; there is no accelerator of any kind.
 
-- **The task table does not scale with the cores.** `TASK_MAX` is 96, slots are allocated by a
-  counter that never goes down, and each core costs two before any program runs - so sixteen cores
-  fill it during the boot, while four leaves room. A leak in the shape of a policy limit.
+- **The task table is a lifetime budget.** `TASK_MAX` is 256 and slots are allocated by a counter
+  that never goes down, and each core costs two before any program runs. 256 is room, not a fix: a
+  long-running system holding a browser's process count spends the table once and cannot recover it.
 - **The compositor's damage is rectangles, not a scene graph.** It repaints the changed rectangles
   and nothing else, but it has no idea what is inside them: a patch that overlaps three windows
   repaints all three, and a window that grows by one pixel repaints its whole frame. There is no
@@ -290,8 +310,9 @@ legacy mode.
 ## What proves it
 
 Everything above is the output of programs that run on the ISO at boot, not a description of intent.
-A stock boot prints 334 `ok` lines and these tallies (the count moves by a few lines between boots:
-the two checks that use somebody else's server say `skipped` when it throttles them):
+A stock boot prints 340 `ok` lines and these tallies (the count moves by a line or two between boots:
+the checks that use somebody else's server say `skipped` when it throttles them, and a sixteen-core
+boot reports 339 with the same suites green):
 
 `surftest` 10/10 (mapping, present, damage, refusals) · `surfbig` 10/10 (1920×1200, shrink and grow,
 the slot pool's `-ENOSPC`) · `surfexit` (a window and its surface are reaped when the process exits) ·
@@ -301,7 +322,8 @@ the slot pool's `-ENOSPC`) · `surfexit` (a window and its surface are reaped wh
 `cred` 7/7 (`SO_PEERCRED`) · `scm` 15/15 (`SCM_RIGHTS`, `MSG_CTRUNC`) · `img` 10/10 · `form` 16/16 ·
 `mem` 2/2 · `disk` 6/6 (with a disk attached) · `linux3` 27/27 · `pipe`/`pipe3` 37/37, 30/30 ·
 `maptest` 24/24 · `epolltest` 24/24 · `memfdtest` 23/23 · `modtest` 15/15 · `dyntest` 14/14 ·
-`lives` 7/8 · `exectest` 7/7.
+`lives` 8/8 · `exectest` 7/7 · `sandtest` 5/5 (a filter over the syscall door: allowed calls run,
+forbidden ones end the task, a second mask cannot widen the first, fork inherits it).
 
 Two of those depend on somebody else's machine, and say so instead of failing: `ominet` fetches a
 real page over TLS (it falls back to a second host on a different CDN when the first refuses the

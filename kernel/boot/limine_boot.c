@@ -559,6 +559,7 @@ void _start(void) {
   ring3_spawn_elf("epolltest", "epolltest.elf", 0);
   ring3_spawn_elf("memfdtest", "memfdtest.elf", 0);
   ring3_spawn_elf("socktest", "socktest.elf", 0);
+  ring3_spawn_elf("sandtest", "sandtest.elf", 0);
   ring3_spawn_elf("tlsget", "tlsget.elf", 0);
   /* The address window, before anything that allocates from it. */
   ring3_spawn_elf("vmtest", "vmtest.elf", 0);

@@ -25,9 +25,14 @@
  * pointing at something with a name, which is what the Task Manager and the exit
  * log read. That makes this a budget for the whole life of the boot, not a live
  * count - 40 ran out the moment a libc with four threads joined the demo, and the
- * failure looked like pthread_create returning EAGAIN. 96 x 16 KB of kernel stack
- * is 1.5 MB of an 18 GB machine. */
-#define TASK_MAX 96
+ * failure looked like pthread_create returning EAGAIN. 96 then ran out too: a
+ * sixteen-core boot spends 31 slots on per-CPU tasks before a test starts, and a
+ * single new test with six children in it was enough to starve a later suite at
+ * four cores. 256 x 16 KB of kernel stack is 4 MB of an 18 GB machine, and a
+ * browser's renderer, GPU process and network service are what this has to hold.
+ * Raising it buys room; the budget shape is still the wrong shape (see
+ * docs/readiness-design.md) and slots are still never handed back. */
+#define TASK_MAX 256
 #define TASK_STACK  16384
 
 /* BLOCKED is a task waiting for something (an event, in practice): the
@@ -185,6 +190,14 @@ typedef struct {
    * only appends), so this guards a future change rather than a live bug - see
    * docs/readiness-design.md. */
   uint32_t tgen;
+  /* The sandbox, once a task asks for one: one bit per syscall number, 256 of
+   * them in four words, 1 = allowed. It is narrow-only - a second install is
+   * ANDed with the first - and inherited by fork and clone, because a thread a
+   * confined process makes must not be a way back out of it. Kept per task
+   * rather than per address space for the same reason seccomp is per thread:
+   * the mask is a property of the code that is running. */
+  int      sbx_on;
+  uint64_t sbx[4];
 } task_t;
 
 void task_init(void);

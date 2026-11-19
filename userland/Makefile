@@ -32,6 +32,7 @@ PROGS += exectest.elf
 PROGS += epolltest.elf
 PROGS += memfdtest.elf
 PROGS += socktest.elf
+PROGS += sandtest.elf
 PROGS += tlsget.elf
 PROGS += surftest.elf
 PROGS += scene.elf
@@ -234,6 +235,10 @@ surfexit.elf: surfexit.c
 socktest.elf: socktest.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping socktest"; exit 0; }
 	@musl-gcc -O2 -static -o $@ $< && echo "built $@" || echo "socktest build failed"
+
+sandtest.elf: sandtest.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping sandtest"; exit 0; }
+	@musl-gcc -O2 -static -o $@ $< && echo "built $@" || echo "sandtest build failed"
 
 memfdtest.elf: memfdtest.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping memfdtest"; exit 0; }

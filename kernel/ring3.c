@@ -3885,6 +3885,61 @@ void scene_owner_exit(int pid) {
 
 uint64_t r3_cur_syscall, r3_cur_arg0;
 
+/* --------------------------------------------------------------- the sandbox */
+
+/* A violation ends the task the way a fatal signal would, with a code a parent
+ * can recognise: 159 is what an uncaught SIGSYS does on Linux, and wait4 here
+ * puts it in bits 8-15 like any other exit code. */
+#define SBX_VIOLATION 159
+
+/* Called at the door, before the number is looked at, for the same reason
+ * kill_req is: a task that may not make this call must not make it *at all*,
+ * not have it fail half way through. */
+static void sandbox_check(uint64_t abi, uint64_t num) {
+  task_t *me = task_at(task_current());
+  if (!me || !me->sbx_on) return;
+  int allowed = 0;
+  if (abi != ABI_LINUX) {
+    /* A confined task must be able to die, whatever its mask says. */
+    if (num == SYS_EXIT) allowed = 1;
+    else if (num < 256) allowed = (int)((me->sbx[num >> 6] >> (num & 63)) & 1);
+  }
+  /* The filter is over this kernel's own numbers. A confined task that switched
+   * to the Linux ABI would be making the same call under a number the mask never
+   * saw, so the switch is the violation - one filtered door is the point. */
+  if (allowed) return;
+  serial_puts("[sandbox] task ");
+  serial_puts(task_name(task_current()));
+  serial_puts(" called ");
+  if (abi == ABI_LINUX) serial_puts("the Linux ABI");
+  else { serial_puts("syscall "); serial_puthex(num); }
+  serial_puts(", which its filter does not allow - ending it\n");
+  r3_exit_now(SBX_VIOLATION);            /* does not return */
+}
+
+static long sys_sandbox(uint64_t mask_u, uint64_t words) {
+  if (words < 1 || words > 4) return -EINVAL;
+  uint64_t m[4] = {0, 0, 0, 0};
+  if (user_get(mask_u, m, words * 8) != 0) return -EFAULT;
+  task_t *me = task_at(task_current());
+  if (!me) return -EINVAL;
+  if (me->sbx_on) {
+    /* Narrow only. Without this a process could install a mask, then install a
+     * wider one, and the filter would be a formality. */
+    for (int i = 0; i < 4; i++) m[i] &= me->sbx[i];
+  }
+  for (int i = 0; i < 4; i++) me->sbx[i] = m[i];
+  me->sbx_on = 1;
+  serial_puts("[sandbox] task ");
+  serial_puts(task_name(task_current()));
+  serial_puts(" confined: allowed = ");
+  serial_puthex(m[0]);
+  serial_puts(" ");
+  serial_puthex(m[1]);
+  serial_puts("\n");
+  return 0;
+}
+
 long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
   /* The door is where a pending kill is carried out. A task that was asked to
    * stop - because its window is gone and nobody can reach it any other way -
@@ -3893,6 +3948,9 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
    * rather than in the scheduler means the task is between calls: its own stack,
    * its descriptors and the window table are all in a state it can leave. */
   kill_if_requested();
+  /* And the door is where a filter is enforced, for the same reason: between
+   * calls is the one point where ending the task leaves nothing half-torn. */
+  sandbox_check(abi, num);
   if (abi == ABI_LINUX) {
     r3_cur_syscall = ~num;      /* distinguishable from our own numbers in a crash report */
     r3_cur_arg0 = a0;
@@ -3912,6 +3970,9 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
 
   switch (num) {
     case SYS_WRITE:  return sys_write(a0, a1, a2);
+    case SYS_SANDBOX: return sys_sandbox(a0, a1);
+    case SYS_FORK:   return sys_fork();
+    case SYS_WAIT4:  return linux_wait4((int)a0, a1, (int)a2, a3);
     case SYS_EXIT:
       serial_puts("[ring3] task ");
       serial_puts(task_name(task_current()));

@@ -165,6 +165,18 @@
                              * new, -EPERM if you are not the display server. It
                              * takes the rectangle: the caller paints it.       */
 
+#define SYS_SANDBOX     55  /* (const uint64_t *mask, int words) -> 0 | -EINVAL | -EFAULT.
+                             * One bit per syscall number, low bit of word 0 first,
+                             * 1 = allowed. Installing narrows: a second mask is ANDed
+                             * with the first, so a confined task cannot widen its own,
+                             * and every child and thread inherits it. SYS_EXIT is always
+                             * allowed - a sandboxed process has to be able to die. */
+#define SYS_FORK        56  /* (void) -> child pid in the parent, 0 in the child. The
+                             * native door to the same fork the Linux ABI has, so a
+                             * confined process can still start a worker. */
+#define SYS_WAIT4       57  /* (pid, int *status, options, 0) -> pid reaped | -ECHILD.
+                             * Status has wait4's shape: exit code in bits 8-15. */
+
 /* the switch, the gates and the fault handler */
 void     ring3_init(void);
 int      ring3_ready(void);

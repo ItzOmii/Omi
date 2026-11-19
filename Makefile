@@ -285,7 +285,7 @@ userland/ominet.elf: userland/ominet.c userland/fetch.c userland/omilayout.c \
                      userland/glyphs.h userland/roots_user.o
 	$(MAKE) -C userland ominet.elf
 
-$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf userland/tlsget.elf userland/surftest.elf userland/scene.elf userland/comp.elf userland/omirender.elf userland/surfexit.elf userland/ominet.elf userland/vmtest.elf userland/shmtest.elf userland/surfbig.elf userland/unixpair.elf userland/scmtest.elf userland/unixname.elf userland/credtest.elf userland/formtest.elf userland/imgtest.elf userland/memtest.elf
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf userland/tlsget.elf userland/surftest.elf userland/scene.elf userland/comp.elf userland/omirender.elf userland/surfexit.elf userland/ominet.elf userland/vmtest.elf userland/shmtest.elf userland/surfbig.elf userland/unixpair.elf userland/scmtest.elf userland/unixname.elf userland/credtest.elf userland/formtest.elf userland/imgtest.elf userland/memtest.elf userland/sandtest.elf
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -320,6 +320,7 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	@if [ -f userland/epolltest.elf ]; then cp userland/epolltest.elf $(ISO_ROOT)/apps/epolltest.elf; else echo "no epolltest.elf: skipping"; fi
 	@if [ -f userland/memfdtest.elf ]; then cp userland/memfdtest.elf $(ISO_ROOT)/apps/memfdtest.elf; else echo "no memfdtest.elf: skipping"; fi
 	@if [ -f userland/socktest.elf ]; then cp userland/socktest.elf $(ISO_ROOT)/apps/socktest.elf; else echo "no socktest.elf: skipping"; fi
+	@if [ -f userland/sandtest.elf ]; then cp userland/sandtest.elf $(ISO_ROOT)/apps/sandtest.elf; else echo "no sandtest.elf: skipping"; fi
 	@if [ -f userland/tlsget.elf ]; then cp userland/tlsget.elf $(ISO_ROOT)/apps/tlsget.elf; else echo "no tlsget.elf: skipping"; fi
 	@if [ -f userland/surftest.elf ]; then cp userland/surftest.elf $(ISO_ROOT)/apps/surftest.elf; else echo "no surftest.elf: skipping"; fi
 	@if [ -f userland/scene.elf ]; then cp userland/scene.elf $(ISO_ROOT)/apps/scene.elf; else echo "no scene.elf: skipping"; fi
