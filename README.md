@@ -14,7 +14,7 @@ the browser, audio, a disk — happened here.
 
 By the numbers, measured from the tree: **36,272 lines** of first-party kernel C (plus 20,829 lines
 of headers), **8,391 lines** of user-mode C, **104,115 lines** of vendored BearSSL and Gumbo, and
-**48 native syscalls** in front of the Linux ABI. A stock boot prints **334 `ok` lines** in the
+**51 native syscalls** in front of the Linux ABI. A stock boot prints **334 `ok` lines** in the
 serial log.
 
 ---
@@ -125,10 +125,20 @@ with specific properties. Here is the honest ledger, in the order the work has t
    from outside: 19 sampled frames of its output, the server's background in 78% of each, three
    cascading title bars at x = 239, 285, 331 with widths 326, 386 and 446 (the windows are 320, 380
    and 440 wide), window pixels underneath them, and a sweep along the bottom edge that moves from
-   frame to frame. What is left is the stacking and the plumbing: several rectangles instead of one
-   claim, input routed to the server rather than to the kernel's shell, a window list so surfaces
-   are not the only way to be a window, and the kernel keeping nothing but the framebuffer, the page
-   tables and the scanout.
+   frame to frame.
+
+   Input went the same way. `SYS_INPUT_TAKE` hands one process the keyboard and pointer and the
+   shell stops routing; `SYS_INPUT_POLL` gives the server events as four ints (move, down, up, key,
+   wheel); `SYS_WIN_INPUT` is how it delivers one to a window afterwards. So the server hit-tests
+   against the geometry it drew last frame, decides who has focus, draws the pointer itself and
+   paints the focused window's title bar differently - none of which the kernel knows about any
+   more. Verified end to end, from outside: click the browser's address bar, type and press Enter,
+   and the browser's own log says `[net] typed -> example.com` while the page area fills with
+   example.com's text. The keystroke the machine acted on passed through the server, and the shell
+   never saw it. What is left is the stacking and the plumbing: several rectangles instead of one
+   claim, a window list so a window without a surface can still be a window, window furniture the
+   server owns outright (the drag, the resize edge, the close box) rather than draws, and the kernel
+   keeping nothing but the framebuffer, the page tables and the scanout.
 2. **More than one core.** Done — four cores, three APs, per-CPU scheduling.
 3. **A sandbox.** No seccomp, no namespaces, no capability model. Chromium's security posture
    assumes the platform takes something away from a renderer; here nothing is taken away, so a

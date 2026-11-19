@@ -4697,6 +4697,80 @@ static uint64_t fwin_click_tick;
 static int      fwin_click_x, fwin_click_y;
 static int fwin_lastx = -1, fwin_lasty = -1;
 
+static fwin_t *fwin_find(int id);
+static void fwin_push(fwin_t *f, int32_t kind, int32_t x, int32_t y, int32_t code);
+
+/* ---- raw input: the keyboard and pointer, for a display server ----------- */
+/* The kernel's shell routes input itself - hit test, focus, push to the window
+ * under the pointer. A display server has to do all of that, so it asks for the
+ * events instead and the shell stands down. One owner at a time, and a server
+ * that dies gives the keyboard back the way a dead scene owner gives back the
+ * screen: otherwise the machine ends up with a desktop nobody can type at. */
+#define INPUT_Q  64
+#define IN_MOVE  1
+#define IN_DOWN  2
+#define IN_UP    3
+#define IN_KEY   4
+#define IN_WHEEL 5
+
+static int     input_owner_pid;
+static int32_t input_q[INPUT_Q][4];
+static int     input_head, input_tail;
+static int     input_last_x = -1, input_last_y = -1;
+
+static void input_push(int32_t kind, int32_t a, int32_t b, int32_t c) {
+  int next = (input_head + 1) % INPUT_Q;
+  if (next == input_tail) return;            /* full: drop it, the server is behind */
+  input_q[input_head][0] = kind;
+  input_q[input_head][1] = a;
+  input_q[input_head][2] = b;
+  input_q[input_head][3] = c;
+  input_head = next;
+}
+
+int gui_input_take(int on) {
+  int me = (int)task_current();
+  if (!on) {
+    if (input_owner_pid == me) input_owner_pid = 0;
+    return 0;
+  }
+  if (input_owner_pid && input_owner_pid != me) return 0;
+  input_owner_pid = me;
+  input_head = input_tail = 0;
+  input_last_x = input_last_y = -1;
+  serial_puts("[input] raw input goes to pid ");
+  serial_puthex((uint64_t)me);
+  serial_puts(": the shell stops routing\n");
+  return 1;
+}
+
+int gui_input_poll(int32_t *out, int max) {
+  if (input_owner_pid != (int)task_current()) return -1;
+  int n = 0;
+  while (n < max && input_tail != input_head) {
+    for (int k = 0; k < 4; k++) out[n * 4 + k] = input_q[input_tail][k];
+    input_tail = (input_tail + 1) % INPUT_Q;
+    n++;
+  }
+  return n;
+}
+
+void gui_input_owner_exited(int pid) {
+  if (input_owner_pid != pid) return;
+  input_owner_pid = 0;
+  input_head = input_tail = 0;
+  serial_puts("[input] owner exited: the shell has the keyboard again\n");
+}
+
+/* The server's other half: it decides which window an event belongs to, and
+ * this is how it says so. */
+int winipc_input_push(int id, int32_t kind, int32_t x, int32_t y, int32_t code) {
+  fwin_t *f = fwin_find(id);
+  if (!f) return -1;
+  fwin_push(f, kind, x, y, code);
+  return 0;
+}
+
 static void fwin_push(fwin_t *f, int32_t kind, int32_t x, int32_t y, int32_t code) {
   int next = (f->ev_head + 1) % WINIPC_EVQ;
   if (next == f->ev_tail) return;              /* queue full: drop, oldest stays */
@@ -5677,6 +5751,14 @@ static void keyboard_callback(int key) {
   needs_redraw = 1;
 
 
+  /* A display server takes the keystrokes and decides which window they were
+   * for; the shell's own key handling is only for when nobody is serving. */
+  if (input_owner_pid) {
+    int mods = (kb_shift_down() ? 1 : 0) | (kb_ctrl_down() ? 2 : 0);
+    input_push(IN_KEY, key, mods, 0);
+    return;
+  }
+
   /* keys belong to a focused ring-3 window first */
   if (winipc_key(key)) return;
   
@@ -6259,6 +6341,21 @@ static void gui_poll_input(void) {
   
   mouse_x = new_x;
   mouse_y = new_y;
+
+  /* A display server owns the pointer now: it hit-tests, it decides who has
+   * focus, and it delivers the event to a window itself. Nothing below this
+   * point may see the click - the shell's own windows are not on the screen. */
+  if (input_owner_pid) {
+    if (new_x != input_last_x || new_y != input_last_y) {
+      input_push(IN_MOVE, new_x, new_y, 0);
+      input_last_x = new_x; input_last_y = new_y;
+    }
+    if (left_press)   input_push(IN_DOWN, new_x, new_y, 1);
+    if (left_release) input_push(IN_UP, new_x, new_y, 1);
+    if (wheel)        input_push(IN_WHEEL, new_x, new_y, wheel);
+    prev_buttons = buttons;
+    return;
+  }
 
   /* A foreign window that owns the pointer consumes the click: the built-in
    * apps and the desktop never see it. */

@@ -2883,6 +2883,7 @@ static void r3_exit_now(uint64_t code) {
    * test can see both the exit and the reaping in one place. */
   winipc_close_owned((int)task_current());
   scene_owner_exit((int)task_current());
+  gui_input_owner_exited((int)task_current());
 
   serial_puts("[ring3] task ");
   serial_puts(task_name(task_current()));
@@ -4094,6 +4095,23 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
       return (long)(((pmm_total_pages() & 0xFFFFFFFFu) << 32) | (pmm_free_pages() & 0xFFFFFFFFu));
     case SYS_WIN_PRESENT: winipc_present((int)a0); return 0;
     case SYS_WIN_CLOSE:   winipc_close((int)a0); return 0;
+    case SYS_INPUT_TAKE:  return (long)gui_input_take((int)a0);
+    case SYS_INPUT_POLL: {
+      int32_t ev[4 * 32];
+      int max = (int)a1;
+      if (max <= 0 || max > 32) max = 32;
+      int n = gui_input_poll(ev, max);
+      if (n < 0) return -EPERM;               /* not the input owner */
+      if (n && user_put(a0, ev, (uint64_t)n * sizeof(int32_t) * 4) != 0) return -EFAULT;
+      return n;
+    }
+    case SYS_WIN_INPUT: {
+      /* Four ints, kind/x/y/code, the same shape the server polls them in. */
+      int32_t ev[4];
+      if (user_get(a1, ev, sizeof ev) != 0) return -EFAULT;
+      return (long)winipc_input_push((int)a0, ev[0], ev[1], ev[2], ev[3]);
+    }
+
   }
   serial_puts("[ring3] unknown syscall ");
   serial_puthex(num);

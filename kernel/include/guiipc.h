@@ -158,6 +158,12 @@ void     surf_release_window(int win_id);
 int  winipc_input(int mx, int my, int buttons, int pressed, int released, int wheel);
 int  winipc_key(int key);           /* 1 = consumed by the focused window */
 int  winipc_poll(int id, win_event_t *out);   /* 1 = event copied, 0 = empty */
+/* Raw input, for a display server: one process at a time takes the keyboard and
+ * pointer off the kernel's shell and gets the events itself. */
+int  gui_input_take(int on);                  /* 1 = this task owns raw input */
+int  gui_input_poll(int32_t *out, int max);   /* events copied, four ints each */
+void gui_input_owner_exited(int pid);         /* a dead server gives it back */
+int  winipc_input_push(int id, int32_t kind, int32_t x, int32_t y, int32_t code);
 int  winipc_focused(void);          /* window id with keyboard focus, or 0 */
 
 /* The process asks for its own geometry, or changes it. Bounds are clamped by

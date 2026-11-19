@@ -13,6 +13,11 @@
  * what this program does not have - input, and window furniture that belongs to
  * the server rather than to whoever owns the window.
  *
+ * It also takes the raw input: the kernel's shell stops routing keys and clicks
+ * and hands the events over, and this process hit-tests them against what it
+ * drew last frame, decides who has focus, and delivers each event to a window
+ * (SYS_WIN_INPUT). That is the other half of being a display server.
+ *
  * It waits for whoever had the screen to give it back (SYS_SCENE_HANDOFF(-1)
  * asks who that is) so it can be a second owner in the same boot instead of
  * fighting scene over the display.
@@ -29,12 +34,30 @@
 #define SYS_SCENE_HANDOFF 45
 #define SYS_SURF_MAP      47
 #define SYS_SURF_LIST     48
+#define SYS_INPUT_TAKE    49   /* (on) -> 1 this process owns the keyboard and pointer */
+#define SYS_INPUT_POLL    50   /* (int32_t out[], max) -> count, kind/a/b/c each */
+#define SYS_WIN_INPUT     51   /* (win, int32_t ev[4]) -> 0 delivered, -1 no window */
 
 #define MAXWIN 8
 #define BG      0x00101828u   /* the server's own desktop */
 #define TITLE   0x00B03050u   /* furniture it draws itself */
 #define EDGE    0x00E0E8F0u
 #define SWEEP   0x00FFFFFFu
+#define FOCUS   0x00E05070u   /* a title bar the server considers focused */
+#define CURSOR  0x00FFFFFFu
+
+#define IN_MOVE  1
+#define IN_DOWN  2
+#define IN_UP    3
+#define IN_KEY   4
+#define IN_WHEEL 5
+
+#define EV_MOVE   1
+#define EV_DOWN   2
+#define EV_UP     3
+#define EV_KEY    4
+#define EV_CLOSE  5
+#define EV_WHEEL  6
 
 static long sys1(long n, long a) {
   long r;
@@ -94,7 +117,34 @@ struct win {
   int      id;
   uint32_t *px;
   long     w, h, stride;
+  long     x, y;          /* where the last frame put it */
 };
+
+/* The server's own idea of the scene, kept from the last frame: input is
+ * handled against this before the new frame is painted, the way a compositor
+ * with a scene graph hit-tests against what it drew most recently. */
+static struct win g_win[MAXWIN];   /* the scene graph, filled by the paint loop */
+static int        g_live[MAXWIN];     /* ids in draw order, topmost last */
+static int        g_nlive;
+static int        g_focus;            /* window id, 0 = none */
+static long       g_mx = 640, g_my = 400;
+static int        g_have_mouse;
+
+/* Which window is under a point, topmost first. */
+static int hit(long x, long y) {
+  for (int i = g_nlive - 1; i >= 0; i--) {
+    struct win *w = 0;
+    for (int k = 0; k < MAXWIN; k++) if (g_win[k].id == g_live[i]) { w = &g_win[k]; break; }
+    if (!w) continue;
+    if (x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h) return w->id;
+  }
+  return 0;
+}
+
+static struct win *byid(int id) {
+  for (int k = 0; k < MAXWIN; k++) if (g_win[k].id == id) return &g_win[k];
+  return 0;
+}
 
 int main(void) {
   /* The scene has one owner at a time, so a second display server starts by
@@ -125,11 +175,66 @@ int main(void) {
   sys1(SYS_SCENE_HANDOFF, 1);
   printf("[comp] the screen is this process's; the kernel paints nothing\n");
 
-  static struct win cache[MAXWIN];
+  struct win *cache = g_win;   /* the one table: the paint loop fills it, input reads it */
   int frames = 0, mapped_total = 0;
   int worst = -1, bad_geom = 0;
 
-  for (int f = 0; f < 700; f++) {            /* ~40 s at 60 ms */
+  long got = sys1(SYS_INPUT_TAKE, 1);
+  printf("[comp] input: %s\n", got ? "the keyboard and pointer are this process's"
+                                    : "refused - somebody else is serving");
+  int keys = 0, clicks = 0, fwd = 0, refused = 0, moves = 0;
+
+  for (int f = 0; f < 3000; f++) {           /* ~3 min at 60 ms */
+    /* First the events, against the geometry of the frame that is on screen. */
+    int32_t ev[4 * 32];
+    int ne = (int)sys3(SYS_INPUT_POLL, (long)ev, 32, 0);
+    for (int e = 0; e < ne; e++) {
+      int32_t kind = ev[e * 4 + 0], a = ev[e * 4 + 1], b = ev[e * 4 + 2], c = ev[e * 4 + 3];
+      int32_t out[4];
+      if (kind == IN_MOVE) {
+        g_mx = a; g_my = b; g_have_mouse = 1;
+        if ((moves++ % 25) == 0) printf("[comp] move %ld,%ld\n", g_mx, g_my);
+        int id = hit(g_mx, g_my);
+        struct win *w = id ? byid(id) : 0;
+        if (w) {
+          out[0] = EV_MOVE; out[1] = (int32_t)(g_mx - w->x); out[2] = (int32_t)(g_my - w->y); out[3] = 0;
+          sys3(SYS_WIN_INPUT, id, (long)out, 0);
+        }
+      } else if (kind == IN_DOWN) {
+        g_mx = a; g_my = b; g_have_mouse = 1;
+        int id = hit(g_mx, g_my);
+        g_focus = id;
+        struct win *w = id ? byid(id) : 0;
+        if (w) {
+          out[0] = EV_DOWN; out[1] = (int32_t)(g_mx - w->x); out[2] = (int32_t)(g_my - w->y); out[3] = 1;
+          long dr = sys3(SYS_WIN_INPUT, id, (long)out, 0);
+          if (dr == 0) fwd++;
+          clicks++;
+          printf("[comp]   delivered: %s%ld\n", dr == 0 ? "yes" : "kernel said ", dr == 0 ? 0 : dr);
+        }
+        if (id) printf("[comp] click %ld,%ld -> win %d, focus\n", g_mx, g_my, id);
+        else    printf("[comp] click %ld,%ld -> no window, focus dropped\n", g_mx, g_my);
+      } else if (kind == IN_UP) {
+        struct win *w = g_focus ? byid(g_focus) : 0;
+        if (w && sys3(SYS_WIN_INPUT, g_focus, (long)(int32_t[4]){EV_UP,
+                (int32_t)(g_mx - w->x), (int32_t)(g_my - w->y), 0}, 0) == 0) fwd++;
+      } else if (kind == IN_KEY) {
+        struct win *w = g_focus ? byid(g_focus) : 0;
+        if (w) {
+          out[0] = EV_KEY; out[1] = b; out[2] = 0; out[3] = a;   /* x = mods, code = key,
+                                                       * the shape fwin_push uses */
+          if (sys3(SYS_WIN_INPUT, g_focus, (long)out, 0) == 0) { fwd++; keys++; }
+        } else refused++;
+        printf("[comp] key %d -> %s%d\n", a, g_focus ? "win " : "nobody (", g_focus);
+      } else if (kind == IN_WHEEL) {
+        struct win *w = g_focus ? byid(g_focus) : 0;
+        if (w) {
+          out[0] = EV_WHEEL; out[1] = (int32_t)(g_mx - w->x); out[2] = (int32_t)(g_my - w->y); out[3] = c;
+          sys3(SYS_WIN_INPUT, g_focus, (long)out, 0);
+        }
+      }
+    }
+
     int32_t list[3 * MAXWIN];
     int n = (int)sys3(SYS_SURF_LIST, (long)list, MAXWIN, 0);
     rect(0, 0, sw, sh, BG);
@@ -161,11 +266,22 @@ int main(void) {
 
       /* Furniture first: the server draws the frame, the client draws the
        * contents. That split is what makes the title bar the server's to move. */
-      if (y > 24) rect(x - 3, y - 22, g[2] + 6, 22, TITLE);
+      if (y > 24) rect(x - 3, y - 22, g[2] + 6, 22, win == g_focus ? FOCUS : TITLE);
       rect(x - 3, y - 3, g[2] + 6, g[3] + 6, EDGE);
       blit(w->px, w->stride, w->w, w->h, x, y);
+      w->x = x; w->y = y;
+      g_live[drawn] = win;
       drawn++;
       if (y > worst) worst = (int)y;
+    }
+
+    g_nlive = drawn;
+    /* The pointer, drawn by the server: the kernel's cursor stood down with the
+     * rest of its shell. A crosshair, because a screenshot has to be able to
+     * find it without knowing what an arrow looks like. */
+    if (g_have_mouse) {
+      rect(g_mx - 7, g_my, 15, 2, CURSOR);
+      rect(g_mx, g_my - 7, 2, 15, CURSOR);
     }
 
     /* A sweep along the bottom: whatever is on the screen is this frame's. */
@@ -177,8 +293,10 @@ int main(void) {
     ms(60);
   }
 
-  printf("[comp] %d frames, %d windows mapped, worst geometry errors %d\n",
-         frames, mapped_total, bad_geom);
+  printf("[comp] %d frames, %d windows mapped, geometry errors %d, "
+         "clicks %d forwarded, keys %d forwarded, %d with no focus\n",
+         frames, mapped_total, bad_geom, clicks, fwd, refused);
+  sys1(SYS_INPUT_TAKE, 0);
   sys1(SYS_SCENE_HANDOFF, 0);
   printf("[comp] gave the screen back; the kernel repaints\n");
   return 0;

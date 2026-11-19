@@ -149,6 +149,11 @@
 #define SYS_SURF_MAP     47  /* (win, int32_t out[3]) -> read-only base address, 0 = fail
                               * out = w, h, stride. Another process's window pixels. */
 #define SYS_SURF_LIST    48  /* (int32_t out[], max) -> count, triples of win,w,h */
+#define SYS_INPUT_TAKE   49  /* (int on) -> 1 this process now owns raw input, 0 not */
+#define SYS_INPUT_POLL   50  /* (int32_t out[], max) -> count; four ints per event:
+                              * kind, a, b, c. 1 move, 2 down, 3 up, 4 key, 5 wheel. */
+#define SYS_WIN_INPUT    51  /* (win, int32_t ev[4] = kind,x,y,code) -> 0 delivered,
+                              * -1 no such window: the server routes an event to a window */
 #define SYS_SCENE_OWN    46  /* (x,y), (w,h) -> 0: a rect the kernel keeps out of
                               * Its own blits. 0,0 clears the claim.         */
 
