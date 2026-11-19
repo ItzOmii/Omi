@@ -100,8 +100,9 @@ with specific properties. Here is the honest ledger, in the order the work has t
 - Shared memory (64 regions, 16 MB each, refcounted) and descriptor passing over Unix sockets —
   i.e. renderer-to-browser IPC's two prerequisites.
 - A real TLS stack above a real TCP stack, with keep-alive.
-- More than one core: four cores online, three application processors started and scheduled per
-  CPU, so threads are no longer pinned to one processor.
+- More than one core: every processor the firmware describes comes online with a stack and a
+  schedule of its own, so threads are no longer pinned to one processor - four cores here, sixteen
+  when the same ISO is booted with sixteen, because the count comes out of the MADT.
 
 **Missing, in the order it blocks progress.**
 1. **A userspace compositor** with client-owned buffers and damage-limited redraw. **Done**, with
@@ -170,7 +171,28 @@ with specific properties. Here is the honest ledger, in the order the work has t
    discovers windows through their surfaces (`SYS_SURF_LIST`), so a window exists for it only once
    there are pixels to composite - there is no window list independent of the buffers. The kernel is
    out of the pixel business, but it is still the only thing that knows a window was opened.
-2. **More than one core.** Done — four cores, three APs, per-CPU scheduling.
+2. **More than one core.** Done, and the number is not a constant. Cores are discovered from the
+   ACPI MADT - every enabled LAPIC entry and every enabled x2APIC entry - and each one is given a
+   stack of its own, per-CPU state, and a scheduler that can run it. `SMP_MAX_CPUS` is 32, so a
+   machine with sixteen cores brings up sixteen; four is what the machine this was developed on has
+   (an i5-6500: four cores, three application processors beside the bootstrap one).
+
+   Verified at sixteen, not just at four: the same ISO booted in QEMU with `-smp 16` prints
+   `[smp] cpus=0x10 of 0x10`, `started 0xF of 0xF application processors`, and then fifteen pinned
+   workers each reporting `ran_on` its own APIC id - one per core, each core running its own thread.
+   Nothing in that path counts to three.
+
+   What sixteen cores did expose is not the CPU path but the task table. `TASK_MAX` is 96 and slots
+   are never reused - a task takes `tasks[ntasks]` and the counter only grows, 16 KB of stack each -
+   so a sixteen-core boot spends 31 slots on per-CPU tasks (sixteen idle, fifteen workers) before the
+   first test runs, and then the boot starts printing `[task] no free slot (TASK_MAX)`: 24 failed
+   spawns, twelve suites red, where a four-core boot is green. The CPUs are fine at sixteen; the
+   scheduler's task table is sized like a four-core machine.
+
+   And the per-CPU state is indexed by APIC id rather than by a dense index, so a core the firmware
+   numbers 32 or higher claims no slot and falls back to the bootstrap processor's - harmless when
+   the ids are 0 to 15, and a shared accounting slot on a dual-socket machine (ids 0-15 and 32-47).
+   x2APIC itself is handled; that indexing is the thing to fix before claiming bigger iron.
 3. **A sandbox.** No seccomp, no namespaces, no capability model. Chromium's security posture
    assumes the platform takes something away from a renderer; here nothing is taken away, so a
    renderer that is compromised *is* the machine.
@@ -194,8 +216,11 @@ next year.
 - **The disk is a first step, not a filesystem.** One PIO drive on the primary channel, no
   partitions, no NVMe, no directories, 32 files of 64 KB, and a bump allocator instead of a free
   list. A torn write is caught by the superblock checksum and answered by reformatting.
-- **No GPU.** Four cores are online and scheduled per CPU, but every pixel is composed on the
-  processor; there is no accelerator of any kind.
+- **No GPU.** Every pixel is composed on the processor; there is no accelerator of any kind.
+
+- **The task table does not scale with the cores.** `TASK_MAX` is 96, slots are allocated by a
+  counter that never goes down, and each core costs two before any program runs - so sixteen cores
+  fill it during the boot, while four leaves room. A leak in the shape of a policy limit.
 - **The compositor's damage is rectangles, not a scene graph.** It repaints the changed rectangles
   and nothing else, but it has no idea what is inside them: a patch that overlaps three windows
   repaints all three, and a window that grows by one pixel repaints its whole frame. There is no
