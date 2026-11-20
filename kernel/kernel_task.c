@@ -287,6 +287,13 @@ static void wake_deadlines(void);
 ctx_t *sched_tick(ctx_t *frame) {
   __atomic_add_fetch(&total_ticks, 1, __ATOMIC_RELAXED);
 
+  /* Where a user task was when the tick hit. A task that spins without
+   * making a syscall leaves no other trace of itself. */
+  if (frame && cur > 0 && cur < ntasks && (frame->cs & 3) == 3) {
+    tasks[cur].sample_rip = frame->rip;
+    tasks[cur].sample_rsp = frame->rsp;
+  }
+
   /* Sample every core from the one place that already runs at a known rate.
    * Windows Task Manager's per-core graph is a sampling profiler too; the only
    * difference is it gets a hardware counter and we count ticks. */
@@ -336,6 +343,46 @@ void task_yield(void) {
  * task_tick(), which nothing ever called - the real timer path is sched_tick(),
  * so a futex timeout was decoration and a wake that raced its block hung the
  * thread for good. It runs from the timer now, once per tick. */
+extern void serial_puthex(uint64_t v);
+
+/* A futex wait nobody wakes hangs a thread with no trace of itself: no fault,
+ * no output, no syscall. When one goes stale, dump the table once - each task's
+ * state, the address it waits on, and where the tick last caught it in ring 3.
+ * That is how the 32-bit futex comparison bug was found: the waiter's expected
+ * value and the address were the whole story. DEV builds only, because a test
+ * that parks a thread on purpose trips it. */
+static uint64_t stale_since[64];
+static int stale_dumped[64];
+__attribute__((unused)) static void stale_wait_check(void) {
+  for (int i = 1; i < ntasks && i < 64; i++) {
+    task_t *t = &tasks[i];
+    if (t->name[0] != 'v' || t->name[1] != '8' ||
+        t->state != TASK_BLOCKED || !t->wait_addr || t->wake_at) {
+      stale_since[i] = 0;
+      continue;
+    }
+    if (!stale_since[i]) stale_since[i] = total_ticks;
+    if (stale_dumped[i] || total_ticks - stale_since[i] < 3 * TASK_TICK_HZ) continue;
+    stale_dumped[i] = 1;
+    serial_puts("[hang] futex wait stale, tasks:\n");
+    for (int j = 1; j < ntasks && j < 64; j++) {
+      serial_puts("  ");
+      serial_puts(tasks[j].name);
+      serial_puts(" state=");
+      serial_puthex(tasks[j].state);
+      serial_puts(" wait=");
+      serial_puthex(tasks[j].wait_addr);
+      serial_puts(" wake_at=");
+      serial_puthex(tasks[j].wake_at);
+      serial_puts(" rip=");
+      serial_puthex(tasks[j].sample_rip);
+      serial_puts(" rsp=");
+      serial_puthex(tasks[j].sample_rsp);
+      serial_puts("\n");
+    }
+  }
+}
+
 static void wake_deadlines(void) {
   /* A blocked thread with a deadline wakes itself when the tick passes. Doing
    * it here, on the timer, is what keeps a missed futex wake from hanging a
@@ -348,6 +395,9 @@ static void wake_deadlines(void) {
     tasks[i].timed_out = 1;
     tasks[i].state = TASK_READY;
   }
+#if OMI_DEV_BOOT
+  stale_wait_check();
+#endif
 }
 
 void task_sleep_ticks(uint64_t ticks) {

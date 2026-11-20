@@ -35,12 +35,15 @@
  * couple of dozen children would have run into this rather than into anything it
  * could see. The socketpair test found it at seventeen pairs. */
 #define OFILE_MAX    512
-/* Slots, not bytes: each one is ~56 bytes of static table. The boot medium
- * carries 24 modules and three RAM files are seeded on top, so 24 was exactly
- * full the day a shared library and its loader joined the ISO - and the three
- * files that did not fit were the last ones listed, which is how a library
- * becomes silently unopenable. */
-#define RFILE_MAX    48
+/* Slots, not bytes: each one is ~56 bytes of static table. Every boot module
+ * takes one, and three RAM files are seeded on top, so this number has to stay
+ * ahead of what limine.conf lists. It was 24 when the medium carried 24 modules
+ * and the three files that did not fit were the last ones listed - which is how
+ * a shared library becomes silently unopenable, and how `dyntest` reports a
+ * missing symbol when the real problem is a full table. 48 then became the same
+ * wall: the ISO is at 51 modules, so adding two test programs pushed
+ * `/lib/libgreet.so` off the end. Kept at twice the current module count. */
+#define RFILE_MAX    112
 #define RFILE_NAME   32
 #define RFILE_CAP   4096
 

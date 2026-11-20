@@ -54,6 +54,8 @@ swap to. Adding it belongs with SMP, not before.
 | 2,3,8 | open, close, lseek | `open`'s mode argument ignored |
 | 9,11 | mmap, munmap | anonymous, file-backed `MAP_PRIVATE`, or `MAP_SHARED` over a shared file or of anonymous memory; `MAP_FIXED` replaces exactly the range it names, splitting what it lands inside; `MAP_SHARED` over a read-only boot module is `-ENOSYS`; `MAP_SHARED` together with `MAP_PRIVATE` is `-EINVAL` |
 | 10 | mprotect | per-area `PROT_*` bits plus live PTEs; `PROT_NONE` releases the pages, and a range spanning several areas takes each area's intersection |
+| 11 | munmap | whatever the range covers: each overlapping area takes its intersection, a fully covered area goes, a partly covered one is trimmed at the front or back. A range outside the user window is `-EINVAL`; a range covering nothing succeeds, as on Linux. One record per area cannot express a *split*, so a hole in the middle releases the pages but keeps the record - the span reads as zeroes instead of faulting |
+| 28 | madvise | `MADV_DONTNEED` and `MADV_FREE` release the pages through `vm_release_range`, so the next touch faults in a zero page. The hints (`NORMAL`, `RANDOM`, `SEQUENTIAL`, `WILLNEED`, `DONTFORK`, `DONTDUMP`, `HUGEPAGE`, `NOHUGEPAGE`, `COLD`) are accepted and do nothing - Linux's contract for them is that they are hints. Anything else is `-EINVAL` |
 | 12 | brk | one lazily-populated 16 MB area, pointer moved inside it |
 | 16 | ioctl | `TCGETS`/`TIOCGWINSZ` only |
 | 20 | writev | loops `write`; a partial write is a success |
@@ -209,6 +211,15 @@ lies had to go:
 - **`CLONE_CHILD_CLEARTID`.** `pthread_join` waits on a futex word that the
   dying thread zeroes and wakes. A kernel that never clears it makes join hang
   for ever, which looks like a scheduler bug and is not one.
+- **A futex word is 32 bits wide and nothing else.** musl's `LOCK()` packs a
+  sign bit and a congestion count into an `int`, and hands the expected value to
+  the kernel in a 64-bit register - sign-extended, so a contended lock waits with
+  `0xFFFFFFFF80000000`. Comparing that against an eight-byte read can never
+  match: the word's upper half is zero and the expected upper half is all ones,
+  so the wait returns `-EAGAIN`, musl retries, and the lock spins for ever with
+  no syscall to show for it. Compare the low 32 bits. `userland/handoff.c` is the
+  test that catches it - 2000 rounds of `sem_post`/`sem_wait` between two
+  threads - and it hung at fewer than 200 before the fix.
 
 `userland/muslthreads.c` is the test, and it is written so each failure is
 visible: four threads increment a `__thread` counter and a mutex-guarded shared

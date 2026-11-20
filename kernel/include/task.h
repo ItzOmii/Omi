@@ -233,6 +233,12 @@ typedef struct {
    * the mask is a property of the code that is running. */
   int      sbx_on;
   uint64_t sbx[4];
+  /* Where the tick last caught this task in ring 3. Sampling costs one store on
+   * a path that already runs at 100 Hz, and it is the only evidence a spinning
+   * or wedged thread leaves. Appended, never inserted: the syscall stubs and
+   * anything else that reaches into this struct sees the same prefixes. */
+  uint64_t sample_rip;
+  uint64_t sample_rsp;
 } task_t;
 
 void task_init(void);

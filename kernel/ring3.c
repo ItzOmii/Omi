@@ -1320,27 +1320,39 @@ static long sys_vm_free(uint64_t addr, uint64_t len) {
   if (!t || !t->mm || len == 0) return -EINVAL;
   uint64_t base = addr & ~0xFFFULL;
   len = (len + 0xFFF) & ~0xFFFULL;
+  uint64_t end = base + len;
+  /* Linux munmaps whatever is mapped in the range and succeeds even if that is
+   * nothing at all; only a range outside the address space is an error. V8 frees
+   * reservations that do not line up with the way this kernel splits areas (a
+   * 128 MB code range can arrive as several), so containment in one area is not
+   * a requirement. */
+  if (base < RING3_USER_MIN || end > RING3_LIMIT) return -EINVAL;
 
   for (int i = 0; i < TASK_AREAS; i++) {
     vm_area_t *a = &t->mm->areas[i];
     if (!a->used) continue;
-    if (base < a->base || base + len > a->base + a->len) continue;
+    uint64_t ahi = a->base + a->len;
+    uint64_t lo = base > a->base ? base : a->base;
+    uint64_t hi = end < ahi ? end : ahi;
+    if (lo >= hi) continue;
 
     uint64_t kept = 0;
-    uint64_t freed = vm_release_range(t, base, len, &kept);
-    serial_puts("[vm] released ");
-    serial_puthex(freed);
-    serial_puts(" pages (");
-    serial_puthex(kept);
-    serial_puts(" kept: another space still maps them), ");
-    serial_puthex(pmm_free_pages());
-    serial_puts(" free of ");
-    serial_puthex(pmm_total_pages());
-    serial_puts("\n");
-    if (base == a->base && len >= a->len) area_release(a);
-    return 0;
+    vm_release_range(t, lo, hi - lo, &kept);
+
+    if (lo == a->base && hi == ahi) {
+      area_release(a);
+    } else if (lo == a->base) {
+      a->base = hi;                         /* trimmed from the front */
+      a->len = ahi - hi;
+    } else if (hi == ahi) {
+      a->len = lo - a->base;                /* trimmed from the back */
+    } else {
+      /* A hole in the middle. One record per area cannot express a split, so
+       * the pages go but the record stays: the span reads as zeroes afterwards
+       * instead of faulting. Written down in docs/linux-abi.md. */
+    }
   }
-  return -EINVAL;                          /* no region covers that range */
+  return 0;
 }
 
 /* ------------------------------------------------------ threads and futexes */
@@ -1828,8 +1840,14 @@ static long sys_futex(uint64_t addr, uint64_t op, uint64_t val, uint64_t timeout
   if (addr < RING3_USER_MIN || addr + 8 > RING3_LIMIT) return -EFAULT;
 
   if ((op & 0x7F) == FUTEX_WAIT) {
-    volatile long *word = (volatile long *)(uintptr_t)addr;
-    if ((uint64_t)*word != val) return -EAGAIN;
+    /* The futex word is 32 bits, always: musl's __lock packs a sign bit and a
+     * congestion count into an int, and passes the expected value sign-extended
+     * to 64. Comparing eight bytes against that sign-extended long can never
+     * match - upper half zero, expected upper half all ones - so every
+     * contended __lock (futex value negative) got -EAGAIN, retried, and spun
+     * for ever. A 32-bit compare is what Linux's futex contract specifies. */
+    volatile int *word = (volatile int *)(uintptr_t)addr;
+    if ((uint32_t)*word != (uint32_t)val) return -EAGAIN;
 
     /* Publish the wait, then re-read before actually blocking. On a
      * uniprocessor these two steps cannot be interleaved - the CPU is inside a
@@ -1842,7 +1860,7 @@ static long sys_futex(uint64_t addr, uint64_t op, uint64_t val, uint64_t timeout
     t->wait_addr = addr;
     t->wait_mm = t->mm;
     t->timed_out = 0;
-    if ((uint64_t)*word != val) {
+    if ((uint32_t)*word != (uint32_t)val) {
       t->wait_addr = 0;
       t->wait_mm = 0;
       return -EAGAIN;
@@ -3652,6 +3670,68 @@ static long linux_mprotect(uint64_t addr, uint64_t len, uint64_t prot) {
   return hit ? 0 : -ENOMEM;      /* Linux says ENOMEM for an unmapped range */
 }
 
+/* madvise is how V8's GC hands pages back: it releases a span of dead objects
+ * with MADV_DONTNEED (or MADV_FREE, which Linux may treat the same way) and
+ * expects a zero-filled page the next time it touches the range. Omi's VM has
+ * exactly that primitive - vm_release_range drops the frames, so the next access
+ * faults a fresh zero page in.
+ *
+ * The advisory hints (NORMAL, RANDOM, SEQUENTIAL, WILLNEED, DONTDUMP, DONTFORK,
+ * HUGEPAGE, NOHUGEPAGE, COLD) are about paging policy and readahead, none of which
+ * this kernel does; Linux's own contract for them is that they are hints, so
+ * succeeding without doing anything is the honest answer.
+ *
+ * V8 CHECKs the return value, so ENOSYS here is fatal to the process rather than
+ * a fallback - which is how this was found. */
+#define LINUX_MADV_NORMAL     0
+#define LINUX_MADV_RANDOM     1
+#define LINUX_MADV_SEQUENTIAL 2
+#define LINUX_MADV_WILLNEED   3
+#define LINUX_MADV_DONTNEED   4
+#define LINUX_MADV_FREE       8
+#define LINUX_MADV_DONTFORK   10
+#define LINUX_MADV_DONTDUMP   16
+#define LINUX_MADV_HUGEPAGE   14
+#define LINUX_MADV_NOHUGEPAGE 15
+#define LINUX_MADV_COLD       20
+
+static long linux_madvise(uint64_t addr, uint64_t len, uint64_t advice) {
+  task_t *t = task_at(task_current());
+  if (!t || !t->mm || !len) return -EINVAL;
+  uint64_t base = addr & ~0xFFFULL;
+  uint64_t end = (addr + len + 0xFFF) & ~0xFFFULL;
+
+  switch (advice) {
+  case LINUX_MADV_DONTNEED:
+  case LINUX_MADV_FREE: {
+    int hit = 0;
+    for (int i = 0; i < TASK_AREAS; i++) {
+      vm_area_t *a = &t->mm->areas[i];
+      if (!a->used) continue;
+      uint64_t lo = base > a->base ? base : a->base;
+      uint64_t hi = end < a->base + a->len ? end : a->base + a->len;
+      if (lo >= hi) continue;
+      uint64_t kept = 0;
+      vm_release_range(t, lo, hi - lo, &kept);
+      hit = 1;
+    }
+    return hit ? 0 : -ENOMEM;     /* Linux says ENOMEM for an unmapped range */
+  }
+  case LINUX_MADV_NORMAL:
+  case LINUX_MADV_RANDOM:
+  case LINUX_MADV_SEQUENTIAL:
+  case LINUX_MADV_WILLNEED:
+  case LINUX_MADV_DONTFORK:
+  case LINUX_MADV_DONTDUMP:
+  case LINUX_MADV_HUGEPAGE:
+  case LINUX_MADV_NOHUGEPAGE:
+  case LINUX_MADV_COLD:
+    return 0;
+  default:
+    return -EINVAL;
+  }
+}
+
 #define LINUX_FUTEX_WAIT 0
 #define LINUX_FUTEX_WAKE 1
 #define LINUX_FUTEX_PRIVATE 128
@@ -4137,6 +4217,7 @@ static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, 
               return r; }                                              /* mmap */
     case 10: { long r = linux_mprotect(a0, a1, a2);
                dynmap("mprotect", a0, a1, a2, 0, r); return r; }        /* mprotect */
+    case 28: return linux_madvise(a0, a1, a2);                         /* madvise */
     case 11: { long r = sys_vm_free(a0, a1);
                dynmap("munmap", a0, a1, 0, 0, r); return r; }           /* munmap */
     case 12:  return linux_brk(a0);                        /* brk */
