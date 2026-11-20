@@ -110,7 +110,7 @@
 #define SYS_WIN_CLOSE   10    /* (id)                                  */
 #define SYS_WIN_POLL    11    /* (id, win_event_t*) -> 1 event, 0 none, -1 gone */
 #define SYS_WIN_WAIT    12    /* (id, win_event_t*) -> blocks until an event  */
-#define SYS_WIN_RECT    13    /* (id, x, y, (w<<16)|h) -> resize/move self   */
+#define SYS_WIN_RECT    13    /* (id, x|y<<32, -, (w<<16)|h) -> move/resize self */
 #define SYS_WIN_GEOM    14    /* (id, int32_t out[4]) -> x,y,w,h             */
 #define SYS_SHM_GET     15    /* (slot, pages) -> 0, creates or grows        */
 #define SYS_SHM_ATTACH  16    /* (slot) -> this process's address, or -EINVAL*/

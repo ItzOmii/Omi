@@ -397,6 +397,7 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	@if [ -f userland/atxit.elf ]; then cp userland/atxit.elf $(ISO_ROOT)/apps/atxit.elf; fi
 	@if [ -f userland/handoff.elf ]; then cp userland/handoff.elf $(ISO_ROOT)/apps/handoff.elf; fi
 	@if [ -f userland/skiahello.elf ]; then cp userland/skiahello.elf $(ISO_ROOT)/apps/skiahello.elf; fi
+	@if [ -f userland/skiawin.elf ]; then cp userland/skiawin.elf $(ISO_ROOT)/apps/skiawin.elf; fi
 	@if [ -f userland/v8hello.elf ]; then cp userland/v8hello.elf $(ISO_ROOT)/apps/v8hello.elf; else echo "no v8hello.elf: skipping"; fi
 	@if [ -f userland/surfbig.elf ]; then cp userland/surfbig.elf $(ISO_ROOT)/apps/surfbig.elf; else echo "no surfbig.elf: skipping"; fi
 	@if [ -f userland/unixpair.elf ]; then cp userland/unixpair.elf $(ISO_ROOT)/apps/unixpair.elf; else echo "no unixpair.elf: skipping"; fi

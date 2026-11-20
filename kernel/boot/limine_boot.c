@@ -588,6 +588,8 @@ void _start(void) {
   ring3_spawn_elf("handoff", "handoff.elf", 0);
   /* Skia's CPU backend: shapes, a shader and a PNG encode. */
   ring3_spawn_elf("skia", "skiahello.elf", 0);
+  /* The same raster pipeline, drawing into a window the compositor blits. */
+  ring3_spawn_elf("skiawin", "skiawin.elf", 0);
   /* exit() itself, with threads having existed: the smallest thing that can
    * hang the same way v8hello does. */
   ring3_spawn_elf("surfbig", "surfbig.elf", 0);

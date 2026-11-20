@@ -71,6 +71,49 @@ This Skia is post-refactor and the old recipes do not compile:
   (colours are `SkColor4f`, not `SkColor`)
 - `SkCanvas::flush()` is gone; a raster surface draws immediately.
 
+## On screen
+
+`skiawin.cpp` points the same pipeline at a real window: `SYS_WIN_OPEN`, then
+`SYS_SURF_CREATE` for the window's pixel buffer, then `SkSurfaces::WrapPixels` over
+that buffer. So the chain under test is
+
+    SkCanvas -> Skia's raster pipeline -> the window's shared pages
+             -> SYS_SURF_PRESENT -> the compositor -> the framebuffer
+
+and it is checked at both ends. Inside: read the buffer back at coordinates Skia was
+told to paint and compare the colours. Outside: a QEMU framebuffer dump has to
+contain the one colour nothing else on that screen draws - a four-pixel neon-green
+border - in the right place.
+
+```
+[skiawin] ok   a window opens
+[skiawin] ok   its pixels are a user mapping
+[skiawin] ok   Skia painted into the window
+[skiawin] border=ff39ff14/ff39ff14 block=ff8a2be2
+[skiawin] ok   the marker border is in the window buffer
+[skiawin] ok   a filled block is in the window buffer
+[skiawin] ok   the window moves itself out of the cascade
+[skiawin] placed at 560,31 400x291 - the marker border is at x=560..959, y=31..321
+[skiawin] ok   the surface presents
+```
+
+Measured in the dump: the green border occupies exactly `(560,31)-(959,290)` - 400x260,
+the size of the surface - and the blueviolet block sits at `(590,51)`, which is the
+window origin plus the 30,20 Skia was given. Colours match bit for bit, because Skia's
+N32 is BGRA in memory and that is the word Omi's surfaces carry; had that been wrong
+the red and blue channels would have come back swapped and the checks would say so.
+
+Two API traps worth knowing, both found by this program:
+
+- **`SYS_WIN_RECT` is (id, x|y<<32, -, (w<<16)|h)** - x and y share one argument and
+  the size rides in the *fourth*, which the header comment had wrong. Omi's `int $0x80`
+  door also carries that fourth argument in **r8**, not `r10` where the Linux ABI puts
+  it; a caller using r10 gets a resize to zero and the compositor's clamps (120 wide,
+  screen - 120 tall) instead of an error.
+- **A window's outer height includes the title bar.** A surface of exactly `(W,H)` in a
+  window opened at `(W,H)` gets its bottom 31 rows clipped. Open at `H + 31`, or measure
+  the client area, but do not assume the surface fits.
+
 ## Where this goes next
 
 The engine now draws into memory. Step 7's surface API is the other half: blitting

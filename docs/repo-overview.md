@@ -83,6 +83,9 @@ an application would:
 - `v8hello` — V8 16.0.0 executes JavaScript, exits 0.
 - `skiahello` — Skia rasterises, and the PNG it encodes has the same CRC on Omi as
   on Linux.
+- `skiawin` — Skia draws into a window's own pixel buffer and the compositor puts it
+  on the framebuffer, checked by reading the buffer back and by finding the marker
+  colour at the expected screen coordinates in a framebuffer dump.
 - `atxit`, `handoff` — the two regression tests that came out of the exit bug.
 
 Two applications sit on top: **Omi Net** (fetching, HTML parsing via Gumbo, a real
@@ -144,7 +147,8 @@ follows is that proposal mapped onto what this repository actually contains.
 | 1. Kernel and process foundations | Signals, `mprotect`, `madvise`, `prlimit64`, slot reclamation, exception handling | **Mostly done.** Signals (1–5), `mprotect` (6), slot reclamation (12) and thread lifecycle (13) are implemented and proven from the ISO. `munmap` partial unmapping (7), `madvise` (8) and `prlimit64` (11) are open; `SA_RESTART` restart semantics, stop/continue and `si_pid` are open. |
 | 2. Linux syscall compatibility | `clone`, robust futexes, epoll, eventfd, `pipe2`, memfd, `SCM_RIGHTS`, `poll`, `openat`, `fstat`, `getdents64`, `prctl`, `arch_prctl` | **Largely done for what musl and V8 need.** `docs/linux-abi.md` lists 31 rows covering 55 Linux call numbers, each with the flags it honours and the cases where it answers `-ENOSYS` instead of pretending. `clone`, `futex`, `execve`, `mmap`/`mprotect`/`munmap`/`madvise`, timing, epoll, memfd, sockets and `arch_prctl` are all there. Gaps that matter: `set_robust_list` and `prctl` are absent, and Linux's `sendmsg` reports `-ENOSYS` for `msg_control` - descriptor passing works over Omi's own Unix sockets, not through the Linux ABI. Robust futexes become important the moment a process can die holding a lock. |
 | 3. Runtime libraries | musl, compiler runtime, libstdc++, zlib, ICU, FreeType, HarfBuzz, Fontconfig, libpng, libjpeg, libwebp, libxml2, SQLite | **Partial.** musl works (dynamic and static, threads, signals). C++ with exceptions and threads works. zlib, libpng and libjpeg-turbo exist as part of the Skia build. **Missing: ICU, FreeType, HarfBuzz, Fontconfig, libwebp, libxml2, SQLite.** Omi's own text is stb_truetype plus one 8×16 bitmap face. |
-| 4. Graphics and window management | Surfaces, shared buffers, damage tracking, window metadata, focus, input, presentation, Ozone, Skia | **Strong except Ozone.** Surfaces (49–51), damage (53), focus and input (55–57) and presentation (59) are done and verified from screenshots. 54 is partial: a window is only discovered through its surface, so there is no window list independent of pixels. 61 is done at the "Skia rasterises" level — it is not yet on screen. **60 (Ozone backend) is not started.** |
+| 4. Graphics and window management | Surfaces, shared buffers, damage tracking, window metadata, focus, input, presentation, Ozone, Skia | **Strong except Ozone.** Surfaces (49–51), damage (53), focus and input (55–57) and presentation (59) are done and verified from screenshots. 54 is partial: a window is only discovered through its surface, so there is no window list independent of pixels. 61 is done: Skia draws straight into a window's buffer and the pixels are verified in a
+framebuffer dump at exact coordinates, so the compositor path is real. **60 (Ozone backend) is not started.** |
 | 5. V8 | GN build, cage, executable memory, signals, threads, GC, `d8` | **Started and green at the smoke-test level.** V8 builds for musl and runs JavaScript in a ring-3 process: cage reservation, JIT, GC, threads and signal-based traps all exercised. Not done: `d8` (70), WebAssembly, and the platform-teardown leak above. |
 | 6. Blink and HTML rendering | Blink build, HTML/CSS parsing, layout, DOM bindings, Skia integration, fonts | **Not started, and the largest single item.** Omi Net has a hand-written parser, cascade and box model; that is a test application, not Blink. |
 | 7. Chromium infrastructure | `//base`, Mojo, process launcher, network service, BoringSSL, storage, Content Shell | **Not started.** The prerequisites exist: Unix sockets with descriptor passing, shared memory, `fork`/`execve`, a sandbox filter, and BearSSL for TLS. |
@@ -152,9 +156,12 @@ follows is that proposal mapped onto what this repository actually contains.
 
 ## The order of work from here
 
-1. **Put Skia on the screen.** A Skia surface blitted to an Omi window through the
-   surface API — this is what turns "Skia runs" into "Skia is a rendering backend",
-   and it is the last piece of Stage 4's milestone.
+1. ~~**Put Skia on the screen.**~~ **Done.** `skiawin` wraps a window's pixel buffer
+   in an `SkSurface`, and the framebuffer dump shows its output at the predicted
+   coordinates. Two API traps came out of it: `SYS_WIN_RECT` packs x and y into one
+   argument and takes the size in the fourth (which travels in `r8`, not `r10`), and a
+   window's outer height includes the title bar, so the surface was being clipped until
+   the window was opened 31 rows taller.
 2. **A real font stack.** FreeType and HarfBuzz built for musl, wired into Skia and
    into the display path. A browser without text is not a browser, and this is also
    Stage 3's biggest gap.
