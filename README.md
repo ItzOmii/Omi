@@ -13,12 +13,16 @@ the browser, audio, a disk — happened here.
 ![Omi desktop](screenshots/omi-desktop.png)
 
 By the numbers, measured from the tree (`find kernel -name '*.c'` and so on, vendored directories
-counted separately): **32,252 lines** of first-party kernel C (plus **17,733** lines of its headers),
-**9,646 lines** of user-mode C, **103,958 lines** of vendored BearSSL and Gumbo, **101,195 lines** of
-vendored audio decoders in `kernel/media/`, and **58 native syscalls** in front of the Linux ABI. A
-stock boot prints **340 `ok` lines** in the serial log - a couple of those checks talk to the public
-internet, and when it refuses them they print a skip instead of a failure, which is why the count
-moves by a few lines from one boot to the next.
+counted separately): **35,743 lines** of first-party kernel C (plus **18,036** lines of its headers),
+**11,746 lines** of user-mode C and C++, **103,958 lines** of vendored BearSSL and Gumbo, **101,195
+lines** of vendored audio decoders in `kernel/media/`, and **59 native syscalls** in front of the Linux
+ABI, which covers 55 Linux call numbers. A stock boot prints **381 `ok` lines** across 32 suites in the
+serial log - a couple of those checks talk to the public internet, and when it refuses them they print
+a skip instead of a failure, which is why the count moves by a few lines from one boot to the next.
+
+**Starting here?** `docs/repo-overview.md` is the whole repository in one file: the map, what each
+subsystem does, what changed and in what order, and the stage-by-stage ledger against
+`docs/chromium-roadmap.md`.
 
 ---
 
