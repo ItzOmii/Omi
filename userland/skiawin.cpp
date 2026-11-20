@@ -18,12 +18,17 @@
  */
 #include "include/core/SkCanvas.h"
 #include "include/core/SkColor.h"
+#include "include/core/SkData.h"
+#include "include/core/SkFont.h"
+#include "include/core/SkFontMgr.h"
 #include "include/core/SkImageInfo.h"
 #include "include/core/SkPaint.h"
 #include "include/core/SkPathBuilder.h"
 #include "include/core/SkRRect.h"
 #include "include/core/SkSurface.h"
+#include "include/core/SkTypeface.h"
 #include "include/effects/SkGradient.h"
+#include "include/ports/SkFontMgr_empty.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -41,6 +46,18 @@
 #define TITLE_H 31     /* the window's outer height includes the title bar */
 
 static int checks, fails;
+
+/* Two faces from the ISO, loaded by path. There is no fontconfig here and ring 3
+ * cannot enumerate a directory, so the program opens the files it was told about
+ * and hands FreeType the bytes. */
+static sk_sp<SkTypeface> g_face, g_mono;
+
+static sk_sp<SkTypeface> load_face(const char *path) {
+  sk_sp<SkFontMgr> mgr = SkFontMgr_New_Custom_Empty();
+  sk_sp<SkData> data = SkData::MakeFromFileName(path);
+  if (!mgr || !data || data->size() < 1024) return nullptr;
+  return mgr->makeFromData(data, 0);
+}
 
 static void check(int ok, const char *what, long got, long want) {
   checks++;
@@ -91,11 +108,29 @@ static int skia_paint(void *pixels) {
   rrect.setColor(0xFFF03C3C);
   c->drawRRect(SkRRect::MakeRectXY(SkRect::MakeXYWH(180, 20, 120, 60), 14, 14), rrect);
 
+  /* Text, through FreeType and Skia's text blob: the part that makes this a
+   * rendering backend for a browser rather than a shape rasteriser. */
+  if (g_face) {
+    SkFont big(g_face, 34);
+    big.setEdging(SkFont::Edging::kAntiAlias);
+    big.setSubpixel(false);
+    SkPaint ink;
+    ink.setColor(0xFFF0F4FA);
+    c->drawString("Skia on Omi", 24, 128, big, ink);
+    if (g_mono) {
+      SkFont small(g_mono, 16);
+      small.setEdging(SkFont::Edging::kAntiAlias);
+      SkPaint dim;
+      dim.setColor(0xFF78C8AA);
+      c->drawString("freetype, raster, present", 26, 154, small, dim);
+    }
+  }
+
   SkPathBuilder star;
   for (int i = 0; i < 10; i++) {
     float a = (float)i * 3.14159265f / 5.0f - 1.5707963f;
-    float r = (i & 1) ? 26.0f : 62.0f;
-    float x = 200.0f + r * cosf(a), y = 175.0f + r * sinf(a);
+    float r = (i & 1) ? 22.0f : 48.0f;
+    float x = 330.0f + r * cosf(a), y = 196.0f + r * sinf(a);
     if (i == 0) star.moveTo(x, y); else star.lineTo(x, y);
   }
   star.close();
@@ -135,6 +170,11 @@ int main(void) {
   sys3(SYS_WIN_GEOM, win, (long)geom, 0);
   printf("[skiawin] window %ld at %d,%d %dx%d\n", win, geom[0], geom[1], geom[2], geom[3]);
 
+  g_face = load_face("/fonts/Bricolage.ttf");
+  g_mono = load_face("/fonts/JBMono.ttf");
+  check(g_face != nullptr, "a TrueType face loads from the ISO", 0, 1);
+  check(g_mono != nullptr, "and a second one, for the mono line", 0, 1);
+
   int rc = skia_paint((void *)addr);
   check(rc == 0, "Skia painted into the window", rc, 0);
 
@@ -150,11 +190,25 @@ int main(void) {
         "the marker border is in the window buffer", top, 0xFF39FF14);
   check(block == 0xFF8A2BE2u, "a filled block is in the window buffer", block, 0xFF8A2BE2);
 
+  /* Ink in the band where the text was drawn: FreeType antialiasing leaves a lot
+   * of partly-lit pixels, so the test is "many pixels above the gradient", not a
+   * particular value. */
+  long ink = 0;
+  for (int y = 96; y < 160; y++) {
+    for (int x = 20; x < 300; x++) {
+      uint32_t v = px[y * W + x];
+      unsigned r8 = v & 0xFF, g8 = (v >> 8) & 0xFF, b8 = (v >> 16) & 0xFF;
+      if (r8 > 0xB0 && g8 > 0xB0 && b8 > 0xB0) ink++;
+    }
+  }
+  printf("[skiawin] ink=%ld px in the text band\n", ink);
+  check(ink > 200, "glyphs are in the window buffer", ink, 200);
+
   /* Move out of the cascade the other windows are stacked in, so the framebuffer
    * dump has somewhere the compositor will actually blit this window to. */
   /* (id, x | y<<32, unused, (w<<16)|h) - the x and y travel in one argument and
    * the size in the fourth, which is not what the header used to say. */
-  long mv = sys4(SYS_WIN_RECT, win, 560L | (30L << 32), 0,
+  long mv = sys4(SYS_WIN_RECT, win, 8L | (8L << 32), 0,
                  ((long)W << 16) | (H + TITLE_H));
   check(mv == 0, "the window moves itself out of the cascade", mv, 0);
   sys3(SYS_WIN_GEOM, win, (long)geom, 0);

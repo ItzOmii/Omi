@@ -16,7 +16,7 @@ By the numbers, measured from the tree (`find kernel -name '*.c'` and so on, ven
 counted separately): **35,743 lines** of first-party kernel C (plus **18,036** lines of its headers),
 **11,746 lines** of user-mode C and C++, **103,958 lines** of vendored BearSSL and Gumbo, **101,195
 lines** of vendored audio decoders in `kernel/media/`, and **59 native syscalls** in front of the Linux
-ABI, which covers 55 Linux call numbers. A stock boot prints **381 `ok` lines** across 32 suites in the
+ABI, which covers 55 Linux call numbers. A verification boot prints **398 `ok` lines** across 34 suites in the
 serial log - a couple of those checks talk to the public internet, and when it refuses them they print
 a skip instead of a failure, which is why the count moves by a few lines from one boot to the next.
 
@@ -340,6 +340,14 @@ hundred suites, the boot self-tests, and the display server that takes the scree
 them. Both are the same kernel and the same userland with one macro flipped, so a fix cannot land
 in one and rot in the other — but an ISO you boot to look at a desktop should not spend two minutes
 proving itself first. `DEV=1` goes further and spawns only the browser.
+
+The difference is not only what boots, it is what is *in* the image. `TESTS=0` deletes the test
+programs from `iso_root/apps` and cuts their `module_path` lines out of the ISO's copy of
+`limine.conf`, driven by one list in the `Makefile` (`TEST_APPS`), so a shipped ISO cannot run a
+suite even by hand — there is nothing there to run. Measured: **77 MB and five binaries** (init,
+comp, skiawin, ominet, spin) against **233 MB and forty-eight** for the verification image. `spin.elf`
+survives the cut because the kernel's own preemption self-test spawns it on every boot, tests or
+not; removing it turned a passing line into `[pre] FAILED`.
 
 ## Run
 

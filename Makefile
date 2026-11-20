@@ -37,6 +37,23 @@ DEV ?= 0
 # verification boot - every suite, then the ring-3 display server - and it stays
 # one flag away because a boot nobody measures against is a boot that rots.
 TESTS ?= 0
+
+# Modules that exist to be measured, never to be used: the suites, the fixtures
+# they spawn, and the single-purpose probes. spin.elf is deliberately absent: the
+# kernel's own preemption self-test spawns it on every boot, TESTS or not, and
+# removing it turns a passing self-test into a FAILED line. TESTS=0 deletes them from the image
+# and cuts their module_path lines out of the ISO's copy of limine.conf. Anything
+# a default boot needs - init, comp, skiawin, ominet, the loader, the faces, the
+# media - is deliberately not on this list.
+TEST_APPS := cat.elf httpget.elf polltest.elf pipetest.elf linuxtest.elf \
+             muslhello.elf muslthreads.elf muslstat.elf muslfork.elf cowlives.elf \
+             libprobe.elf libmap.elf dyntest.elf exectest.elf exectarget.elf \
+             epolltest.elf memfdtest.elf socktest.elf sandtest.elf power.elf \
+             tlsget.elf vmtest.elf shmtest.elf sigtest.elf pthreadtest.elf \
+             cpptest.elf atxit.elf handoff.elf skiahello.elf skiatext.elf \
+             v8hello.elf surfbig.elf unixpair.elf scmtest.elf unixname.elf \
+             credtest.elf formtest.elf imgtest.elf memtest.elf surftest.elf \
+             scene.elf omirender.elf surfexit.elf libgreet.so
 $(shell mkdir -p $(KERNEL_DIR)/include; printf '#define OMI_DEV_BOOT %s\n#define OMI_TESTS %s\n' $(DEV) $(TESTS) > /tmp/devboot.new.$$$$ 2>/dev/null; cmp -s /tmp/devboot.new.$$$$ $(KERNEL_DIR)/include/devboot.h 2>/dev/null || cp /tmp/devboot.new.$$$$ $(KERNEL_DIR)/include/devboot.h; rm -f /tmp/devboot.new.$$$$)
 ifeq ($(DEV),1)
 ISO := omi-dev.iso
@@ -398,6 +415,7 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	@if [ -f userland/handoff.elf ]; then cp userland/handoff.elf $(ISO_ROOT)/apps/handoff.elf; fi
 	@if [ -f userland/skiahello.elf ]; then cp userland/skiahello.elf $(ISO_ROOT)/apps/skiahello.elf; fi
 	@if [ -f userland/skiawin.elf ]; then cp userland/skiawin.elf $(ISO_ROOT)/apps/skiawin.elf; fi
+	@if [ -f userland/skiatext.elf ]; then cp userland/skiatext.elf $(ISO_ROOT)/apps/skiatext.elf; fi
 	@if [ -f userland/v8hello.elf ]; then cp userland/v8hello.elf $(ISO_ROOT)/apps/v8hello.elf; else echo "no v8hello.elf: skipping"; fi
 	@if [ -f userland/surfbig.elf ]; then cp userland/surfbig.elf $(ISO_ROOT)/apps/surfbig.elf; else echo "no surfbig.elf: skipping"; fi
 	@if [ -f userland/unixpair.elf ]; then cp userland/unixpair.elf $(ISO_ROOT)/apps/unixpair.elf; else echo "no unixpair.elf: skipping"; fi
@@ -430,6 +448,24 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	cp limine.conf $(ISO_ROOT)/boot/limine.conf
 	cp limine.conf $(ISO_ROOT)/limine/limine.conf
 	cp limine.conf $(ISO_ROOT)/EFI/BOOT/limine.conf
+
+	# TESTS=0: take the test programs out of the image completely - not just out
+	# of the boot path. limine.conf in the tree stays the single source of truth;
+	# the copies in the ISO are filtered, and the files themselves are removed, so
+	# a shipped ISO cannot run a suite even by hand. TESTS=1 keeps everything and
+	# is the verification boot.
+ifeq ($(TESTS),0)
+	@for f in $(TEST_APPS); do \
+	  b=$$(basename $$f); \
+	  sed -i "/module_path: boot():.*\/$$b$$/d" $(ISO_ROOT)/limine.conf \
+	    $(ISO_ROOT)/boot/limine.conf $(ISO_ROOT)/limine/limine.conf \
+	    $(ISO_ROOT)/EFI/BOOT/limine.conf; \
+	  rm -f $(ISO_ROOT)/apps/$$b $(ISO_ROOT)/lib/$$b; \
+	done
+	@echo "  [iso] TESTS=0 - $(words $(TEST_APPS)) test programs left out"
+else
+	@echo "  [iso] TESTS=1 - verification image, all suites included"
+endif
 	
 	# Copy Limine files
 	cp $(LIMINE_DIR)/bin/limine-bios.sys $(ISO_ROOT)/boot/ 2>/dev/null || true

@@ -59,7 +59,7 @@ Omi's own kernel code is about 53,500 lines. The rest is vendored.
 
 ## What runs, and what proves it
 
-One boot of the current ISO produces **381 named `ok` checks across 32 suites, and
+One boot of the current ISO produces **398 named `ok` checks across 34 suites, and
 no `FAIL` lines**, plus per-suite tallies (`vfs 16/16`, `futex 3/3`). The suites are
 not unit tests of functions — they are ring-3 programs that use the kernel the way
 an application would:
@@ -85,7 +85,10 @@ an application would:
   on Linux.
 - `skiawin` — Skia draws into a window's own pixel buffer and the compositor puts it
   on the framebuffer, checked by reading the buffer back and by finding the marker
-  colour at the expected screen coordinates in a framebuffer dump.
+  colour at the expected screen coordinates in a framebuffer dump. It also draws text
+  from the ISO's own faces, so the window on screen reads "Skia on Omi".
+- `skiatext` — FreeType inside Skia, over `Bricolage.ttf` and `JBMono.ttf`. Prints the
+  advance, the ink count and two CRCs that are identical to the same binary on Linux.
 - `atxit`, `handoff` — the two regression tests that came out of the exit bug.
 
 Two applications sit on top: **Omi Net** (fetching, HTML parsing via Gumbo, a real
@@ -146,7 +149,7 @@ follows is that proposal mapped onto what this repository actually contains.
 | --- | --- | --- |
 | 1. Kernel and process foundations | Signals, `mprotect`, `madvise`, `prlimit64`, slot reclamation, exception handling | **Mostly done.** Signals (1–5), `mprotect` (6), slot reclamation (12) and thread lifecycle (13) are implemented and proven from the ISO. `munmap` partial unmapping (7), `madvise` (8) and `prlimit64` (11) are open; `SA_RESTART` restart semantics, stop/continue and `si_pid` are open. |
 | 2. Linux syscall compatibility | `clone`, robust futexes, epoll, eventfd, `pipe2`, memfd, `SCM_RIGHTS`, `poll`, `openat`, `fstat`, `getdents64`, `prctl`, `arch_prctl` | **Largely done for what musl and V8 need.** `docs/linux-abi.md` lists 31 rows covering 55 Linux call numbers, each with the flags it honours and the cases where it answers `-ENOSYS` instead of pretending. `clone`, `futex`, `execve`, `mmap`/`mprotect`/`munmap`/`madvise`, timing, epoll, memfd, sockets and `arch_prctl` are all there. Gaps that matter: `set_robust_list` and `prctl` are absent, and Linux's `sendmsg` reports `-ENOSYS` for `msg_control` - descriptor passing works over Omi's own Unix sockets, not through the Linux ABI. Robust futexes become important the moment a process can die holding a lock. |
-| 3. Runtime libraries | musl, compiler runtime, libstdc++, zlib, ICU, FreeType, HarfBuzz, Fontconfig, libpng, libjpeg, libwebp, libxml2, SQLite | **Partial.** musl works (dynamic and static, threads, signals). C++ with exceptions and threads works. zlib, libpng and libjpeg-turbo exist as part of the Skia build. **Missing: ICU, FreeType, HarfBuzz, Fontconfig, libwebp, libxml2, SQLite.** Omi's own text is stb_truetype plus one 8×16 bitmap face. |
+| 3. Runtime libraries | musl, compiler runtime, libstdc++, zlib, ICU, FreeType, HarfBuzz, Fontconfig, libpng, libjpeg, libwebp, libxml2, SQLite | **Partial, and further along than it was.** musl works (dynamic and static, threads, signals). C++ with exceptions and threads works. zlib, libpng, libjpeg-turbo and now **FreeType** (built into Skia, producing byte-identical text on Omi and Linux) are part of the Skia build. **Missing: ICU, HarfBuzz, Fontconfig, libwebp, libxml2, SQLite.** Omi's own kernel text is stb_truetype plus one 8×16 bitmap face; ring-3 apps can now go through FreeType instead. |
 | 4. Graphics and window management | Surfaces, shared buffers, damage tracking, window metadata, focus, input, presentation, Ozone, Skia | **Strong except Ozone.** Surfaces (49–51), damage (53), focus and input (55–57) and presentation (59) are done and verified from screenshots. 54 is partial: a window is only discovered through its surface, so there is no window list independent of pixels. 61 is done: Skia draws straight into a window's buffer and the pixels are verified in a
 framebuffer dump at exact coordinates, so the compositor path is real. **60 (Ozone backend) is not started.** |
 | 5. V8 | GN build, cage, executable memory, signals, threads, GC, `d8` | **Started and green at the smoke-test level.** V8 builds for musl and runs JavaScript in a ring-3 process: cage reservation, JIT, GC, threads and signal-based traps all exercised. Not done: `d8` (70), WebAssembly, and the platform-teardown leak above. |
@@ -162,7 +165,9 @@ framebuffer dump at exact coordinates, so the compositor path is real. **60 (Ozo
    argument and takes the size in the fourth (which travels in `r8`, not `r10`), and a
    window's outer height includes the title bar, so the surface was being clipped until
    the window was opened 31 rows taller.
-2. **A real font stack.** FreeType and HarfBuzz built for musl, wired into Skia and
+2. **A real font stack.** ~~FreeType~~ **done** — it is inside Skia and renders text that
+   hashes the same as Linux. What remains is HarfBuzz for shaping and ICU for breaking and
+   bidi, plus a matching story so a page can ask for a family and get a face.
    into the display path. A browser without text is not a browser, and this is also
    Stage 3's biggest gap.
 3. **Finish Stage 1.** `munmap` partial unmapping, `madvise`, `prlimit64`,

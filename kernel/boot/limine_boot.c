@@ -588,6 +588,10 @@ void _start(void) {
   ring3_spawn_elf("handoff", "handoff.elf", 0);
   /* Skia's CPU backend: shapes, a shader and a PNG encode. */
   ring3_spawn_elf("skia", "skiahello.elf", 0);
+  /* Skia's text path: FreeType over the ISO's own TrueType faces. A test, so it
+   * stays inside the TESTS gate - the default ISO shows the same text in the
+   * window instead of printing hashes about it. */
+  ring3_spawn_elf("skiatext", "skiatext.elf", 0);
   /* The same raster pipeline, drawing into a window the compositor blits. */
   ring3_spawn_elf("skiawin", "skiawin.elf", 0);
   /* exit() itself, with threads having existed: the smallest thing that can
@@ -621,6 +625,17 @@ void _start(void) {
   ring3_spawn_elf("surfexit", "surfexit.elf", 0);
   }
 #endif /* !OMI_DEV_BOOT */
+
+  /* Outside the TESTS gate, because a default ISO is meant to be looked at and
+   * not measured: the display server takes the screen, and one window on it is
+   * Skia drawing into its own pixels. With TESTS=1 these two start at the end of
+   * the suites instead - comp waits on -EBUSY until the scene test lets go - and
+   * the order between them and the tests is unchanged. */
+#if !OMI_TESTS
+  ring3_spawn_elf("comp", "comp.elf", 0);
+  ring3_spawn_elf("skiawin", "skiawin.elf", 0);
+#endif
+  /* With TESTS=1 both of those already started inside the suite block above. */
 
   ring3_spawn_elf("ominet", "ominet.elf", 0);
 #if OMI_BENCH

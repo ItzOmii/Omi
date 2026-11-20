@@ -71,6 +71,40 @@ This Skia is post-refactor and the old recipes do not compile:
   (colours are `SkColor4f`, not `SkColor`)
 - `SkCanvas::flush()` is gone; a raster surface draws immediately.
 
+## Text
+
+Shapes are not a browser. Text is, and text needs a font stack, so Skia is now built
+with **FreeType** inside it (`skia_use_freetype = true`, system FreeType off, so the
+copy that ships is the one in `third_party/externals/freetype`). Fontconfig stays off:
+Omi has no fontconfig and ring 3 cannot enumerate a directory, so a program opens the
+face it wants and hands FreeType the bytes:
+
+    SkFontMgr_New_Custom_Empty()            -> a manager with no searching in it
+    SkData::MakeFromFileName("/fonts/...")  -> the TTF, straight off the ISO
+    mgr->makeFromData(data, 0)              -> a typeface, parsed by FreeType
+    SkFont(face, 40) + canvas->drawString() -> glyphs in the surface
+
+`skiatext.cpp` is the proof, and it is a *number*: the same static binary runs on
+Linux and on Omi, and both print the same four values.
+
+```
+Linux                                    Omi
+advance=208.00 bounds=206.00x30.00       advance=208.00 bounds=206.00x30.00
+ink=4383 of 54000 px                     ink=4383 of 54000 px
+surface crc=a5e72215                     surface crc=a5e72215
+png=7607 bytes crc=8b408c86              png=7607 bytes crc=8b408c86
+```
+
+Nothing in that is a tolerance. FreeType is deterministic and Skia's raster pipeline is
+deterministic, so two machines that get the same pixels produce the same hash; when they
+stop, one of them is guessing. The face reports `Bricolage Grotesque`, 597 glyphs, 1000
+units per em, and the mono line comes from `JBMono.ttf` through the same manager, so both
+faces are exercised.
+
+What is still missing for real web text: **HarfBuzz** (no shaping - Arabic, Devanagari and
+ligatures will be wrong), **ICU** (no line breaking or bidi), and a font *matching* story
+(today a program names its face; a browser has to pick one from a family name).
+
 ## On screen
 
 `skiawin.cpp` points the same pipeline at a real window: `SYS_WIN_OPEN`, then
