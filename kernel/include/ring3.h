@@ -177,6 +177,11 @@
 #define SYS_WAIT4       57  /* (pid, int *status, options, 0) -> pid reaped | -ECHILD.
                              * Status has wait4's shape: exit code in bits 8-15. */
 
+#define SYS_FONT        59  /* (face, char *out, cap) -> bytes written | size
+                             * when out is 0 | -ENOSPC. A face's own bytes so a
+                             * ring-3 program can raster text from outlines
+                             * instead of the 8x16 bitmap. Face 0 is the display
+                             * face, 1 the mono one. */
 #define SYS_POWER       58  /* (what, 0, 0, 0) -> only returns on failure (-1).
                              * 0 = switch off, 1 = restart. Both flush the disk
                              * first. Requires no privilege beyond being a task: a

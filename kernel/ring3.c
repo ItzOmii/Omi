@@ -21,6 +21,7 @@
 #include "include/gui.h"     /* the display's geometry: what the scene is sized to */
 #include "include/bt.h"     /* the register dump and the walk out of a fault */
 #include "include/power.h"   /* SYS_POWER: off and restart, disk first */
+#include "include/ttf.h"    /* SYS_FONT: hand a face's outlines to ring 3 */
 #include "include/guiipc.h"
 #include "include/pmm.h"
 #include "include/errno.h"
@@ -57,6 +58,10 @@ uint64_t r3_user_rsp;
  * time, so a static is enough - and it is the only way to reach the caller's
  * saved registers, which is what clone has to hand a new thread. */
 uint64_t r3_frame_base;
+/* Which exception vector landed in ring3_fault. The stub tags it, because the
+ * handler itself only ever sees the error code and the return frame: vector 13
+ * and 14 both arrive here and mean different things to a signal. */
+uint64_t r3_fault_vec;
 /* The fifth and sixth Linux argument registers (r8, r9). They are parked here
  * rather than passed along because only clone takes five arguments today; a
  * second such syscall is the signal to widen the dispatch signature instead. */
@@ -1603,6 +1608,7 @@ fail:
  * ended task's stack is left between calls, which is the only place it is safe
  * to unwind. */
 static void r3_exit_now(uint64_t code);   /* the one exit path, defined below */
+static int sig_is_ignored(task_t *t, int sig);
 
 static void kill_if_requested(void) {
   task_t *me = task_at(task_current());
@@ -1634,7 +1640,11 @@ static long linux_wait4(int pid, uint64_t status_u, int options, uint64_t rusage
     }
     if (found) {
       task_t *c = task_at(found);
-      int status = (int)((c->work & 0xFF) << 8);
+      uint64_t w = c->work;
+      /* A task killed by a signal reports the signal number, not an exit code.
+       * Those deaths are marked with 0x100 so a program that merely chose to exit
+       * with the same number stays distinguishable. */
+      int status = (w & 0x100) ? (int)(w & 0x7F) : (int)((w & 0xFF) << 8);
       if (status_u && user_put(status_u, &status, sizeof status) != 0) return -EFAULT;
       if (rusage_u) {
         int64_t zero[18];
@@ -1679,6 +1689,17 @@ static long sys_fork(void) {
     mm_free_tables(child_mm);
     kfree(child_mm);
     return -EAGAIN;
+  }
+  /* The child inherits the mask and the alternate stack - a forked process that
+   * lost its alt stack would be unable to catch a stack overflow, which is the
+   * whole reason it set one up. Pending signals are not inherited: they were
+   * raised at the parent. Handlers came across with the address space. */
+  task_t *ch = task_at((uint32_t)id);
+  if (ch) {
+    ch->sig_blocked  = t->sig_blocked;
+    ch->sig_alt_sp   = t->sig_alt_sp;
+    ch->sig_alt_size = t->sig_alt_size;
+    ch->sig_alt_flags = t->sig_alt_flags;
   }
   return id;
 }
@@ -1856,6 +1877,28 @@ static int user_page_present(uint64_t page) {
   return (pt[i4] & PTE_P) ? 1 : 0;
 }
 
+/* Present is not the same as writable: after fork the stack is shared and its
+ * pages are mapped read-only in both spaces, so a kernel-side store into a
+ * child's stack faults in ring 0 where nothing can rescue it. */
+static int user_page_writable(uint64_t page) {
+  task_t *t = task_at(task_current());
+  if (!t || !t->cr3) return 0;
+  uint64_t *pml4 = (uint64_t *)(hhdm_offset + t->cr3);
+  int i1 = (int)((page >> 39) & 511);
+  if (!(pml4[i1] & PTE_P)) return 0;
+  uint64_t *pdpt = (uint64_t *)(hhdm_offset + (pml4[i1] & ~0xFFFULL));
+  int i2 = (int)((page >> 30) & 511);
+  if (!(pdpt[i2] & PTE_P)) return 0;
+  uint64_t *pd = (uint64_t *)(hhdm_offset + (pdpt[i2] & ~0xFFFULL));
+  int i3 = (int)((page >> 21) & 511);
+  if (!(pd[i3] & PTE_P)) return 0;
+  if (pd[i3] & 0x80ULL) return (pd[i3] & PTE_W) != 0;
+  uint64_t *pt = (uint64_t *)(hhdm_offset + (pd[i3] & ~0xFFFULL));
+  int i4 = (int)((page >> 12) & 511);
+  if (!(pt[i4] & PTE_P)) return 0;
+  return (pt[i4] & PTE_W) != 0;
+}
+
 /* Copy in from a user pointer the way a syscall has to: the window check, and a
  * demand-paged page faulted in first. The kernel-side load cannot take a fault,
  * and a buffer handed to sendto() has no reason to have been written yet - the
@@ -1879,9 +1922,252 @@ static int user_get(uint64_t uptr, void *dst, uint64_t n) {
 static int user_prep(uint64_t uptr, uint64_t n) {
   if (n == 0) return 0;
   if (uptr < RING3_USER_MIN || uptr + n > RING3_LIMIT) return -1;
-  for (uint64_t page = uptr & ~0xFFFULL; page < uptr + n; page += 0x1000)
-    if (!user_page_present(page) && !vm_fault_in(page, 0)) return -1;
+  for (uint64_t page = uptr & ~0xFFFULL; page < uptr + n; page += 0x1000) {
+    if (!user_page_present(page)) {
+      if (!vm_fault_in(page, 0)) return -1;
+      continue;
+    }
+    /* A present page can still refuse the store. After fork the stack is mapped
+     * read-only in both spaces, so a signal frame written onto a child's stack
+     * is a store like any other: unshare it here, or the kernel takes the fault
+     * in ring 0 and panics. A page that genuinely has no write permission
+     * (PROT_READ, PROT_NONE) still fails, which is what -EFAULT means. */
+    if (!user_page_writable(page) && !cow_fault(page)) return -1;
+  }
   return 0;
+}
+
+/* ------------------------------------------------------------------ signals
+ *
+ * Storage for sigaction()/sigprocmask() existed long before anything was ever
+ * delivered: a libc could install a handler and read it back, and that was all.
+ * This is the delivery half - the piece V8 cannot run without, because its trap
+ * handler *is* a SIGSEGV handler and its stack-overflow guard is a SIGSEGV
+ * handler on an alternate stack.
+ *
+ * The mechanism is Linux's, because the return path has to be: a handler is
+ * entered with a return address already on its stack that points at the
+ * restorer trampoline libc supplied through sigaction() (x86_64 has no other
+ * way back), and that trampoline issues rt_sigreturn, which reads the saved
+ * context off the user stack and resumes the interrupted instruction.
+ *
+ * The saved context is laid out as a musl/x86_64 ucontext_t followed by a
+ * siginfo_t, so a handler written against SA_SIGINFO can read the faulting
+ * address out of si_addr and the faulting rip out of uc_mcontext - which is
+ * exactly what a JIT's trap handler does.
+ *
+ * Two doors deliver, and they save different frames:
+ *   - the syscall return (r3_dispatch_tail), for signals raised by kill/tkill
+ *     and for a signal that was pending while blocked and is now unblocked;
+ *   - the fault path (ring3_fault), for the synchronous ones: a #PF or #GP that
+ *     would have killed the task is offered to a handler first.
+ */
+#define SA_SIGINFO_BIT    0x00000004ULL
+#define SA_ONSTACK_BIT    0x08000000ULL
+#define SA_NODEFER_BIT    0x40000000ULL
+#define SA_RESETHAND_BIT  0x80000000ULL
+#define SS_ONSTACK_BIT    1
+#define SS_DISABLE_BIT    2
+
+#define SI_USER_CODE      0
+#define SI_KERNEL_CODE    0x80
+#define SEGV_MAPERR_CODE  1
+#define SEGV_ACCERR_CODE  2
+
+/* Offsets inside the frame, which starts at the ucontext: the handler's rsp
+ * points 8 bytes below this (at the restorer address), so rt_sigreturn - which
+ * runs after that address has been popped - sees the frame exactly here.
+ * These are musl's x86_64 numbers, and they are load-bearing: gregs[23] is 184
+ * bytes, then a fpregset pointer and 8 reserved words take the mcontext to 256,
+ * so uc_sigmask starts at 296, ucontext_t is 936, and the siginfo_t after it is
+ * another 128. A handler compiled against musl reads si_addr at 936+16. */
+#define SIGF_GREGS    40      /* uc_mcontext.gregs[23] */
+#define SIGF_MASK     296     /* uc_sigmask, 8 meaningful bytes */
+#define SIGF_SIGINFO  936
+#define SIGF_ALTFLAG  1064    /* was this frame built on the alt stack? */
+#define SIGF_SIZE     1072
+
+/* Register order musl's x86_64 mcontext uses. Kept because a handler compiled
+ * against musl reads gregs by these indices. */
+enum { R8_, R9_, R10_, R11_, R12_, R13_, R14_, R15_, RDI_, RSI_, RBP_, RBX_,
+       RDX_, RAX_, RCX_, RSP_, RIP_, EFL_, CSGSFS_, ERR_, TRAPNO_, OLDMASK_, CR2_ };
+
+typedef struct {
+  uint64_t g[23];
+  uint64_t rip, rsp, rflags, cs, ss;
+  uint64_t err, trapno, cr2;
+} sigctx_t;
+
+/* The frame the syscall door leaves on the kernel stack, in memory order:
+ * r15 r14 r13 r12 r11 r10 r9 r8 rdi rsi rdx rcx rbx rax | rip cs rflags rsp ss
+ * rbp is not in it, and does not need to be: the kernel builds with
+ * -fno-omit-frame-pointer, so rbp survives every call and comes in as an
+ * argument. */
+static void sig_get_sys(const uint64_t *f, uint64_t rbp, sigctx_t *c) {
+  for (int i = 0; i < 23; i++) c->g[i] = 0;
+  c->g[R15_] = f[0];  c->g[R14_] = f[1];  c->g[R13_] = f[2];
+  c->g[R12_] = f[3];  c->g[R11_] = f[4];  c->g[R10_] = f[5];
+  c->g[R9_]  = f[6];  c->g[R8_]  = f[7];
+  c->g[RDI_] = f[8];  c->g[RSI_] = f[9];  c->g[RBP_] = rbp;
+  c->g[RDX_] = f[10]; c->g[RCX_] = f[11]; c->g[RBX_] = f[12];
+  c->g[RAX_] = f[13];
+  c->rip = f[14]; c->cs = f[15]; c->rflags = f[16]; c->rsp = f[17]; c->ss = f[18];
+}
+
+static void sig_put_sys(uint64_t *f, const sigctx_t *c) {
+  f[0] = c->g[R15_];  f[1] = c->g[R14_];  f[2] = c->g[R13_];
+  f[3] = c->g[R12_];  f[4] = c->g[R11_];  f[5] = c->g[R10_];
+  f[6] = c->g[R9_];   f[7] = c->g[R8_];
+  f[8] = c->g[RDI_];  f[9] = c->g[RSI_];
+  f[10] = c->g[RDX_]; f[11] = c->g[RCX_]; f[12] = c->g[RBX_];
+  f[13] = c->g[RAX_];
+  f[14] = c->rip; f[15] = c->cs; f[16] = c->rflags; f[17] = c->rsp; f[18] = c->ss;
+}
+
+/* The fault door's frame: the same fifteen registers in the stub's order, with
+ * the hardware's error code and return frame after them. rbp is one of them
+ * here, because a fault can land anywhere and must restore everything. */
+static void sig_get_fault(const uint64_t *f, sigctx_t *c) {
+  for (int i = 0; i < 23; i++) c->g[i] = 0;
+  c->g[R15_] = f[-15]; c->g[R14_] = f[-14]; c->g[R13_] = f[-13];
+  c->g[R12_] = f[-12]; c->g[R11_] = f[-11]; c->g[R10_] = f[-10];
+  c->g[R9_]  = f[-9];  c->g[R8_]  = f[-8];
+  c->g[RBP_] = f[-7];  c->g[RDI_] = f[-6];  c->g[RSI_] = f[-5];
+  c->g[RDX_] = f[-4];  c->g[RCX_] = f[-3];  c->g[RBX_] = f[-2];
+  c->g[RAX_] = f[-1];
+  c->err = f[0]; c->rip = f[1]; c->cs = f[2]; c->rflags = f[3];
+  c->rsp = f[4]; c->ss = f[5];
+}
+
+static void sig_put_fault(uint64_t *f, const sigctx_t *c) {
+  f[-15] = c->g[R15_]; f[-14] = c->g[R14_]; f[-13] = c->g[R13_];
+  f[-12] = c->g[R12_]; f[-11] = c->g[R11_]; f[-10] = c->g[R10_];
+  f[-9]  = c->g[R9_];  f[-8]  = c->g[R8_];
+  f[-7]  = c->g[RBP_]; f[-6]  = c->g[RDI_]; f[-5] = c->g[RSI_];
+  f[-4]  = c->g[RDX_]; f[-3]  = c->g[RCX_]; f[-2] = c->g[RBX_];
+  f[-1]  = c->g[RAX_];
+  f[1] = c->rip; f[3] = c->rflags; f[4] = c->rsp;
+}
+
+/* Default actions, for the signals a task can raise at itself. Only three of
+ * Linux's five matter here: terminate, ignore, and stop - and stop is not
+ * modelled, so a stopping signal is treated as ignored rather than fatal. */
+static int sig_default_ignored(int sig) {
+  return sig == 17 /* CHLD */ || sig == 18 /* CONT */ || sig == 23 /* URG */ ||
+         sig == 28 /* WINCH */ || sig == 19 /* STOP */ || sig == 20 /* TSTP */ ||
+         sig == 21 /* TTIN */ || sig == 22 /* TTOU */;
+}
+
+/* Build the handler frame on the user stack and point `c` at the handler.
+ * Returns 1 delivered, 0 ignored, -2 no handler, -1 could not build (the
+ * caller then treats the signal as fatal, as Linux does). */
+static int sig_deliver(int sig, int code, uint64_t addr, sigctx_t *c) {
+  task_t *t = task_at(task_current());
+  if (!t || !t->mm) return -1;
+  sigact_t *a = &t->mm->sig_act[sig - 1];
+  if (a->handler == 1) return 0;          /* SIG_IGN */
+  if (a->handler == 0)                    /* SIG_DFL */
+    return sig_default_ignored(sig) ? 0 : -2;
+
+  uint64_t sp = c->rsp;
+  int on_alt = 0;
+  if ((a->flags & SA_ONSTACK_BIT) && t->sig_alt_sp &&
+      !(t->sig_alt_flags & SS_DISABLE_BIT) && !t->sig_on_alt) {
+    sp = t->sig_alt_sp + t->sig_alt_size;
+    on_alt = 1;
+  }
+  uint64_t base = (sp - (SIGF_SIZE + 8)) & ~15ULL;
+  uint64_t P = base + 8;
+  if (user_prep(base, SIGF_SIZE + 8) != 0) return -1;
+
+  uint8_t buf[SIGF_SIZE];
+  for (int i = 0; i < SIGF_SIZE; i++) buf[i] = 0;
+  uint64_t *q = (uint64_t *)buf;
+  q[0] = 0;                        /* uc_flags */
+  q[1] = 0;                        /* uc_link */
+  q[2] = t->sig_alt_sp;            /* uc_stack: what the handler sees as its */
+  q[3] = t->sig_alt_flags;         /* alt stack, not as its own frame */
+  q[4] = t->sig_alt_size;
+
+  uint64_t *gr = (uint64_t *)(buf + SIGF_GREGS);
+  for (int i = 0; i < 23; i++) gr[i] = c->g[i];
+  gr[RSP_] = c->rsp;
+  gr[RIP_] = c->rip;
+  gr[EFL_] = c->rflags;
+  gr[CSGSFS_] = c->cs & 0xffff;    /* gs/fs are not tracked; cs is what resumes */
+  gr[ERR_] = c->err;
+  gr[TRAPNO_] = c->trapno;
+  gr[CR2_] = addr;
+  *(uint64_t *)(buf + SIGF_MASK) = t->sig_blocked;
+
+  int32_t *si = (int32_t *)(buf + SIGF_SIGINFO);
+  si[0] = sig;                     /* si_signo */
+  si[1] = 0;                       /* si_errno */
+  si[2] = code;                    /* si_code */
+  si[3] = 0;
+  *(uint64_t *)(buf + SIGF_SIGINFO + 16) = addr;   /* si_addr / si_ptr */
+  *(uint64_t *)(buf + SIGF_ALTFLAG) = (uint64_t)on_alt;
+
+  uint64_t pretcode = a->restorer;
+  if (user_put(base, &pretcode, 8) != 0) return -1;
+  if (user_put(P, buf, SIGF_SIZE) != 0) return -1;
+
+  c->g[RDI_] = (uint64_t)sig;
+  c->g[RSI_] = P + SIGF_SIGINFO;
+  c->g[RDX_] = P;                  /* the ucontext */
+  c->rip = a->handler;
+  c->rsp = base;
+  /* Bit n of a Linux sigset is signal n+1, and userspace speaks that
+   * convention, so the signal's own bit is 1<<(sig-1) - as is a->mask, which
+   * arrived from userspace unchanged. */
+  t->sig_blocked |= (a->flags & SA_NODEFER_BIT) ? a->mask
+                                               : ((1ULL << (sig - 1)) | a->mask);
+  if (a->flags & SA_RESETHAND_BIT) a->handler = 0;
+  if (on_alt) t->sig_on_alt = 1;
+  return 1;
+}
+
+/* Called from the shared return path of both syscall doors, with the frame and
+ * the user's rbp. Delivers at most one signal per return, lowest number first,
+ * which is the order Linux uses and keeps a burst of pending signals from
+ * running the same handler recursively. */
+void sig_deliver_syscall(uint64_t *f, uint64_t rbp) {
+  task_t *t = task_at(task_current());
+  if (!t) return;
+  uint64_t pend = t->sig_pending & ~t->sig_blocked;
+  pend |= t->sig_pending & (1ULL << (9 - 1));   /* SIGKILL is not maskable */
+  if (!pend) return;
+  for (int sig = 1; sig < 32; sig++) {
+    uint64_t bit = 1ULL << (sig - 1);
+    if (!(pend & bit)) continue;
+    t->sig_pending &= ~bit;
+    sigctx_t c;
+    sig_get_sys(f, rbp, &c);
+    c.cr2 = 0; c.err = 0; c.trapno = 0;
+    int r = sig_deliver(sig, SI_USER_CODE, 0, &c);
+    if (r == 1) { sig_put_sys(f, &c); return; }
+    if (r == 0) continue;                 /* ignored: look for another */
+    /* -1: no frame could be built, -2: the default action is fatal. Either way
+     * the task dies, which is what Linux does rather than leaving a signal
+     * silently pending forever. 0x100 marks a death by signal, so wait4 can
+     * report WIFSIGNALED instead of an exit code of 128+n. */
+    task_kill_current(0x100u | (uint64_t)sig);
+    return;
+  }
+}
+
+/* The fault door's half: offer a synchronous signal to a handler. Returns 1 if
+ * the handler was entered (the caller returns straight back to user mode),
+ * 0 if there is nothing to do and the task must die. */
+static int sig_deliver_fault(int sig, uint64_t *f, uint64_t cr2, int code) {
+  sigctx_t c;
+  sig_get_fault(f, &c);
+  c.cr2 = cr2;
+  c.trapno = r3_fault_vec;
+  int r = sig_deliver(sig, code, cr2, &c);
+  if (r != 1) return 0;
+  sig_put_fault(f, &c);
+  return 1;
 }
 
 /* Copy a NUL-terminated string out of user memory without insisting the whole
@@ -2917,6 +3203,16 @@ static void r3_exit_now(uint64_t code) {
     serial_puthex(pmm_free_pages());
     serial_puts("\n");
   }
+  /* SIGCHLD tells the parent a child is gone. It is only *raised* here - the
+   * parent is not the task running, so it is taken at the parent's next syscall
+   * return, which is also where wait4 has a status to hand over. A thread exit
+   * does not notify: it shares the address space, and that sharing is the same
+   * distinction Linux draws with CLONE_THREAD. */
+  if (t && t->parent) {
+    task_t *p = task_at((uint32_t)t->parent);
+    if (p && p->mm != t->mm && !sig_is_ignored(p, 17))
+      p->sig_pending |= 1ULL << (17 - 1);
+  }
   task_kill_current(code);          /* does not return */
 }
 
@@ -3476,29 +3772,137 @@ static long linux_newfstatat(int dirfd, uint64_t path_u, uint64_t st_u, uint64_t
   return stat_by_path(path_u, st_u);
 }
 
-/* ------------------------------------------------------ signals (13, 14, 34) */
+/* ---------------------------------------------- signals (13, 14, 15, 62, 131) */
 
-/* A libc installs handlers the moment it starts and asks for its mask back. None
- * of it can ever fire: the kernel raises no signals, and a fault kills the task
- * rather than calling into it. Storing the request and answering it truthfully
- * is what keeps the startup path from failing - "remembered but never called" is
- * a smaller lie than -ENOSYS, and the gap is written down rather than guessed at.
- * SIGKILL and SIGSTOP cannot be blocked on Linux; neither can they here, since
- * the mask is not consulted. */
+/* A libc installs handlers the moment it starts and asks for its mask back. The
+ * whole record is kept, not just the address: a handler cannot be entered
+ * without knowing the restorer it returns through, the mask it adds, and the
+ * flags it asked for (SA_ONSTACK in particular decides *where* it runs). */
 static long linux_rt_sigaction(int sig, uint64_t act_u, uint64_t old_u, uint64_t sigsetsize) {
   if (sig <= 0 || sig > 31 || sigsetsize != 8) return -EINVAL;
+  if (sig == 9 || sig == 19) return -EINVAL;      /* SIGKILL, SIGSTOP: uncatchable */
   task_t *me = task_at(task_current());
   mm_t *mm = me ? me->mm : 0;
   if (!mm) return -EFAULT;
   if (old_u) {
-    uint64_t old[4] = { mm->sig_act[sig - 1], 0, 0, 0 };
+    uint64_t old[4] = { mm->sig_act[sig - 1].handler, mm->sig_act[sig - 1].flags,
+                        mm->sig_act[sig - 1].restorer, mm->sig_act[sig - 1].mask };
     if (user_put(old_u, old, sizeof old) != 0) return -EFAULT;
   }
   if (act_u) {
     uint64_t act[4];                       /* handler, flags, restorer, mask */
     if (user_copy((char *)act, act_u, sizeof act) != 0) return -EFAULT;
-    mm->sig_act[sig - 1] = act[0];
+    mm->sig_act[sig - 1].handler  = act[0];
+    mm->sig_act[sig - 1].flags    = act[1];
+    mm->sig_act[sig - 1].restorer = act[2];
+    mm->sig_act[sig - 1].mask     = act[3];
   }
+  return 0;
+}
+
+/* The trampoline libc's handler returns into calls this. The context it resumes
+ * is on the user stack, where the handler was entered, and it is the context the
+ * interrupted instruction needs - not the syscall frame rt_sigreturn itself
+ * arrived on. */
+static long linux_rt_sigreturn(void) {
+  task_t *t = task_at(task_current());
+  if (!t) return -EFAULT;
+  uint64_t *f = (uint64_t *)(uintptr_t)r3_frame_base;
+  uint64_t P = f[17];                      /* the interrupted rsp = the frame */
+  if (P < RING3_USER_MIN || P + SIGF_SIZE > RING3_LIMIT) return -EFAULT;
+  uint8_t buf[SIGF_SIZE];
+  if (user_copy((char *)buf, P, SIGF_SIZE) != 0) return -EFAULT;
+
+  const uint64_t *gr = (const uint64_t *)(buf + SIGF_GREGS);
+  sigctx_t c;
+  for (int i = 0; i < 23; i++) c.g[i] = gr[i];
+  c.rip = gr[RIP_];
+  c.rsp = gr[RSP_];
+  c.rflags = gr[EFL_];
+  /* musl's x86_64 sigcontext packs cs, gs, fs into CSGSFS and does not store ss
+   * at all, so the selector comes from the GDT here: 0x23 is user code, 0x1b is
+   * user data, and a ring-3 frame that resumes with anything else would fault on
+   * the next instruction fetch. */
+  c.cs = gr[CSGSFS_] & 0xffff;
+  c.ss = 0x1b;
+  if (!c.cs) c.cs = 0x23;
+  c.err = c.trapno = c.cr2 = 0;
+
+  sig_put_sys(f, &c);
+  t->sig_blocked = *(const uint64_t *)(buf + SIGF_MASK);
+  t->sig_on_alt = (uint32_t)*(const uint64_t *)(buf + SIGF_ALTFLAG);
+  return (long)c.g[RAX_];                  /* the syscall result that was cut off */
+}
+
+/* sigaltstack. Without this there is no way to catch a stack overflow: the
+ * handler would be entered on the stack that just ran out. */
+static long linux_sigaltstack(uint64_t ss_u, uint64_t old_u) {
+  task_t *t = task_at(task_current());
+  if (!t) return -EFAULT;
+  struct kstack { uint64_t sp; int32_t flags; uint32_t pad; uint64_t size; };
+  if (old_u) {
+    struct kstack o;
+    o.sp = t->sig_alt_sp;
+    o.size = t->sig_alt_size;
+    o.pad = 0;
+    o.flags = (t->sig_alt_flags & SS_DISABLE_BIT) ? SS_DISABLE_BIT
+            : (t->sig_on_alt ? SS_ONSTACK_BIT : 0);
+    if (user_put(old_u, &o, sizeof o) != 0) return -EFAULT;
+  }
+  if (ss_u) {
+    struct kstack n;
+    if (user_copy((char *)&n, ss_u, sizeof n) != 0) return -EFAULT;
+    if (n.flags & SS_DISABLE_BIT) {
+      t->sig_alt_sp = 0;
+      t->sig_alt_size = 0;
+      t->sig_alt_flags = SS_DISABLE_BIT;
+    } else {
+      /* Linux's minimum is 2048; anything smaller cannot hold the frame plus the
+       * handler's own, and failing here is far better than faulting there. */
+      if (n.size < 2048) return -ENOMEM;
+      if (!n.sp || n.sp < RING3_USER_MIN || n.sp + n.size > RING3_LIMIT) return -EPERM;
+      t->sig_alt_sp = n.sp;
+      t->sig_alt_size = n.size;
+      t->sig_alt_flags = 0;
+    }
+  }
+  return 0;
+}
+
+/* kill/tkill/tgkill. A task's id is its pid here, so a positive pid names one
+ * task directly. Process groups are not modelled: a negative pid is refused
+ * rather than silently aimed at the caller, which would be a very confusing way
+ * to be killed. */
+static long linux_kill(int pid, int sig) {
+  if (!task_at(task_current())) return -ESRCH;
+  if (sig < 0 || sig > 31) return -EINVAL;
+  uint32_t target;
+  if (pid > 0) target = (uint32_t)pid;
+  else if (pid == 0) target = task_current();
+  else return -ESRCH;
+  task_t *v = task_at(target);
+  if (!v || v->state == TASK_FREE || v->state == TASK_DEAD) return -ESRCH;
+  if (sig == 0) return 0;                  /* existence probe */
+  v->sig_pending |= 1ULL << (sig - 1);      /* bit n is signal n+1 */
+  if (v->state == TASK_BLOCKED) task_wake((int)target);   /* so it can take it */
+  return 0;
+}
+
+/* Is this signal explicitly ignored? Used where raising it would be pointless -
+ * a parent that set SIG_IGN on SIGCHLD is not waiting to hear about exits. */
+static int sig_is_ignored(task_t *t, int sig) {
+  if (!t || !t->mm || sig < 1 || sig > 31) return 0;
+  return t->mm->sig_act[sig - 1].handler == 1;   /* SIG_IGN */
+}
+
+/* rt_sigpending. POSIX means "blocked and waiting", not merely "raised", so the
+ * answer is the intersection: a signal that can be taken right now is not
+ * pending, it is about to be delivered. */
+static long linux_rt_sigpending(uint64_t set_u, uint64_t sigsetsize) {
+  task_t *t = task_at(task_current());
+  if (!t || sigsetsize != 8) return -EINVAL;
+  uint64_t set = t->sig_pending & t->sig_blocked;
+  if (set_u && user_put(set_u, &set, sizeof set) != 0) return -EFAULT;
   return 0;
 }
 
@@ -3711,10 +4115,21 @@ static long linux_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, 
     case 12:  return linux_brk(a0);                        /* brk */
     case 13:  return linux_rt_sigaction((int)a0, a1, a2, a3); /* rt_sigaction */
     case 14:  return linux_rt_sigprocmask((int)a0, a1, a2, a3); /* rt_sigprocmask */
+    case 15:  return linux_rt_sigreturn();                   /* rt_sigreturn */
+    case 127: return linux_rt_sigpending(a0, a1);            /* rt_sigpending */
+    case 62:  return linux_kill((int)a0, (int)a1);            /* kill */
+    case 200: return linux_kill((int)a0, (int)a1);            /* tkill(tid, sig) */
+    case 234: return linux_kill((int)a1, (int)a2);            /* tgkill(tgid, tid, sig) */
+    case 131: return linux_sigaltstack(a0, a1);               /* sigaltstack */
     case 16:  return linux_ioctl(a1, a2);                  /* ioctl */
-    case 34:  return -EINTR;                               /* pause: nothing can
-                                                            * arrive, so nothing
-                                                            * can interrupt it */
+    case 34: {                                             /* pause */
+      /* Now that signals exist, pause means what it says: sleep until one is
+       * raised at this task, then return -EINTR so the return path can deliver
+       * it. A signal already pending makes it a no-op, as on Linux. */
+      task_t *pt = task_at(task_current());
+      if (pt && !(pt->sig_pending & ~pt->sig_blocked)) task_block_current();
+      return -EINTR;
+    }
     case 20:  return linux_writev(a0, a1, a2);             /* writev */
     /* sched_yield: the polite "let something else run". Without it a program that
      * yields in a loop - which is how any spin-with-backoff is written, and what
@@ -4105,6 +4520,23 @@ long syscall_dispatch(uint64_t abi, uint64_t num, uint64_t a0, uint64_t a1, uint
       if (user_put(a1, out, sizeof out) != 0) return -EFAULT;
       return 1;
     }
+    case SYS_FONT: {
+      /* A ring-3 program that lays out and rasters its own text needs the
+       * outlines, and the only copy of them is the boot module. Copy out, never
+       * hand out the kernel pointer: the client must not be able to write to
+       * the kernel's own font bytes. */
+      unsigned char *p = 0;
+      int n = ttf_blob((int)a0, &p);
+      if (n <= 0) return -ENOENT;
+      if (a1 == 0) return n;                  /* ask how big it is */
+      if ((uint64_t)a2 < (uint64_t)n) return -ENOSPC;
+      /* A 700 KB face lands in a heap that malloc only reserved, so half of it is
+       * not mapped yet; user_put's byte loop cannot demand-page and a store to an
+       * untouched page is a panic with no useful stack. Prep the whole range. */
+      if (user_prep(a1, (uint64_t)n) != 0) return -EFAULT;
+      if (user_put(a1, p, (uint64_t)n) != 0) return -EFAULT;
+      return n;
+    }
     case SYS_WIN_TITLE: {
       char t[40];
       int n = winipc_title((int)a0, t, (int)((a2 < 40) ? a2 : 40));
@@ -4336,6 +4768,11 @@ __asm__(
 "  call syscall_dispatch\n"
 "  movq %rbx, %rsp\n"
 "  movq %rax, 104(%rsp)\n"   /* result becomes the user's rax */
+"  movq %rbx, %rdi\n"        /* frame, so a pending signal can be delivered */
+"  movq %rbp, %rsi\n"        /* user's rbp, untouched by the stub */
+"  andq $-16, %rsp\n"        /* the user's rsp at the syscall is arbitrary, so */
+"  call sig_deliver_syscall\n" /* the frame base is not 16-aligned: gcc's movdqa */
+"  movq %rbx, %rsp\n"        /* spills would #GP, as they did before this line */
 "  movq task_fpu_slot(%rip), %rax\n"
 "  fxrstor (%rax)\n"
 "  popq %r15\n"
@@ -4367,6 +4804,43 @@ __asm__(
 ".global r3_isr_fault\n"
 ".type r3_isr_fault, @function\n"
 "r3_isr_fault:\n"
+"  movq $14, r3_fault_vec(%rip)\n"   /* #PF: the address is in cr2 */
+"  jmp r3_isr_fault_body\n"
+".global r3_isr_fault_gp\n"
+".type r3_isr_fault_gp, @function\n"
+"r3_isr_fault_gp:\n"
+"  movq $13, r3_fault_vec(%rip)\n"   /* #GP: no address, and no cr2 to trust */
+"  jmp r3_isr_fault_body\n"
+/* #DE, #UD and #MF push no error code, so one is fabricated to keep the frame
+ * the same shape: [0] error [1] rip [2] cs [3] rflags [4] rsp [5] ss. Without
+ * it every field is off by one and err would read as rip. */
+".global r3_isr_fault_de\n"
+".type r3_isr_fault_de, @function\n"
+"r3_isr_fault_de:\n"
+"  pushq $0\n"
+"  movq $0, r3_fault_vec(%rip)\n"    /* #DE: divide error -> SIGFPE */
+"  jmp r3_isr_fault_body\n"
+".global r3_isr_fault_ud\n"
+".type r3_isr_fault_ud, @function\n"
+"r3_isr_fault_ud:\n"
+"  pushq $0\n"
+"  movq $6, r3_fault_vec(%rip)\n"    /* #UD: invalid opcode -> SIGILL */
+"  jmp r3_isr_fault_body\n"
+".global r3_isr_fault_mf\n"
+".type r3_isr_fault_mf, @function\n"
+"r3_isr_fault_mf:\n"
+"  pushq $0\n"
+"  movq $16, r3_fault_vec(%rip)\n"   /* #MF: x87 error -> SIGFPE */
+"  jmp r3_isr_fault_body\n"
+/* #AC does push an error code, and is the one exception here that is expected
+ * to fire on purpose: a guard-page check in a JIT can use alignment checks
+ * instead of a faulting load. */
+".global r3_isr_fault_ac\n"
+".type r3_isr_fault_ac, @function\n"
+"r3_isr_fault_ac:\n"
+"  movq $17, r3_fault_vec(%rip)\n"   /* #AC: alignment check -> SIGBUS */
+"  jmp r3_isr_fault_body\n"
+"r3_isr_fault_body:\n"
 "  pushq %rax\n"
 "  pushq %rbx\n"
 "  pushq %rcx\n"
@@ -4385,7 +4859,10 @@ __asm__(
 "  movq task_fpu_slot(%rip), %rax\n"
 "  fxsave (%rax)\n"
 "  leaq 120(%rsp), %rdi\n"        /* 15 saved registers, then the frame */
-"  call ring3_fault\n"
+"  movq %rsp, %rbx\n"              /* a fault arrives at an arbitrary rsp, so */
+"  andq $-16, %rsp\n"              /* it cannot be assumed 16-aligned, and gcc's */
+"  call ring3_fault\n"             /* movdqa spills #GP on a frame that is not */
+"  movq %rbx, %rsp\n"
 "  movq task_fpu_slot(%rip), %rax\n"
 "  fxrstor (%rax)\n"
 "  popq %r15\n"
@@ -4411,6 +4888,11 @@ __asm__(
 extern void *task_fpu_slot;        /* set by the scheduler on every switch */
 extern void r3_syscall_stub(void);
 extern void r3_isr_fault(void);
+extern void r3_isr_fault_gp(void);
+extern void r3_isr_fault_de(void);
+extern void r3_isr_fault_ud(void);
+extern void r3_isr_fault_mf(void);
+extern void r3_isr_fault_ac(void);
 
 void ring3_fault(uint64_t *f) {
   uint64_t err = f[0], rip = f[1], cs = f[2];
@@ -4428,10 +4910,41 @@ void ring3_fault(uint64_t *f) {
      * it, is the other half of fork: the copy happens now and the instruction
      * retries. Checked before the not-present case because the page is there -
      * what it lacks is permission, and permission is ours to grant. */
-    if ((err & 1) && (err & 2) && cow_fault(cr2 & ~0xFFFULL)) return;
+    /* Both service paths are #PF-only. A #DE or #UD carries no address, so cr2
+     * still holds the last page fault's - and serving *that* would map an
+     * unrelated page, return to the faulting instruction, and fault again
+     * forever, with the task spinning and nothing printed. */
+    if (r3_fault_vec == 14) {
+      if ((err & 1) && (err & 2) && cow_fault(cr2 & ~0xFFFULL)) return;
 
-    /* Not-present faults inside a SYS_VM_ALLOC region are demand paging. */
-    if (!(err & 1) && vm_fault_in(cr2, err)) return;
+      /* Not-present faults inside a SYS_VM_ALLOC region are demand paging. */
+      if (!(err & 1) && vm_fault_in(cr2, err)) return;
+    }
+
+    /* Nothing in the kernel can serve it, so the fault becomes a signal - and a
+     * handler gets first refusal. This is the whole point of the mechanism for a
+     * JIT: its guard pages are touched on purpose, and its stack-overflow check
+     * runs on an alternate stack precisely because this frame's stack is gone. */
+    {
+      /* Which signal an exception becomes is the ISA's business, not the
+       * handler's: a JIT distinguishes a divide error from a guard-page hit by
+       * si_signo, and V8 installs different handlers for each. */
+      int sig;
+      switch (r3_fault_vec) {
+        case 0:  case 16: sig = 8;  break;   /* #DE, #MF -> SIGFPE */
+        case 6:           sig = 4;  break;   /* #UD      -> SIGILL */
+        case 17:          sig = 7;  break;   /* #AC      -> SIGBUS */
+        default:          sig = 11; break;   /* #PF, #GP -> SIGSEGV */
+      }
+      /* cr2 belongs to #PF; after a #GP or #UD it still holds whatever the last
+       * page fault left there, and handing that to a handler as si_addr would
+       * send it chasing an address that has nothing to do with this fault. */
+      int code = (r3_fault_vec == 14)
+               ? ((err & 1) ? SEGV_ACCERR_CODE : SEGV_MAPERR_CODE)
+               : SI_KERNEL_CODE;
+      if (sig_deliver_fault(sig, f, (r3_fault_vec == 14) ? cr2 : 0, code))
+        return;
+    }
   }
 
   serial_puts("[ring3] fault: rip=");
@@ -4460,8 +4973,10 @@ void ring3_fault(uint64_t *f) {
     serial_puts("[ring3] killed user task ");
     serial_puts(task_name(task_current()));
     serial_puts(" (isolation held)\n");
-    /* no exit code: this task did not leave through sys_exit */
-    task_kill_current((uint64_t)-1);
+    /* Killed by the fault itself, so it reports as death by SIGSEGV rather than
+     * an exit code - which is what a parent that is checking for a crash wants to
+     * see. */
+    task_kill_current(0x100u | 11u);
   }
 
   serial_puts("[ring3] FATAL: fault in kernel mode, task=");
@@ -4643,8 +5158,12 @@ void ring3_init(void) {
   kpml4_virt = (uint64_t *)(hhdm_offset + kpml4_phys);
 
   idt_set_gate_raw(0x80, (void *)r3_syscall_stub, 1);   /* DPL 3: callable */
-  idt_set_gate_raw(13, (void *)r3_isr_fault, 0);        /* #GP */
+  idt_set_gate_raw(0,  (void *)r3_isr_fault_de, 0);     /* #DE */
+  idt_set_gate_raw(6,  (void *)r3_isr_fault_ud, 0);     /* #UD */
+  idt_set_gate_raw(13, (void *)r3_isr_fault_gp, 0);     /* #GP */
   idt_set_gate_raw(14, (void *)r3_isr_fault, 0);        /* #PF */
+  idt_set_gate_raw(16, (void *)r3_isr_fault_mf, 0);     /* #MF */
+  idt_set_gate_raw(17, (void *)r3_isr_fault_ac, 0);     /* #AC */
 
   rfs_init();                     /* seed /hello.txt and friends */
 

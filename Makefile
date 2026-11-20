@@ -57,6 +57,14 @@ POWER_DEMO ?= 0
 # MENU_DEMO=1 opens the start menu at first paint, so a screenshot shows it.
 MENU_DEMO ?= 0
 TRAY_DEMO ?= 0
+# CTM_DEMO=1 opens the taskbar's right-click menu at first paint.
+CTM_DEMO ?= 0
+PERF     ?= 0
+BENCH    ?= 0
+RASTER_MT ?= 0
+ifeq ($(BENCH),1)
+PERF     := 1
+endif
 
 CFLAGS := -target x86_64-unknown-none-elf \
           -ffreestanding \
@@ -78,6 +86,8 @@ CFLAGS := -target x86_64-unknown-none-elf \
           -DOMI_POWER_DEMO=$(POWER_DEMO) \
           -DOMI_MENU_DEMO=$(MENU_DEMO) \
           -DOMI_TRAY_DEMO=$(TRAY_DEMO) \
+          -DOMI_CTM_DEMO=$(CTM_DEMO) -DOMI_PERF=$(PERF) -DOMI_BENCH=$(BENCH) -DOMI_RASTER_MT=$(RASTER_MT) \
+          -DOMI_CTM_DEMO=$(CTM_DEMO) \
           -g
 
 # Use GCC-compatible flags if using cross compiler
@@ -116,6 +126,7 @@ BUILTINS := $(shell ls /usr/lib/llvm-*/lib/clang/*/lib/linux/libclang_rt.builtin
 # Source files
 SOURCES := $(KERNEL_DIR)/boot/limine_boot.c \
            $(KERNEL_DIR)/lib/string.c \
+           $(KERNEL_DIR)/work.c \
            $(KERNEL_DIR)/lib/builtins_shim.c \
            $(KERNEL_DIR)/mm/kmalloc.c \
            $(KERNEL_DIR)/mm/mmio.c \
@@ -331,7 +342,7 @@ userland/ominet.elf: userland/ominet.c userland/fetch.c userland/omilayout.c \
                      userland/glyphs.h userland/roots_user.o
 	$(MAKE) -C userland ominet.elf
 
-$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf userland/tlsget.elf userland/surftest.elf userland/scene.elf userland/comp.elf userland/omirender.elf userland/surfexit.elf userland/ominet.elf userland/vmtest.elf userland/shmtest.elf userland/surfbig.elf userland/unixpair.elf userland/scmtest.elf userland/unixname.elf userland/credtest.elf userland/formtest.elf userland/imgtest.elf userland/memtest.elf userland/sandtest.elf userland/power.elf
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf userland/tlsget.elf userland/surftest.elf userland/scene.elf userland/comp.elf userland/omirender.elf userland/surfexit.elf userland/ominet.elf userland/vmtest.elf userland/shmtest.elf userland/sigtest.elf userland/surfbig.elf userland/unixpair.elf userland/scmtest.elf userland/unixname.elf userland/credtest.elf userland/formtest.elf userland/imgtest.elf userland/memtest.elf userland/sandtest.elf userland/power.elf
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -377,6 +388,7 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	@if [ -f userland/ominet.elf ]; then cp userland/ominet.elf $(ISO_ROOT)/apps/ominet.elf; else echo "no ominet.elf: skipping"; fi
 	@if [ -f userland/vmtest.elf ]; then cp userland/vmtest.elf $(ISO_ROOT)/apps/vmtest.elf; else echo "no vmtest.elf: skipping"; fi
 	@if [ -f userland/shmtest.elf ]; then cp userland/shmtest.elf $(ISO_ROOT)/apps/shmtest.elf; else echo "no shmtest.elf: skipping"; fi
+	@if [ -f userland/sigtest.elf ]; then cp userland/sigtest.elf $(ISO_ROOT)/apps/sigtest.elf; else echo "no sigtest.elf: skipping"; fi
 	@if [ -f userland/surfbig.elf ]; then cp userland/surfbig.elf $(ISO_ROOT)/apps/surfbig.elf; else echo "no surfbig.elf: skipping"; fi
 	@if [ -f userland/unixpair.elf ]; then cp userland/unixpair.elf $(ISO_ROOT)/apps/unixpair.elf; else echo "no unixpair.elf: skipping"; fi
 	@if [ -f userland/scmtest.elf ]; then cp userland/scmtest.elf $(ISO_ROOT)/apps/scmtest.elf; else echo "no scmtest.elf: skipping"; fi

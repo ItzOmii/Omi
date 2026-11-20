@@ -132,8 +132,7 @@ int main(void) {
    * guard, and musl's allocator puts one in front of its heap precisely so that
    * an overflow faults. The assertion is about a child dying, so it is made from
    * a child: this process stays alive to prove the range comes back afterwards.
-   * The kernel kills a faulting task with 255 - there is no signal status yet, so
-   * "exited 255" is what a violation looks like here. */
+   * A violation is now a death by SIGSEGV, reported through wait as such. */
   unsigned char *g = mmap(0, PAGE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   check(g != MAP_FAILED, "reserve a page with PROT_NONE", g == MAP_FAILED ? -1 : 0, 0);
   if (g != MAP_FAILED) {
@@ -145,9 +144,14 @@ int main(void) {
     }
     int st = 0;
     int reaped = kid > 0 ? (int)waitpid(kid, &st, 0) : -1;
+    /* The reader must die, and die of SIGSEGV. It used to be checked as exit
+     * code 255, which was the kernel's stand-in before signal deaths were
+     * reported as signal deaths; WIFSIGNALED is what a program can actually
+     * tell apart from _exit(11). */
+    int died = WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV;
     int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
-    check(reaped == (int)kid && code == 255,
-          "a read of a PROT_NONE page kills the reader", code, 255);
+    check(reaped == (int)kid && died,
+          "a read of a PROT_NONE page kills the reader with SIGSEGV", code, -1);
 
     int mp = mprotect(g, PAGE, PROT_READ | PROT_WRITE);
     check(mp == 0, "mprotect gives a PROT_NONE range back", mp, 0);
@@ -170,9 +174,10 @@ int main(void) {
     }
     int st = 0;
     int reaped = kid > 0 ? (int)waitpid(kid, &st, 0) : -1;
+    int died = WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV;
     int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
-    check(reaped == (int)kid && code == 255,
-          "a write into a read-only page kills the writer", code, 255);
+    check(reaped == (int)kid && died,
+          "a write into a read-only page kills the writer with SIGSEGV", code, -1);
     int mp = mprotect(ro, PAGE, PROT_READ | PROT_WRITE);
     if (mp == 0) ro[0] = 9;
     check(mp == 0 && ro[0] == 9, "and it was the protection, not the mapping", mp == 0 ? ro[0] : -1, 9);

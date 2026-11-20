@@ -11,6 +11,18 @@
 #include <stdint.h>
 #include "fd.h"
 
+/* One installed signal action. `handler` is the user address, 0 for SIG_DFL and
+ * 1 for SIG_IGN - the two values a libc writes through sigaction(). `restorer`
+ * is the trampoline the handler returns into: on x86_64 there is no other way
+ * back, because the handler is entered with a return address that must lead to
+ * rt_sigreturn. */
+typedef struct {
+  uint64_t handler;
+  uint64_t flags;
+  uint64_t restorer;
+  uint64_t mask;      /* signals to block *in addition* while the handler runs */
+} sigact_t;
+
 /* 20 was enough while the boot ran four demo processes; the standalone apps and
  * the thread tests together ran past it, and the failure looked like a broken
  * futex rather than a full table. Headroom is cheap: 16 KB of kernel stack each.
@@ -115,7 +127,12 @@ typedef struct {
    * installed here is remembered and read back but never called. A libc asks at
    * startup and reads the answer back, so storing beats -ENOSYS; the absence of
    * delivery is the documented gap, not the storage. */
-  uint64_t  sig_act[32];  /* handler address per signal 1..31, 0 = default */
+  /* Signal handlers, per process (Linux keeps them on the thread group). The
+   * old array held the handler address alone, which is not enough to *run* one:
+   * a handler installed by libc returns through a restorer trampoline it supplies
+   * (SA_RESTORER is implicit on x86_64), carries its own sa_mask, and needs its
+   * flags read back verbatim. */
+  sigact_t  sig_act[32];
   /* Set when this space ever forked or was forked from, so its teardown is worth
    * auditing: the bank's contents are only interesting once a participant goes. */
   int       cow_participant;
@@ -170,8 +187,19 @@ typedef struct {
   uint64_t cow_copies;
   uint64_t cow_steals;
   uint64_t last_cow_va;
-  uint64_t sig_blocked; /* per-thread signal mask, stored but never consulted:
-                         * nothing is ever delivered, so it can never stop one */
+  uint64_t sig_blocked; /* per-thread signal mask. A signal is taken only if it
+                         * is not in here, so unblocking is a delivery point:
+                         * the syscall that lowers the mask returns into the
+                         * handler, exactly as Linux does. */
+  uint64_t sig_pending; /* raised and still waiting: set by kill/tkill, cleared
+                         * when the handler is entered. Kept even while blocked,
+                         * which is what makes a blocked signal "pending". */
+  uint64_t sig_alt_sp;  /* sigaltstack: where a handler runs when the thread's
+                         * own stack is the thing that broke (SA_ONSTACK). */
+  uint64_t sig_alt_size;
+  uint32_t sig_alt_flags;
+  uint32_t sig_on_alt;  /* this thread is executing on its alt stack right now,
+                         * which sigaltstack reports back as SS_ONSTACK */
   uint64_t wait_addr;   /* futex word this thread sleeps on, 0 = not waiting */
   mm_t    *wait_mm;
   /* Someone wants this task gone (the compositor, when the window it owned was

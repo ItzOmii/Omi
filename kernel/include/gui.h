@@ -77,6 +77,7 @@ int font_string_width(const char *str);
 /* ========== GUI Functions ========== */
 void gui_init(void);
 void gui_compose(void);
+void gui_bench(int n);   /* OMI_BENCH builds: N frames, marked in the serial log */
 void gui_main_loop(void);
 
 /* Direct framebuffer access for low-level debug */
@@ -87,6 +88,7 @@ extern uint32_t g_fb_pitch;
 
 void debug_rect(int x, int y, int w, int h, uint32_t color);
 void gui_open_start_menu(void);   /* MENU_DEMO: open the start menu */
+void gui_open_ctm(void);          /* CTM_DEMO: open the taskbar context menu */
 void gui_open_tray(int which);    /* TRAY_DEMO: open the audio (1) or network (2) panel */
 void gui_activate_power_row(void);/* MENU_DEMO: run the shut-down row */
 void gui_open_files_app(void);    /* MENU_DEMO: open the files app */

@@ -489,6 +489,11 @@ static void prime(task_t *t, uint64_t rip, uint64_t cs, uint64_t rdi,
   t->fs_base = 0;
   t->ctid = 0;
   t->sig_blocked = 0;
+  t->sig_pending = 0;
+  t->sig_alt_sp = 0;
+  t->sig_alt_size = 0;
+  t->sig_alt_flags = 0;
+  t->sig_on_alt = 0;
   /* Start from the FPU state this cpu is in right now, never from zeros: an
    * fxsave image of all zeros carries an invalid MXCSR. */
   __asm__ volatile("fxsave %0" : "=m"(t->fpu));
@@ -535,9 +540,22 @@ int task_spawn_ap_idle(uint32_t apic_id, uint64_t stack_top) {
 void sched_ap_enter(int idle_id) {
   *cur_slot() = idle_id;
   task_fpu_slot = tasks[idle_id].fpu;
+  unsigned long long spins = 0;
   for (;;) {
     __asm__ volatile("sti");
     task_yield();          /* int 0x81: pick, switch, and come back here */
+#if OMI_BENCH
+    /* is this core even alive, and does it see ready work? */
+    if ((++spins & 0x3FFFFF) == 0) {
+      int ready = 0;
+      for (int i = 1; i < ntasks; i++) if (tasks[i].state == TASK_READY) ready++;
+      serial_puts("[ap] core=");
+      serial_puthex((uint64_t)lapic_this_id());
+      serial_puts(" idle spins, ready tasks=");
+      serial_puthex((uint64_t)ready);
+      serial_puts("\n");
+    }
+#endif
   }
 }
 

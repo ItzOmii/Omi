@@ -227,21 +227,59 @@ with specific properties. Here is the honest ledger, in the order the work has t
    is written against this kernel's own numbers, and the ABI switch would be a second door, so it is
    the violation. One filtered door is the point - it is also why a musl-linked binary cannot be run
    under a filter today.
-4. **A font stack beyond one 8×16 bitmap face**, and text shaping. Half of this is done: the shell
-   draws its headings with real TrueType — Bricolage for display, JetBrains Mono for anything that
-   has to line up — through stb_truetype, with the faces arriving as boot modules and a bitmap
-   fallback if they are missing. What is missing is the other half: Omi Net still lays its own text
-   out with the bitmap face, and no glyph is shaped (no kerning, no ligatures, no complex scripts).
-   Chromium renders through Skia and HarfBuzz and expects both.
-5. **A GPU or a fast software raster.** Every pixel is composed on the CPU today.
+4. **A font stack beyond one 8×16 bitmap face**, and text shaping. Done for both clients: the shell
+   draws with real TrueType, and Omi Net now does too — `SYS_FONT` copies the boot module faces into
+   the process, `userland/omittf.h` rasterises them in ring 3 through stb_truetype, and the wrapper
+   and the painter share one 26.6 accumulation so a line cannot be measured at one width and drawn at
+   another. Glyphs are placed on real advances with kerning from the font's own table, at five sizes
+   (12 / 13 / 14 / 17 / 26), with 8-bit coverage blended through the same rasteriser the rest of the
+   page uses. What shaping still means here is the rest of it: no ligatures, no marks, no bidirectional
+   or complex-script reordering, and no OpenType feature selection — HarfBuzz's real work. Ranges
+   outside Latin-1 draw a box.
+5. **A GPU or a fast software raster.** Every pixel is composed on the CPU today. The raster is now
+   measured rather than described: `make BEN=1` builds a wall-clock frame benchmark (40 frames, timed
+   from outside the VM, because the guest cannot time itself honestly). On this machine, virtualised
+   with KVM, fixing the kernel's byte-at-a-time `memcpy`/`memset` and rewriting the supersample
+   filters took a full frame from 7.58 ms to 5.55 ms and a draw-only frame from 4.04 ms to 2.06 ms;
+   the box filter alone fell from 3.54 ms to 0.90 ms because it was dividing three times per output
+   pixel. The wallpaper copy did not move - 4 MB into the backbuffer is bandwidth-bound at ~1.5 ms
+   whatever the loop looks like - which is the argument for not repainting it. What is left is structural,
+   not constant: a keystroke still repaints and presents the whole screen, so the next step is damage
+   rectangles in the kernel compositor, not more micro-optimisation. Tiles across cores are written
+   (`kernel/work.c`, `RASTER_MT=1`) and off by default, because application processors stop accepting
+   work after boot — they run the pinned-worker test during `smp_start_workers` and then never pick a
+   thread spawned later, with no fault and no log. That is the next real bug in this area.
 6. **A JavaScript engine.** The largest single chunk, and the last to attempt: V8 wants the cage, the
    threads, the signal-based traps, and a memory model this kernel does not have yet.
+
+**The stylesheet is now parsed, not guessed at.** Omi Net used to walk a sheet with a flat brace
+scan — find `{`, copy up to the first `}`. Any `@media` block desynchronised it, so on a real site
+only the rules before the first one applied and everything after was shredded; `var(--x)` values
+were silently dropped, and every rule was applied in source order with no specificity. The cascade is
+now a real one: comments, strings and `url()` are stepped over, `@media`/`@supports` recurse with the
+condition recorded on the rule and tested against the viewport width, `@font-face`/`@keyframes` are
+skipped, `:root` custom properties are collected and `var(--x, fallback)` expanded before any value
+is parsed, and selectors are matched right-to-left with descendant and child combinators, class
+lists, attribute tests and `:first-child`/`:last-child`/`:root`. Rules carry a specificity and a
+source position, so `#sidebar a` beats `a` and equal specificity keeps sheet order. Against
+`iana.org`'s own 121 KB sheet that is 1446 rules and 86 custom properties applied, where before it
+was a handful.
+
+Lengths are parsed as lengths: `px`, `em`, `rem`, `%`, `pt`, `ex`/`ch`, resolved against the
+element's own font size or its containing box. `padding: 0 1em` used to be one pixel and
+`max-width: 60rem` sixty, which is the whole reason a styled page came out as a cramped column.
+`line-height`, `list-style: none`, and `max-width` with `margin: 0 auto` are honoured, and
+`display: flex` over inline-only content (a nav bar, a breadcrumb, a row of footer links) is laid out
+as one wrapped line of inline boxes built from the same segments as ordinary text, so link hit
+testing and the measure invariant are unchanged.
 
 **The realistic near-term target** is not Chromium itself but a modern engine in-process: keep
 Omi Net's fetching and process model, replace the hand-written CSS box model with an inline
 formatting context (floats, percentage widths, inline boxes — the reason a gallery page lays out as
 text instead of a grid), and let the engine stay a single process until the compositor and SMP work
-lands. Chromium becomes reachable only after items 1–3, and pretending otherwise would waste the
+lands. Flex over inline content is the first slice of that; a real flex row beside a `<main>`, which
+is what `iana.org`'s own `article.sidenav` asks for, still needs boxes and is honestly not there
+yet. Chromium becomes reachable only after items 1–3, and pretending otherwise would waste the
 next year.
 
 ---

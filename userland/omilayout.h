@@ -66,6 +66,13 @@ int web_count(void);
 int web_ops_full(void);
 const web_op_t *web_ops(void);
 int web_line_height(int font);
+/* Supply real metrics once the client has real faces: line height and ascent per
+ * font id. Both are optional - leaving them off keeps the bitmap's numbers. */
+void web_font_metrics(int (*line_h)(int font), int (*ascent)(int font));
+/* How much of a stylesheet survived the scanner: rules, and custom properties. */
+int web_rule_count(void);
+int web_var_count(void);
+int web_font_ascent(int font);
 /* How many times the 8x16 bitmap a font id is drawn at: 1 or 2. The measure
  * function must multiply by this too, or the layout wraps at the wrong width. */
 int web_font_scale(int font);

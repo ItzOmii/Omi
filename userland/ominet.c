@@ -35,8 +35,12 @@
 #define SYS_TICKS        4
 #define SYS_MEMINFO      41
 
-#define WIN_W  440
-#define WIN_H  360
+/* The window a browser opens at. 440x360 was a test fixture's size, and it put
+ * every page on the wrong side of the desktop breakpoints: at 438 CSS pixels the
+ * IANA sheet correctly collapses to a single column, so the browser looked like it
+ * had ignored the stylesheet when it had actually honoured the narrow layout. */
+#define WIN_W  900
+#define WIN_H  620
 /* The client area, inside the compositor's chrome. Not a constant any more: the
  * window can be maximised or dragged bigger, and every frame is laid out for the
  * size it actually has. */
@@ -428,6 +432,7 @@ static int dbg_ink = 0;   /* surface ink probe: flip to 1 to measure a paint */
 /* After the surface and its size: the rasteriser works on the includer's pix,
  * cw and ch, which is what makes it shareable by two clients. */
 #include "omitext.h"
+#include "omittf.h"    /* real outlines, blended through the same rasteriser */
 
 static long sys3(long n, long a, long b, long c) {
   long r;
@@ -504,7 +509,10 @@ static char last_ip[16];
 
 /* Width of a run in the face it will be drawn in. It has to agree with
  * web_font_scale(), or lines wrap at a width the renderer does not honour. */
+static int omi_faces_ready;   /* set once SYS_FONT has handed over the outlines */
+
 static int user_measure(int font, const char *s) {
+  if (omi_faces_ready) return omi_face_measure(font, s);
   return (int)strlen(s) * GLYPH_W * web_font_scale(font);
 }
 
@@ -883,6 +891,8 @@ static void paint(long win, int off) {
   int n = show_ops ? web_count() : 0;
   const web_op_t *ops = web_ops();
   unsigned long np_drawn = 0, np_chars = 0;
+  unsigned long np_font[5] = {0, 0, 0, 0, 0};   /* which faces the page asks for */
+  unsigned long np_bold = 0, np_runs = 0;
   unsigned long long cyc0 = __builtin_ia32_rdtsc();
   for (int bi = 0; bi < nb; bi++) {
   const int band_top = bt[bi], band_bot = bb[bi];
@@ -916,9 +926,21 @@ static void paint(long win, int off) {
       }
     } else if (o->text) {
       np_chars += (unsigned long)strlen(o->text);
-      int sc = web_font_scale(o->font);
-      text_scaled(px0 + o->x, oy, o->text, o->color, sc);
-      if (o->bold) text_scaled(px0 + o->x + sc, oy, o->text, o->color, sc);
+      np_font[o->font < 0 ? 0 : o->font > 4 ? 4 : o->font]++;
+      np_runs++; if (o->bold) np_bold++;
+      if (omi_faces_ready) {
+        /* The line box is the face's own height now, so the baseline is where the
+         * metrics say it is - not a fixed 12px from the top of a bitmap. */
+        int base = oy + web_font_ascent(o->font);
+        omi_face_draw(o->font, px0 + o->x, base, o->text, o->color);
+        /* <strong> and <b>: the layout marks the run, the face table does not
+         * know it, so weight it the same way the bitmap path did. */
+        if (o->bold) omi_face_draw(o->font, px0 + o->x + 1, base, o->text, o->color);
+      } else {
+        int sc = web_font_scale(o->font);
+        text_scaled(px0 + o->x, oy, o->text, o->color, sc);
+        if (o->bold) text_scaled(px0 + o->x + sc, oy, o->text, o->color, sc);
+      }
     }
   }
   }
@@ -979,6 +1001,11 @@ static void paint(long win, int off) {
     int sw = (int)strlen(OMI_BUILD) * GLYPH_W;
     if (cw > sw + 40) text(cw - 20 - sw, ch - GLYPH_H - 8, OMI_BUILD, C_DIM);
   }
+
+  { static int told;
+    if (np_chars && told++ < 3)
+      printf("[net] faces used 12px:%lu 14px:%lu mono:%lu 17px:%lu 26px:%lu bold:%lu of %lu\n",
+             np_font[3], np_font[0], np_font[2], np_font[4], np_font[1], np_bold, np_runs); }
 
   /* the exact-pixel marker: chrome, so it does not move with the page */
   fill(MARGIN, ch - 6, 24, 4, C_MARK);
@@ -1131,6 +1158,20 @@ int main(void) {
   }
   if (!page) { printf("[net] no page buffer at all\n"); return 1; }
 
+  /* Real outlines, if the kernel has them. Both the wrapper and the painter take
+   * their numbers from these, which is what keeps a line inside its box. */
+  if (omi_face_init()) {
+    omi_faces_ready = 1;
+    web_font_metrics(omi_face_line_h, omi_face_ascent);
+    printf("[net] faces: display %d bytes, mono %d bytes\n",
+           (int)(omi_font_bytes[0] ? 1 : 0), (int)(omi_font_bytes[1] ? 1 : 0));
+    printf("[net] line heights %d/%d/%d/%d/%d ascent %d\n",
+           omi_face_line_h(0), omi_face_line_h(1), omi_face_line_h(2),
+           omi_face_line_h(3), omi_face_line_h(4), omi_face_ascent(0));
+  } else {
+    printf("[net] no outlines: keeping the 8x16 bitmap face\n");
+  }
+
   win_id = sys3(SYS_WIN_OPEN, (long)"Omi Net", WIN_W, WIN_H);
   check(win_id > 0, "the window opens", win_id, 1);
 
@@ -1151,10 +1192,10 @@ int main(void) {
   web_image_provider(provide_image);
   web_css_provider(provide_css);
   printf("[net] omi net build %s\n", OMI_BUILD);
-  /* Real type: the two faces the ISO already ships for the shell. */
-  printf("[net] font sans=%d mono=%d\n",
-         font_load(FONT_SANS, "/fonts/Bricolage.ttf"),
-         font_load(FONT_MONO, "/fonts/JBMono.ttf"));
+  /* The faces arrive as boot modules, not as files, so this path is dead - it has
+   * always returned -1 and printing it only ever looked like a failure. The real
+   * load is omi_face_init() at the top of main. */
+  (void)font_load;
 
   long t_start = sys3(SYS_TICKS, 0, 0, 0);
 
@@ -1205,11 +1246,16 @@ int main(void) {
     const web_op_t *o = &web_ops()[i];
     if (!o->text) continue;
     runs++;
-    int r = o->x + (int)strlen(o->text) * GLYPH_W;
+    /* Measured the way it will be painted. This check used to assume the 8x16
+     * bitmap - eight pixels a character - which stopped meaning anything the
+     * moment the page got real outlines, and reported a 430px run in a 422px
+     * column that was in fact 422px wide. */
+    int r = o->x + user_measure(o->font, o->text);
     if (r > maxr) maxr = r;
   }
   printf("[net] layout %d ops, %d text runs, widest %d px, height %d\n",
          nops, runs, maxr, content_h);
+  printf("[net] css: %d rules, %d custom properties in use\n", web_rule_count(), web_var_count());
   check(nops > 0, "the page produced a display list", nops, 1);
   check(runs >= 4, "the page has text runs to paint", runs, 4);
   check(maxr <= measure_w, "no text run escapes the measure", maxr, measure_w);

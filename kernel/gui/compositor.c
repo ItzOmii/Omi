@@ -8,6 +8,8 @@
 #include "../include/e1000.h"
 #include "../include/font.h"
 #include "../include/gui.h"
+#include "../include/walltime.h"
+#include "../include/work.h"   /* rows across cores */
 #include "../include/kmalloc.h"
 #include "../include/media.h"
 #include "../include/hda.h"
@@ -2256,6 +2258,19 @@ static void draw_help_window(void) {
 /* ===================================================================== */
 
 
+/* One band of the wallpaper copy: rows are independent, so the only decision is
+ * how many of them make a task worth dispatching. */
+#define WALL_ROWS 32
+struct walljob { uint32_t *dst, *src; int w, h, rows; };
+static void wallband(void *arg, int i) {
+  struct walljob *j = (struct walljob *)arg;
+  int y0 = i * j->rows, y1 = y0 + j->rows;
+  if (y1 > j->h) y1 = j->h;
+  size_t bytes = (size_t)j->w * sizeof(uint32_t);
+  for (int y = y0; y < y1; y++)
+    memcpy(j->dst + (size_t)y * j->w, j->src + (size_t)y * j->w, bytes);
+}
+
 static void draw_wallpaper(void) {
   /* MeepOS paper desktop: #EDEBDD, a 22px dot grid at 16,16, and
      radial-gradient(120% 80% at 50% 0%, rgba(255,255,255,.34), transparent 62%).
@@ -2265,6 +2280,15 @@ static void draw_wallpaper(void) {
   int w = (int)screen_width, h = (int)screen_height;
 
   if (!cache || cw != w || ch != h || cdark != appearance_dark) {
+#if OMI_PERF
+    { static int rb; char b[64]; int i = 0; const char *m = "[wall] rebuild #";
+      while (*m) b[i++] = *m++;
+      char t[12]; int n = 0; rb++;
+      int x = rb; if (!x) t[n++] = '0';
+      while (x) { t[n++] = (char)('0' + x % 10); x /= 10; }
+      while (n) b[i++] = t[--n];
+      b[i] = 0; serial_puts(b); serial_puts("\n"); }
+#endif
     if (cache) kfree(cache);
     cache = (uint32_t *)kmalloc((size_t)w * h * sizeof(uint32_t));
     cw = w; ch = h; cdark = appearance_dark;
@@ -2315,8 +2339,16 @@ static void draw_wallpaper(void) {
     }
   }
 
-  for (int y = 0; y < h; y++)
-    memcpy(backbuffer + (size_t)y * w, cache + (size_t)y * w, (size_t)w * sizeof(uint32_t));
+  /* Four megabytes into the backbuffer every frame. Rows are independent, so
+   * this is the cheapest thing on the machine to spread. */
+  int bands = (h + WALL_ROWS - 1) / WALL_ROWS;
+  if (work_threads() > 1 && bands > 1) {
+    struct walljob j = { backbuffer, cache, w, h, WALL_ROWS };
+    work_run(wallband, &j, bands);
+  } else {
+    for (int y = 0; y < h; y++)
+      memcpy(backbuffer + (size_t)y * w, cache + (size_t)y * w, (size_t)w * sizeof(uint32_t));
+  }
 }
 
 /* no desktop icons in the MeepOS environment: the shell is the layout, nothing else */
@@ -4507,9 +4539,10 @@ static void draw_tray(void) {
       tray_mute_rect(&mx, &my, &mw, &mh);
       meep_box(mx, my, mw, mh, UI_SCALE_VAL(6), MEEP_LINE_SOFT,
                audio_muted() ? MEEP_ACCENT : MEEP_PAPER3);
-      int g = UI_SCALE_VAL(13);
+      const int gs = 13;                 /* meep_icon scales its own size */
+      int g = UI_SCALE_VAL(gs);
       meep_icon(audio_muted() ? ICON_VOLUME_OFF : ICON_VOLUME,
-                mx + UI_SCALE_VAL(7), my + (mh - g) / 2, g, MEEP_INK);
+                mx + UI_SCALE_VAL(7), my + (mh - g) / 2, gs, MEEP_INK);
     }
   }
   for (int which = 1; which <= 2; which++) {
@@ -4525,7 +4558,9 @@ static void draw_tray(void) {
       ic = (audio_muted() || audio_volume() == 0) ? ICON_VOLUME_OFF : ICON_VOLUME;
     else
       ic = tray_net_up() ? ICON_NET : ICON_NET_OFF;
-    meep_icon(ic, ix, iy, iw, MEEP_INK);
+    /* iw is already in this pass's pixels; meep_icon scales what it is given,
+       so it takes the base size and fills the icon box exactly */
+    meep_icon(ic, ix, iy, TRAY_ICON_BASE, MEEP_INK);
   }
 }
 
@@ -4661,10 +4696,12 @@ static int ctm_h(void) { return UI_SCALE_VAL(CTM_ROW_H) * CTM_N + UI_SCALE_VAL(1
  * buffer passes that buffer's scale as k (the same trick draw_cursor uses). */
 static void ctm_rect_k(int *x, int *y, int *w, int *h, int k) {
   int cw = UI_SCALE_VAL(CTM_W_BASE), ch = ctm_h();
-  int px = ctm_x * k;
+  int px = ctm_x * k;              /* the anchor is stored at 1x; k scales it */
   /* sit entirely above the bar: a menu that overlaps it gets clipped by the
-     chrome pass, and the bottom row would be unreadable */
-  int py = taskbar_y() * k - ch - UI_SCALE_VAL(6);
+     chrome pass, and the bottom row would be unreadable. taskbar_y() and
+     UI_SCALE_VAL() are already in the calling pass's pixels, so only the anchor
+     takes k - scaling the bar's own y by it put the panel off screen. */
+  int py = taskbar_y() - ch - UI_SCALE_VAL(6);
   if (py < UI_SCALE_VAL(8)) py = UI_SCALE_VAL(8);
   if (px + cw > (int)screen_width - UI_SCALE_VAL(8))
     px = (int)screen_width - UI_SCALE_VAL(8) - cw;
@@ -4673,6 +4710,15 @@ static void ctm_rect_k(int *x, int *y, int *w, int *h, int k) {
 }
 static void ctm_rect(int *x, int *y, int *w, int *h) {
   ctm_rect_k(x, y, w, h, 1);
+}
+
+/* CTM_DEMO: park the pointer's menu anchor mid-screen and open the menu, so a
+ * screenshot shows the panel and its border rather than three floating rows. */
+void gui_open_ctm(void) {
+  ctm_x = (int)screen_width / (ui_scale > 0 ? ui_scale * 2 : 2);   /* anchor is 1x */
+  ctm_y = taskbar_y();
+  ctm_hover = 0;
+  ctm_open = 1;
 }
 
 static int ctm_row_at(int x, int y) {
@@ -4700,10 +4746,10 @@ static void ctm_activate(int r) {
   full_redraw = 1;
 }
 
-static void draw_ctm(void) {
+static void draw_ctm(int k) {
   if (!ctm_open) return;
   int px, py, pw, ph;
-  ctm_rect_k(&px, &py, &pw, &ph, SX);
+  ctm_rect_k(&px, &py, &pw, &ph, k);
   meep_box(px, py, pw, ph, UI_SCALE_VAL(8), MEEP_LINE, MEEP_PAPER2);
   for (int i = 0; i < CTM_N; i++) {
     if (i != ctm_hover) continue;
@@ -7066,15 +7112,19 @@ static void ss_fill_region(int x, int y, int w, int h) {
   if (x + w > W) w = W - x;
   if (y + h > H) h = H - y;
   if (w <= 0 || h <= 0) return;
+  /* Row at a time. The old order wrote one 1x pixel's 3x3 block before moving
+   * on, so it stepped down three ss rows for every source pixel and came back -
+   * three streams over the same lines. Filling a whole ss row per source row
+   * walks memory once. */
   for (int py = y; py < y + h; py++) {
-    const uint32_t *src = backbuffer + (size_t)py * W;
+    const uint32_t *src = backbuffer + (size_t)py * W + x;
     int sy = py * SX;
-    for (int px = x; px < x + w; px++) {
-      uint32_t c = src[px];
-      int sx = px * SX;
-      for (int dy = 0; dy < SX; dy++) {
-        uint32_t *row = ss_buf + (size_t)(sy + dy) * ss_w + sx;
-        for (int dx = 0; dx < SX; dx++) row[dx] = c;
+    for (int dy = 0; dy < SX; dy++) {
+      uint32_t *row = ss_buf + (size_t)(sy + dy) * ss_w + x * SX;
+      if (SX == 3) {
+        for (int px = 0; px < w; px++) { uint32_t c = src[px]; row[0] = c; row[1] = c; row[2] = c; row += 3; }
+      } else {
+        for (int px = 0; px < w; px++) { uint32_t c = src[px]; for (int dx = 0; dx < SX; dx++) row[dx] = c; row += SX; }
       }
     }
   }
@@ -7089,20 +7139,49 @@ static void ss_blend_region(int x, int y, int w, int h) {
   if (x + w > W) w = W - x;
   if (y + h > H) h = H - y;
   if (w <= 0 || h <= 0) return;
+  /* Two things made this the most expensive loop in the shell. It divided three
+   * times per output pixel - `r / 9` is an idiv, ~20 cycles each, ~60 cycles a
+   * pixel before anything else - and it read the ss buffer column-wise, so each
+   * pass touched 3 lines of it per output row. Now: one multiply per channel by a
+   * reciprocal that is exact for the whole 0..2295 range (checked against every
+   * possible sum), a hoisted row pointer, and a straight-through copy when the
+   * block is one colour, which is most of a taskbar. */
   const int n = SX * SX;
+  const unsigned mul = (SX == 3) ? 7282u : (SX == 2 ? 16384u : 65536u);
+  const int shift = (SX == 3) ? 16 : (SX == 2 ? 16 : 16);
   for (int py = y; py < y + h; py++) {
-    uint32_t *dst = backbuffer + (size_t)py * W;
-    int sy = py * SX;
-    for (int px = x; px < x + w; px++) {
-      int sx = px * SX;
+    uint32_t *dst = backbuffer + (size_t)py * W + x;
+    const uint32_t *s0 = ss_buf + (size_t)(py * SX) * ss_w + x * SX;
+    for (int px = 0; px < w; px++) {
+      const uint32_t *p0 = s0 + px * SX;
+      const uint32_t *p1 = p0 + ss_w;
+      const uint32_t *p2 = p1 + ss_w;
+      uint32_t c00 = p0[0];
+      if (SX == 3) {
+        /* flat block: 8 compares against 9 adds + 6 shifts + 3 multiplies */
+        if (c00 == p0[1] && c00 == p0[2] && c00 == p1[0] && c00 == p1[1] &&
+            c00 == p1[2] && c00 == p2[0] && c00 == p2[1] && c00 == p2[2]) {
+          dst[px] = c00;
+          continue;
+        }
+        int r = ((p0[0] >> 16) & 0xFF) + ((p0[1] >> 16) & 0xFF) + ((p0[2] >> 16) & 0xFF)
+              + ((p1[0] >> 16) & 0xFF) + ((p1[1] >> 16) & 0xFF) + ((p1[2] >> 16) & 0xFF)
+              + ((p2[0] >> 16) & 0xFF) + ((p2[1] >> 16) & 0xFF) + ((p2[2] >> 16) & 0xFF);
+        int g = ((p0[0] >> 8) & 0xFF) + ((p0[1] >> 8) & 0xFF) + ((p0[2] >> 8) & 0xFF)
+              + ((p1[0] >> 8) & 0xFF) + ((p1[1] >> 8) & 0xFF) + ((p1[2] >> 8) & 0xFF)
+              + ((p2[0] >> 8) & 0xFF) + ((p2[1] >> 8) & 0xFF) + ((p2[2] >> 8) & 0xFF);
+        int b = (p0[0] & 0xFF) + (p0[1] & 0xFF) + (p0[2] & 0xFF)
+              + (p1[0] & 0xFF) + (p1[1] & 0xFF) + (p1[2] & 0xFF)
+              + (p2[0] & 0xFF) + (p2[1] & 0xFF) + (p2[2] & 0xFF);
+        dst[px] = MAKE_COLOR((r * mul) >> shift, (g * mul) >> shift, (b * mul) >> shift);
+        continue;
+      }
       int r = 0, g = 0, b = 0;
       for (int dy = 0; dy < SX; dy++) {
-        const uint32_t *row = ss_buf + (size_t)(sy + dy) * ss_w + sx;
+        const uint32_t *row = p0 + (size_t)dy * ss_w;
         for (int dx = 0; dx < SX; dx++) {
           uint32_t c = row[dx];
-          r += (c >> 16) & 0xFF;
-          g += (c >> 8) & 0xFF;
-          b += c & 0xFF;
+          r += (c >> 16) & 0xFF; g += (c >> 8) & 0xFF; b += c & 0xFF;
         }
       }
       dst[px] = MAKE_COLOR(r / n, g / n, b / n);
@@ -7130,12 +7209,111 @@ static void ss_prepare(void) {
 
 static int cur_pop_x, cur_pop_y, cur_pop_w, cur_pop_h;
 
+/* ---- frame cost, measured -------------------------------------------------
+ * "Faster" is a claim until something counts. PERF=1 builds this in and prints
+ * cycles per section every 120 frames; a shipping build compiles it out and pays
+ * nothing for it. Cycles, not milliseconds: the tick is 100 Hz and a frame is
+ * well under one, so the timer resolution would round every frame to zero. */
+#ifndef OMI_PERF
+#define OMI_PERF 0
+#endif
+#if OMI_PERF
+static inline uint64_t perf_rdtsc(void) {
+  uint32_t lo, hi;
+  __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+  return ((uint64_t)hi << 32) | lo;
+}
+/* wall, prep, draw, blend, apps, text - cycles, averaged over the window */
+static uint64_t perf_acc[6];
+static int perf_frames;
+static void perf_probe(void);
+/* Under TCG a "cycle" is whatever the emulator decides it is, so raw rdtsc deltas
+ * are only good for ranking. Calibrate once against the 100 Hz tick and every
+ * number below is microseconds of real time, emulator included. */
+static uint64_t perf_hz;
+static uint64_t perf_us(uint64_t cyc) {
+  if (!perf_hz) return cyc;            /* not calibrated: raw cycles */
+  return (cyc * 1000000ULL) / perf_hz;
+}
+static void perf_report(const uint64_t *v) {
+  perf_probe();
+  for (int k = 0; k < 6; k++) perf_acc[k] += v[k];
+  if (++perf_frames < 10) return;
+  static const char *names[7] = {"[frame] wall %d", " prep %d", " draw %d",
+                                 " blend %d", " apps %d", " text %d", "  (us/frame, 10 frames)\n"};
+  for (int k = 0; k < 7; k++) {
+    const char *f = names[k];
+    if (k == 6) { serial_puts(f); break; }
+    char b[48]; int i = 0;
+    for (const char *p = f; *p; p++) {
+      if (*p != '%') { b[i++] = *p; continue; }
+      p++;
+      char t[24]; int n = 0; uint64_t x = perf_us(perf_acc[k] / 10);
+      if (!x) t[n++] = '0';
+      while (x) { t[n++] = (char)('0' + x % 10); x /= 10; }
+      while (n) b[i++] = t[--n];
+    }
+    b[i] = 0; serial_puts(b);
+  }
+  for (int k = 0; k < 6; k++) perf_acc[k] = 0;
+  perf_frames = 0;
+}
+/* One-shot probe: how long do the primitives actually take? If a 4 MB memcpy is
+ * fast here, the frame cost is in the loops above it; if it is slow, the memory
+ * path is the problem and no amount of loop rewriting will help. */
+static void perf_probe(void) {
+  static int done;
+  if (done) return;
+  done = 1;
+  const size_t n = 4u << 20;
+  uint32_t *a = (uint32_t *)kmalloc(n);
+  uint32_t *b = (uint32_t *)kmalloc(n);
+  if (!a || !b) { serial_puts("[probe] no room\n"); if (a) kfree(a); if (b) kfree(b); return; }
+  memset(a, 0xAB, n);
+  uint64_t t0 = perf_rdtsc();
+  memcpy(b, a, n);
+  uint64_t t1 = perf_rdtsc();
+  memset(b, 0x11, n);
+  uint64_t t2 = perf_rdtsc();
+  uint64_t acc = 0;
+  for (size_t i = 0; i < n / 4; i++) acc += b[i];
+  uint64_t t3 = perf_rdtsc();
+  char msg[160]; int i = 0;
+  const char *m = "[probe] memcpy4M "; const char *p2;
+  for (p2 = m; *p2; p2++) msg[i++] = *p2;
+  uint64_t v[3] = {t1 - t0, t2 - t1, t3 - t2};
+  const char *labs[3] = {" memset4M ", " sum4M ", "  (cycles, acc "};
+  for (int k = 0; k < 3; k++) {
+    for (p2 = labs[k]; *p2; p2++) msg[i++] = *p2;
+    char t[24]; int nn = 0; uint64_t x = v[k];
+    if (!x) t[nn++] = '0';
+    while (x) { t[nn++] = (char)('0' + x % 10); x /= 10; }
+    while (nn) msg[i++] = t[--nn];
+  }
+  msg[i] = 0;
+  serial_puts(msg); serial_puts(")\n");
+  (void)acc;
+  kfree(a); kfree(b);
+}
+
+static inline uint64_t pt_now(void) { return perf_rdtsc(); }
+static inline uint64_t pt_since(uint64_t t) { return perf_rdtsc() - t; }
+#else
+#define pt_now() 0ULL
+#define pt_since(t) 0ULL
+#define perf_report(v) do { (void)(v); } while (0)
+#endif
+
 static void gui_draw_all(void) {
   const int rs = ui_scale > 0 ? ui_scale : 1;
   const int W = (int)screen_width, H = (int)screen_height;
 
+  uint64_t pv[6] = {0, 0, 0, 0, 0, 0};
+  uint64_t pwt = pt_now();
+
   /* 1. background, at 1x - already matches the browser render pixel for pixel */
   draw_wallpaper();
+  pv[0] = pt_since(pwt);
 
   ss_prepare();
   if (!ss_buf) {                    /* out of memory: fall back to hard edges */
@@ -7145,6 +7323,7 @@ static void gui_draw_all(void) {
     draw_cursor(mouse_x, mouse_y);
     draw_taskbar_text();
     draw_tray_text();
+    draw_ctm(1);
     draw_ctm_text();
     return;
   }
@@ -7175,6 +7354,8 @@ static void gui_draw_all(void) {
   if (cur_box_w) ss_fill_region(cur_box_x, cur_box_y, cur_box_w, cur_box_h);
   if (cur_pop_w) ss_fill_region(cur_pop_x, cur_pop_y, cur_pop_w, cur_pop_h);
 
+  uint64_t p1 = pt_now();   /* prep: the three ss_fill_region calls above */
+
   /* 4. draw the shell into the supersampled buffer */
   uint32_t *rb = backbuffer;
   uint32_t rw = screen_width, rh = screen_height;
@@ -7186,7 +7367,7 @@ static void gui_draw_all(void) {
   menu_bar_height = 0;
 
   draw_start_menu();                       /* under the bar, above the windows */
-  draw_ctm();
+  draw_ctm(SX);
   draw_taskbar();
   draw_tray();                             /* icons in the bar, panel above it */
   draw_cursor(mouse_x * SX, mouse_y * SX);
@@ -7196,6 +7377,7 @@ static void gui_draw_all(void) {
   screen_height = rh;
   ui_scale = rs;
   menu_bar_height = mb_saved;
+  uint64_t pa = pt_now();           /* shell drawn into the ss buffer */
 
   /* 5. box-filter back down over the wallpaper */
   ss_blend_region(0, 0, W, mb_h);
@@ -7205,13 +7387,18 @@ static void gui_draw_all(void) {
 
   cur_box_x = nx; cur_box_y = ny; cur_box_w = cw; cur_box_h = chh;
   cur_pop_x = px; cur_pop_y = py; cur_pop_w = pw; cur_pop_h = ph;
+  uint64_t pb = pt_now();           /* step 5: the box filters */
+
+  uint64_t p3 = pt_now();   /* shell drawn; the blends below are the filters */
 
   /* 6. apps and widgets sit on the wallpaper, under the shell's own chrome */
   apps_draw();
+  uint64_t p4 = pt_now();
 
   /* 6b. the taskbar and an open start menu are chrome: never behind a window */
   ss_blend_region(dx, dy, dw, dh);
   if (pw) ss_blend_region(px, py, pw, ph);
+  uint64_t pc = pt_now();           /* 6b: chrome back over the windows */
 
   /* 7. type on top, at 1x, with the atlas' own anti-aliasing */
   draw_taskbar_text();
@@ -7220,7 +7407,53 @@ static void gui_draw_all(void) {
   draw_cursor(mouse_x, mouse_y);        /* keep the pointer above the windows */
 
   full_redraw = 1;                  /* dirty rects are in ss coords; blit whole frames */
+  uint64_t p5 = pt_now();
+  pv[1] = p1 - pwt - pv[0];          /* step 3: the ss fills that clear last frame */
+  pv[2] = pa - p1;                  /* step 4: shell drawn into the ss buffer */
+  pv[3] = pb - pa;                  /* step 5: the box filters */
+  pv[4] = p4 - pb;                  /* apps_draw */
+  pv[5] = p5 - pc;                  /* type on top */
+  perf_report(pv);
 }
+
+#ifndef OMI_BENCH
+#define OMI_BENCH 0
+#endif
+#if OMI_BENCH
+/* A repeatable frame cost, measured from outside the VM.
+ *
+ * rdtsc was the obvious instrument and it lied: this dev VM runs under TCG, where
+ * a 4 MB memset reads as 100 M "cycles" because every guest instruction is
+ * interpreted. Wall clock on the host is the honest number - the serial log is
+ * written as it goes, so the gap between "start" and "done" in it is how long N
+ * frames really took, emulator and all. Both halves are timed separately because
+ * drawing and presenting fail independently: the first is a raster problem, the
+ * second is a bus problem. */
+void gui_bench(int n) {
+  char b[48]; int i = 0;
+  /* One second of the wall clock, against the same counter the sections use. The
+   * PIT was the obvious ruler and it was 85x out - task_sleep_ticks(TASK_TICK_HZ)
+   * does not return after a second of TCG time, and every section then read as
+   * microseconds when it was milliseconds. */
+  uint64_t s0 = 0, s1 = 0; uint32_t n0 = 0, n1 = 0;
+  walltime_now(&s0, &n0);
+  uint64_t c0 = perf_rdtsc();
+  task_sleep_ticks(TASK_TICK_HZ);
+  uint64_t c1 = perf_rdtsc();
+  walltime_now(&s1, &n1);
+  uint64_t ns = (s1 - s0) * 1000000000ULL + (uint64_t)n1 - (uint64_t)n0;
+  if (ns > 1000000ULL) perf_hz = (c1 - c0) * 1000000000ULL / ns;
+  serial_puts("[bench] draw+present start\n");
+  for (int k = 0; k < n; k++) { gui_force_redraw(); gui_draw_all(); fb_swap_buffers(); }
+  serial_puts("[bench] draw+present done\n");
+  serial_puts("[bench] draw-only start\n");
+  for (int k = 0; k < n; k++) { gui_force_redraw(); gui_draw_all(); }
+  serial_puts("[bench] draw-only done\n");
+  (void)b; (void)i;
+}
+#else
+void gui_bench(int n) { (void)n; }
+#endif
 
 void gui_force_redraw(void) {
   needs_redraw = 1;

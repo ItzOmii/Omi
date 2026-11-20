@@ -573,6 +573,9 @@ void _start(void) {
   /* The address window, before anything that allocates from it. */
   ring3_spawn_elf("vmtest", "vmtest.elf", 0);
   ring3_spawn_elf("shmtest", "shmtest.elf", 0);
+  /* Signals: handlers, alternate stacks, and faults offered to a handler - the
+   * three things a JIT needs before it can run at all. */
+  ring3_spawn_elf("sigtest", "sigtest.elf", 0);
   ring3_spawn_elf("surfbig", "surfbig.elf", 0);
   ring3_spawn_elf("disk",   "init.elf", 10);
   ring3_spawn_elf("unixpair", "unixpair.elf", 0);
@@ -604,6 +607,12 @@ void _start(void) {
 #endif /* !OMI_DEV_BOOT */
 
   ring3_spawn_elf("ominet", "ominet.elf", 0);
+#if OMI_BENCH
+  /* give the desktop a few seconds to settle, then measure it in place */
+  task_sleep_ticks(600);
+  serial_puts("[bench] settling done\n");
+  gui_bench(40);
+#endif
 #if OMI_DEV_BOOT
   /* The two suites that own the socket paths the browser depends on, so a dev
    * boot still proves they hold - they need no network and cost a second. */
@@ -649,6 +658,9 @@ void _start(void) {
   /* TRAY_DEMO=1 opens the audio panel, =2 the network one: the same reason the
    * menu has a demo switch - a panel nobody can photograph is not evidence. */
   gui_open_tray(OMI_TRAY_DEMO);
+#endif
+#if OMI_CTM_DEMO
+  gui_open_ctm();
 #endif
 
 #if OMI_MENU_DEMO == 1

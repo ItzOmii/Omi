@@ -6,20 +6,35 @@
 
 /* ========== Memory Functions ========== */
 
+/* 8 bytes a store, and rep stosq for the bulk of it. The byte loop this replaces
+ * cost ~25 cycles a byte, which is 25 * 4 MB = 100 M cycles for one wallpaper
+ * copy - two thirds of a frame. rdtsc says so; see the PERF build. */
 void *memset(void *s, int c, size_t n) {
   uint8_t *p = (uint8_t *)s;
-  while (n--) {
-    *p++ = (uint8_t)c;
+  uint8_t v = (uint8_t)c;
+  while (((uintptr_t)p & 7) && n) { *p++ = v; n--; }
+  size_t q = n >> 3;
+  if (q) {
+    uint64_t v8 = 0x0101010101010101ULL * (uint64_t)v;
+    __asm__ volatile("rep stosq" : "+D"(p), "+c"(q) : "a"(v8) : "memory");
   }
+  n &= 7;
+  while (n--) *p++ = v;
   return s;
 }
 
+/* Words, not bytes. This is the compositor's hot path: every window blit, every
+ * taskbar fill and every frame of the supersampled box filter ends up here. */
 void *memcpy(void *dest, const void *src, size_t n) {
   uint8_t *d = (uint8_t *)dest;
   const uint8_t *s = (const uint8_t *)src;
-  while (n--) {
-    *d++ = *s++;
+  while (((uintptr_t)d & 7) && n) { *d++ = *s++; n--; }
+  size_t q = n >> 3;
+  if (q) {
+    __asm__ volatile("rep movsq" : "+D"(d), "+S"(s), "+c"(q) :: "memory");
+    n &= 7;
   }
+  while (n--) *d++ = *s++;
   return dest;
 }
 
@@ -27,16 +42,11 @@ void *memmove(void *dest, const void *src, size_t n) {
   uint8_t *d = (uint8_t *)dest;
   const uint8_t *s = (const uint8_t *)src;
 
-  if (d < s) {
-    while (n--) {
-      *d++ = *s++;
-    }
-  } else {
-    d += n;
-    s += n;
-    while (n--) {
-      *--d = *--s;
-    }
+  if (d < s || d >= s + n) return memcpy(dest, src, n);   /* no overlap: the fast path */
+  d += n;
+  s += n;
+  while (n--) {
+    *--d = *--s;
   }
   return dest;
 }

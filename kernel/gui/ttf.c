@@ -135,6 +135,16 @@ int ttf_init(void) {
 
 int ttf_ready(void) { return ttf_init(); }
 
+int ttf_blob(int face, unsigned char **p) {
+  if (face != TTF_DISPLAY && face != TTF_MONO) return 0;
+  void *b = 0;
+  uint64_t n = 0;
+  const char *want = face == TTF_MONO ? "JBMono.ttf" : "Bricolage.ttf";
+  if (!meep_module_find(want, &b, &n) || !b || n < 1024) return 0;
+  if (p) *p = (unsigned char *)b;
+  return (int)n;
+}
+
 int ttf_ascent(int face, int px) {
   if (!ttf_init() || !have[face]) return px;
   int a, d, g;

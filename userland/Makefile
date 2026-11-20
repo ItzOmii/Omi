@@ -40,6 +40,7 @@ PROGS += scene.elf
 PROGS += comp.elf
 PROGS += vmtest.elf
 PROGS += shmtest.elf
+PROGS += sigtest.elf
 PROGS += surfbig.elf
 PROGS += unixpair.elf
 PROGS += scmtest.elf
@@ -192,6 +193,12 @@ shmtest.elf: shmtest.c
 
 vmtest.elf: vmtest.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping vmtest"; exit 0; }
+	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
+
+# Signals, the way a JIT uses them: handlers, alt stacks, faults as SIGSEGV.
+sigtest.elf: sigtest.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping sigtest"; exit 0; }
 	musl-gcc -static -O2 -no-pie -o $@ $<
 	@echo "built $@"
 

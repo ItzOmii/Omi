@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include "omilayout.h"
@@ -50,7 +51,13 @@ static int nops, capops;
 static int page_h;
 static web_measure_fn meas;
 
-typedef struct { const char *sel; int sellen; const char *decls; int decllen; } rule_t;
+typedef struct {
+  const char *sel; int sellen;
+  const char *decls; int decllen;
+  int spec;        /* specificity: id*100 + (class|attr|pseudo-class)*10 + tag */
+  int order;       /* source position, so equal specificity keeps sheet order */
+  int min_px, max_px;   /* the @media window this rule lives in, -1 when none */
+} rule_t;
 static rule_t rules[MAX_RULES];
 static int nrules;
 static web_image_fn img_fn;
@@ -91,8 +98,14 @@ typedef struct {
   const char *href;            /* set while inside <a href>, does inherit */
   int form;                    /* form index, -1 outside a <form>; inherits */
   int grid;                    /* >0: lay children out in this many columns */
+  int min_px;                  /* a heading's own size: CSS may not shrink it */
   int floated;                 /* float: left - a gallery cell, in practice */
   int inline_block;            /* display: inline-block */
+  int max_w;                   /* max-width in px, 0 = none */
+  int centered;                /* margin-left/right: auto */
+  int list_none;               /* list-style: none - no bullet, no indent */
+  int line_mul;                /* line-height as a percentage, 0 = the face's own */
+  int flex_row;                /* display: flex over inline-only content */
 } st_t;
 
 #define OMI_CELL_LAYOUT 0   /* see the note at the cell placement, below */
@@ -191,6 +204,27 @@ static int face_scale[5] = {1, 2, 1, 1, 2};   /* body, display(h1/h2), mono, alt
 static int face_asc[5]  = {12, 24, 12, 12, 24};
 static int face_desc[5] = {4, 8, 4, 4, 8};
 
+/* When the client has real outlines it also has real metrics, and the line boxes
+ * below have to be its numbers rather than the bitmap's - otherwise a 26px heading
+ * is laid out in an 18px line and the next block lands on its descenders. */
+static int (*face_line_h_fn)(int font);
+static int (*face_ascent_fn)(int font);
+
+void web_font_metrics(int (*line_h)(int font), int (*ascent)(int font)) {
+  face_line_h_fn = line_h;
+  face_ascent_fn = ascent;
+}
+
+int web_font_ascent(int font) {
+  if (font < 0) font = 0;
+  if (font > 4) font = 4;
+  if (face_ascent_fn) {
+    int a = face_ascent_fn(font);
+    if (a > 0) return a;
+  }
+  return face_asc[font];
+}
+
 int web_font_scale(int font) {
   if (font < 0) font = 0;
   if (font > 4) font = 4;
@@ -200,6 +234,10 @@ int web_font_scale(int font) {
 int web_line_height(int font) {
   if (font < 0) font = 0;
   if (font > 4) font = 4;
+  if (face_line_h_fn) {
+    int h = face_line_h_fn(font);
+    if (h > 0) return h;
+  }
   return face_asc[font] + face_desc[font] + 2;
 }
 
@@ -293,6 +331,90 @@ static int parse_px(const char *v, int n) {
   return neg ? -val : val;
 }
 
+/* Font sizes with their units honoured. parse_px() reads the digits and drops the
+ * unit, which is right for a margin in px and wrong for every font-size on the
+ * web: `font-size: 100%` parsed as 100px, so a page that styles its body with a
+ * percentage rendered all of its text on the display face. Percentages resolve
+ * against the 16px default, em/rem the same way (there is no cascade to inherit
+ * from), and points convert at 4/3. */
+static int parse_font_px(const char *v, int n) {
+  int i = 0;
+  while (i < n && (v[i] == ' ' || v[i] == ':')) i++;
+  int neg = 0;
+  if (i < n && (v[i] == '-' || v[i] == '+')) { neg = (v[i] == '-'); i++; }
+  long ip = 0;
+  while (i < n && v[i] >= '0' && v[i] <= '9') { ip = ip * 10 + (v[i] - '0'); i++; }
+  long frac = 0; int fd = 0;
+  if (i < n && v[i] == '.') {
+    i++;
+    while (i < n && v[i] >= '0' && v[i] <= '9' && fd < 2) { frac = frac * 10 + (v[i] - '0'); fd++; i++; }
+  }
+  /* the value in hundredths, so 1.5em does not become 1em */
+  long h = ip * 100 + (fd == 0 ? 0 : fd == 1 ? frac * 10 : frac);
+  const char *u = v + i;
+  int un = n - i;
+  long px;
+  if (un >= 1 && u[0] == '%')      px = (h * 16 + 5000) / 10000;
+  else if (un >= 2 && u[1] == 'm') px = (h * 16 + 50) / 100;     /* em, rem */
+  else if (un >= 2 && u[1] == 't') px = (h * 4 + 50) / 300;      /* pt */
+  else                             px = (h + 50) / 100;          /* px, unitless */
+  if (px <= 0) return 0;
+  return (int)(neg ? -px : px);
+}
+
+/* The pixel size behind each face, so `em` can be resolved. */
+static const int font_px_tab[5] = { 14, 26, 13, 12, 17 };
+static int font_px_of(int font) { return (font >= 0 && font < 5) ? font_px_tab[font] : 16; }
+
+/* A real CSS length. parse_px() drops the unit, which turns `padding: 0 1em` into
+ * one pixel and `max-width: 60rem` into sixty - the reason a styled page rendered
+ * as a cramped column with no container. em resolves against the element's own
+ * font size, rem against the 16px root, % against the containing box, pt at 4/3. */
+static int parse_len(const char *v, int n, int font_px, int box_px) {
+  int i = 0;
+  while (i < n && (v[i] == ' ' || v[i] == '\t' || v[i] == ':')) i++;
+  if (i >= n) return 0;
+  int neg = 0;
+  if (v[i] == '-' || v[i] == '+') { neg = (v[i] == '-'); i++; }
+  if (i < n && (v[i] < '0' || v[i] > '9') && v[i] != '.') {
+    /* keywords that carry a length */
+    if (n - i >= 4 && ci_eq(v + i, "auto", 4)) return 0;
+    if (n - i >= 6 && ci_eq(v + i, "normal", 6)) return 0;
+    return 0;
+  }
+  long ip = 0;
+  while (i < n && v[i] >= '0' && v[i] <= '9') { ip = ip * 10 + (v[i] - '0'); i++; }
+  int frac = 0, fdig = 0;
+  if (i < n && v[i] == '.') { i++; while (i < n && v[i] >= '0' && v[i] <= '9') { frac = frac * 10 + (v[i] - '0'); fdig++; i++; } }
+  long hundredths = ip * 100 + (fdig ? (frac * 100) / (fdig == 1 ? 10 : fdig == 2 ? 100 : 1000) : 0);
+  long px;
+  if (i < n && v[i] == '%')            px = box_px > 0 ? (hundredths * box_px) / 10000 : 0;
+  else if (i + 2 < n && (v[i]|0x20) == 'r' && (v[i+1]|0x20) == 'e' && (v[i+2]|0x20) == 'm')
+                                       px = (hundredths * 16) / 100;
+  else if (i < n && (v[i]|0x20) == 'e' && i + 1 < n && (v[i+1]|0x20) == 'm')
+                                       px = (hundredths * (font_px > 0 ? font_px : 16)) / 100;
+  else if (i < n && (v[i]|0x20) == 'p' && i + 1 < n && (v[i+1]|0x20) == 't')
+                                       px = (hundredths * 4) / 300;
+  else if (i < n && ((v[i]|0x20) == 'e' || (v[i]|0x20) == 'c') && i + 1 < n && ((v[i+1]|0x20) == 'x' || (v[i+1]|0x20) == 'h'))
+                                       px = (hundredths * (font_px > 0 ? font_px : 16)) / 200;
+  else                                 px = (hundredths + 50) / 100;
+  if (px > 4000) px = 4000;
+  return (int)(neg ? -px : px);
+}
+
+/* css 1-4 value shorthand: all / v h / t h b / t r b l */
+static int parse_box_lens(const char *v, int n, int *vals, int max, int font_px, int box_px) {
+  int cnt = 0, i = 0;
+  while (i < n && cnt < max) {
+    while (i < n && (v[i] == ' ' || v[i] == '\t')) i++;
+    if (i >= n) break;
+    int s = i;
+    while (i < n && v[i] != ' ' && v[i] != '\t') i++;
+    vals[cnt++] = parse_len(v + s, i - s, font_px, box_px);
+  }
+  return cnt;
+}
+
 /* css 1-4 value shorthand: all / v h / t h b / t r b l */
 static int parse_box_values(const char *v, int n, int *vals, int max) {
   int cnt = 0, i = 0;
@@ -345,7 +467,10 @@ static int sel_is_simple(const char *s, int n) {
   }
   return 1;
 }
+static int expand_vars(const char *v, int n, char *out, int cap);   /* below */
 static int decl_ctx_simple;   /* set per rule, before its declarations run */
+static int viewport_w = 800;
+/* the width @media queries are answered against */
 
 static void apply_decls(st_t *st, const char *d, int len) {
   int i = 0;
@@ -366,6 +491,17 @@ static void apply_decls(st_t *st, const char *d, int len) {
     const char *v = d + c + 1;
     int vn = e - c - 1;
     while (vn > 0 && (*v == ' ')) { v++; vn--; }
+    /* var(--x) is how every themed sheet writes its colours and sizes; expand
+     * before parsing or the value is the literal text "var(--x)". */
+    char vbuf[112];
+    if (vn > 4) {
+      for (int k = 0; k + 3 < vn; k++)
+        if ((v[k]|0x20) == 'v' && (v[k+1]|0x20) == 'a' && (v[k+2]|0x20) == 'r' && v[k+3] == '(') {
+          int got = expand_vars(v, vn, vbuf, (int)sizeof vbuf);
+          if (got > 0) { v = vbuf; vn = got; }
+          break;
+        }
+    }
     if (ci_eq(p, "display", pn)) {
       /* `display:none` is the one declaration whose false positive is fatal: a
        * complex selector that our matcher roughly matches hid the whole body and
@@ -379,11 +515,43 @@ static void apply_decls(st_t *st, const char *d, int len) {
       /* A grid or a flex row is how every gallery, card list and menu bar on the
        * web is built. Without it each child is a block on its own line, which is
        * the difference between a wall of text and a page of thumbnails. */
-      else if ((vn == 4 && ci_eq(v, "grid", 4)) || (vn == 4 && ci_eq(v, "flex", 4)))
-        st->grid = 3;
+      else if (vn == 4 && ci_eq(v, "grid", 4)) st->grid = 3;
       else if (vn == 11 && ci_eq(v, "inline-grid", 11)) st->grid = 3;
-      else if (vn == 11 && ci_eq(v, "inline-flex", 11)) st->grid = 3;
+      else if (vn == 4 && ci_eq(v, "flex", 4)) {
+        st->flex_row = 1;
+      }
+      else if (vn == 11 && ci_eq(v, "inline-flex", 11)) st->flex_row = 1;
       else if (vn == 12 && ci_eq(v, "inline-block", 12)) st->inline_block = 1;
+    } else if (ci_eq(p, "line-height", pn)) {
+      /* A unitless number is a multiple of the font size; a percentage or a
+       * length is absolute. Tight leading is most of what makes unstyled text
+       * look like a wall, so this one is worth honouring. */
+      int i2 = 0;
+      while (i2 < vn && (v[i2] == ' ' || v[i2] == '\t')) i2++;
+      int is_num = 1;
+      for (int k = i2; k < vn; k++) if (!((v[k] >= '0' && v[k] <= '9') || v[k] == '.')) is_num = 0;
+          if (is_num && i2 < vn) {
+        int hundredths = 0, dig = 0, dot = 0;
+        for (int k = i2; k < vn; k++) {
+          if (v[k] == '.') { dot = 1; continue; }
+          hundredths = hundredths * 10 + (v[k] - '0');
+          if (dot) dig++;
+        }
+        while (dig++ < 2) hundredths *= 10;
+        if (hundredths >= 80 && hundredths <= 300) st->line_mul = hundredths;
+      } else {
+        int px2 = parse_len(v, vn, font_px_of(st->font), 800);
+        int base = font_px_of(st->font);
+        if (px2 > 0 && base > 0) {
+          int pct = (px2 * 100) / base;
+          if (pct >= 80 && pct <= 300) st->line_mul = pct;
+        }
+      }
+    } else if (ci_eq(p, "list-style", pn) || (pn == 15 && ci_eq(p, "list-style-type", 15))) {
+      if (vn == 4 && ci_eq(v, "none", 4)) st->list_none = 1;
+    } else if (ci_eq(p, "max-width", pn)) {
+      int w2 = parse_len(v, vn, font_px_of(st->font), 800);
+          if (w2 > 40) st->max_w = w2;
     } else if (ci_eq(p, "color", pn)) {
       uint32_t c2 = parse_color(v, vn);
       if (c2 != 0xFFFFFFFF) st->color = c2;
@@ -392,10 +560,30 @@ static void apply_decls(st_t *st, const char *d, int len) {
       uint32_t c2 = parse_color(v, vn);
       if (c2 != 0xFFFFFFFF) { st->bg = c2; st->has_bg = 1; }
     } else if (ci_eq(p, "font-weight", pn)) {
-      st->bold = (ci_eq(v, "bold", 4) || (vn >= 3 && v[0] >= '6')) ? 1 : 0;
+      /* Numeric weights, and the keywords. The old test was `v[0] >= '6'`, which
+       * is true of the letter 'n': `font-weight: normal` set bold on every
+       * element that said it, so a page that styles its body "normal" rendered
+       * entirely in fake bold. */
+      if (ci_eq(v, "bold", 4) || ci_eq(v, "bolder", 6)) st->bold = 1;
+      else if (ci_eq(v, "normal", 6) || ci_eq(v, "lighter", 7)) st->bold = 0;
+      else if (vn > 0 && v[0] >= '0' && v[0] <= '9') st->bold = parse_px(v, vn) >= 600;
+      /* A heading stays bold for the same reason it stays large: a sheet that
+       * sets a weight on everything must not flatten the page's structure. */
+      if (st->min_px) st->bold = 1;
     } else if (ci_eq(p, "font-size", pn)) {
-      int px = parse_px(v, vn);
-      if (px > 0) st->font = px <= 11 ? 2 : px == 12 ? 4 : px <= 13 ? 0 : 1;
+      int px = parse_font_px(v, vn);
+      /* CSS pixels to one of the five faces. The old rule was written for a
+       * 1x/2x bitmap - anything 14px and up became the display face - so a page
+       * asking for 16px body text got 26px and three words a line. Now the
+       * sizes are a ladder: 12 / 13 / 14 / 17 / 26. */
+      if (px > 0) {
+        /* A heading keeps its own size. Sheets very often set body text with a
+         * relative size (`font-size: 1em` on body), and a heading that inherits
+         * that stops being a heading - the page renders as one flat column of
+         * 17px text, which is exactly what this page did. */
+        if (st->min_px && px < st->min_px) px = st->min_px;
+        st->font = px <= 12 ? 3 : px <= 14 ? 0 : px <= 19 ? 4 : 1;
+      }
     } else if (ci_eq(p, "text-align", pn)) {
       if (ci_eq(v, "center", 6)) st->align = 1;
       else if (ci_eq(v, "right", 5)) st->align = 2;
@@ -407,10 +595,26 @@ static void apply_decls(st_t *st, const char *d, int len) {
     } else if (ci_eq(p, "margin", pn) || ci_eq(p, "margin-top", pn) || ci_eq(p, "margin-bottom", pn) ||
                ci_eq(p, "margin-left", pn) || ci_eq(p, "margin-right", pn)) {
       int vals[4];
-      int nv = parse_box_values(v, vn, vals, 4);
+      int nv = parse_box_lens(v, vn, vals, 4, font_px_of(st->font), 800);
       for (int k = 0; k < nv; k++) {
         if (vals[k] > 60) vals[k] = 60;
         if (vals[k] < -20) vals[k] = 0;
+      }
+      /* `margin: 0 auto` is the standard way a page centres its content column */
+      {
+        int ai = 0;
+        while (ai < vn && (v[ai] == ' ' || v[ai] == '\t')) ai++;
+        if (vn - ai >= 4 && ci_eq(v + ai, "auto", 4)) { st->ml = st->mr = 0; st->centered = 1; }
+        else if (nv == 2) {
+          int hit_auto = 0;
+          for (int k = 0; k < nv; k++) {
+            int sp = 0;
+            const char *q = v; int qn = vn;
+            while (qn > 0 && sp < k) { while (qn > 0 && *q != ' ' && *q != '\t') { q++; qn--; } while (qn > 0 && (*q == ' ' || *q == '\t')) { q++; qn--; } sp++; }
+            if (qn >= 4 && ci_eq(q, "auto", 4)) hit_auto = 1;
+          }
+          if (hit_auto) st->centered = 1;
+        }
       }
       if (pn == 6) {
         if (nv == 1) { st->mt = st->mr = st->mb = st->ml = vals[0]; }
@@ -427,10 +631,10 @@ static void apply_decls(st_t *st, const char *d, int len) {
     } else if (ci_eq(p, "padding", pn) || ci_eq(p, "padding-top", pn) || ci_eq(p, "padding-bottom", pn) ||
                ci_eq(p, "padding-left", pn) || ci_eq(p, "padding-right", pn)) {
       int vals[4];
-      int nv = parse_box_values(v, vn, vals, 4);
+      int nv = parse_box_lens(v, vn, vals, 4, font_px_of(st->font), 800);
       for (int k = 0; k < nv; k++) {
         if (vals[k] < 0) vals[k] = 0;
-        if (vals[k] > 40) vals[k] = 40;
+        if (vals[k] > 60) vals[k] = 60;
       }
       if (pn == 7) {
         if (nv == 1) { st->pt = st->pr = st->pb = st->pl = vals[0]; }
@@ -483,66 +687,473 @@ static void apply_decls(st_t *st, const char *d, int len) {
 /* selector match: tag, .class, #id, or comma-separated list of those */
 static int is_ws(char ch) { return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t'; }
 
-static int sel_matches(const char *sel, int len, const char *tag, const char *cls, const char *id) {
+/* ---- CSS custom properties ------------------------------------------------
+ * Every modern sheet defines its colours and sizes once on :root and refers to
+ * them with var(--name). Without a table those declarations resolve to nothing,
+ * so a page that looks deliberately themed renders as browser defaults. */
+#define MAX_VARS 128
+typedef struct { char name[48]; char val[72]; } cssvar_t;
+static cssvar_t cssvars[MAX_VARS];
+static int ncssvars;
+
+static void cssvar_set(const char *name, int nlen, const char *val, int vlen) {
+  if (nlen <= 0 || nlen >= (int)sizeof cssvars[0].name) return;
+  if (vlen < 0) vlen = 0;
+  if (vlen >= (int)sizeof cssvars[0].val) vlen = (int)sizeof cssvars[0].val - 1;
+  for (int i = 0; i < ncssvars; i++)
+    if (strlen(cssvars[i].name) == (size_t)nlen && !memcmp(cssvars[i].name, name, (size_t)nlen)) {
+      memcpy(cssvars[i].val, val, (size_t)vlen); cssvars[i].val[vlen] = 0; return;
+    }
+  if (ncssvars >= MAX_VARS) return;
+  memcpy(cssvars[ncssvars].name, name, (size_t)nlen); cssvars[ncssvars].name[nlen] = 0;
+  memcpy(cssvars[ncssvars].val, val, (size_t)vlen);   cssvars[ncssvars].val[vlen] = 0;
+  ncssvars++;
+}
+
+static const char *cssvar_get(const char *name, int n) {
+  for (int i = 0; i < ncssvars; i++)
+    if ((int)strlen(cssvars[i].name) == n && !memcmp(cssvars[i].name, name, (size_t)n)) return cssvars[i].val;
+  return 0;
+}
+
+/* Expand var(--x) and var(--x, fallback) into `out`. One level of nesting is
+ * enough for real sheets because a custom property almost never refers to
+ * another one twice; the loop below handles the common chains anyway. */
+static int expand_vars(const char *v, int n, char *out, int cap) {
+  int o = 0, i = 0, changed = 0;
+  while (i < n && o < cap - 1) {
+    if (n - i >= 4 && (v[i] == 'v' || v[i] == 'V') && (v[i+1] == 'a' || v[i+1] == 'A') &&
+        (v[i+2] == 'r' || v[i+2] == 'R') && v[i+3] == '(') {
+      int j = i + 4;
+      while (j < n && (v[j] == ' ' || v[j] == '\t')) j++;
+      int ns = j;
+      while (j < n && v[j] != ',' && v[j] != ')') j++;
+      int ne = j;
+      while (ne > ns && (v[ne-1] == ' ' || v[ne-1] == '\t')) ne--;
+      /* the fallback, if the property is unknown */
+      int fs = -1, fe = -1;
+      if (j < n && v[j] == ',') {
+        int k = j + 1;
+        int depth = 0;
+        while (k < n && (depth > 0 || v[k] != ')')) {
+          if (v[k] == '(') depth++;
+          else if (v[k] == ')') depth--;
+          k++;
+        }
+        fs = j + 1; fe = k; j = k;
+      }
+      if (j < n && v[j] == ')') j++;
+      const char *val = 0; int vlen = 0;
+      if (ne > ns) {
+        const char *hit = cssvar_get(v + ns, ne - ns);
+        if (hit) { val = hit; vlen = (int)strlen(hit); }
+      }
+      if (!val && fs >= 0) {
+        int a = fs, b = fe;
+        while (a < b && (v[a] == ' ' || v[a] == '\t')) a++;
+        while (b > a && (v[b-1] == ' ' || v[b-1] == '\t')) b--;
+        val = v + a; vlen = b - a;
+      }
+      if (val) {
+        for (int k = 0; k < vlen && o < cap - 1; k++) out[o++] = val[k];
+        changed = 1;
+      }
+      i = j;
+      continue;
+    }
+    out[o++] = v[i++];
+  }
+  out[o] = 0;
+  return changed ? o : 0;
+}
+
+/* ---- selectors ------------------------------------------------------------
+ * Right to left, the way a browser matches: the rightmost compound is the
+ * element itself, and each compound to its left has to be satisfied by an
+ * ancestor, either the nearest one ('>') or any (' '). The previous matcher
+ * only knew single simple selectors, so `#sidebar ul li a` - the shape of every
+ * navigation list on the web - matched nothing at all. */
+
+/* the element's class list contains exactly this name */
+static int class_has(const char *cls, const char *name, int n) {
+  if (!cls) return 0;
   int i = 0;
-  while (i < len) {
+  while (cls[i]) {
+    while (cls[i] && is_ws(cls[i])) i++;
     int s = i;
-    while (i < len && sel[i] != ',') i++;
-    int e = i;
-    if (i < len) i++;
-    while (s < e && is_ws(sel[s])) s++;
-    while (e > s && is_ws(sel[e - 1])) e--;
-    if (s >= e) continue;
-    if (sel[s] == '*') return 1;
-    if (sel[s] == '.' && cls) {
-      int n = e - s - 1, k = 0;
-      while (k < n && cls[k] && cls[k] == sel[s + 1 + k]) k++;
-      if (k == n && (cls[k] == 0 || cls[k] == ' ')) return 1;
-      continue;
-    }
-    if (sel[s] == '#' && id) {
-      int n = e - s - 1, k = 0;
-      while (k < n && id[k] && id[k] == sel[s + 1 + k]) k++;
-      if (k == n && id[k] == 0) return 1;
-      continue;
-    }
-    if (tag) {
-      int n = e - s, k = 0;
-      while (k < n && tag[k] && ci_eq(&tag[k], &sel[s + k], 1)) k++;
-      if (k == n && tag[k] == 0) return 1;
-    }
+    while (cls[i] && !is_ws(cls[i])) i++;
+    if (i - s == n && !memcmp(cls + s, name, (size_t)n)) return 1;
   }
   return 0;
 }
 
-static void css_scan(const char *css, int len) {
-  int i = 0;
-  while (i < len && nrules < MAX_RULES) {
-    int s = i;
-    while (i < len && css[i] != '{') i++;
-    if (i >= len) break;
-    int se = i;
-    i++;
-    int ds = i;
-    while (i < len && css[i] != '}') i++;
-    int de = i;
-    if (i < len) i++;
-    while (ds < de && (css[ds] == ' ' || css[ds] == '\n' || css[ds] == '\t')) ds++;
-    while (de > ds && (css[de - 1] == ' ' || css[de - 1] == '\n' || css[de - 1] == '\t')) de--;
-    /* drop at-rules and pseudo-classes we do not implement */
-    int at = 0;
-    while (s < se && (css[s] == ' ' || css[s] == '\n' || css[s] == '\r' || css[s] == '\t')) s++;
-    int se2 = se;
-    while (se2 > s && (css[se2 - 1] == ' ' || css[se2 - 1] == '\n' || css[se2 - 1] == '\r' || css[se2 - 1] == '\t')) se2--;
-    if (s < se && css[s] == '@') at = 1;
-    for (int k = s; k < se; k++) if (css[k] == ':') { at = 1; break; }
-    if (at || se <= s || de <= ds) continue;
-    rules[nrules].sel = css + s;
-    rules[nrules].sellen = se2 - s;
-    rules[nrules].decls = css + ds;
-    rules[nrules].decllen = de - ds;
-    nrules++;
+static GumboNode *node_parent(GumboNode *n) { return n ? n->parent : 0; }
+
+static int node_index_in_parent(GumboNode *n) {
+  GumboNode *p = node_parent(n);
+  if (!p || p->type != GUMBO_NODE_ELEMENT) return -1;
+  GumboVector *ch = &p->v.element.children;
+  for (unsigned i = 0; i < ch->length; i++) if (ch->data[i] == n) return (int)i;
+  return -1;
+}
+
+/* One compound: tag / .class / #id / [attr] / :pseudo, glued together. */
+static int compound_matches(const char *sel, int s, int e, GumboNode *el) {
+  if (!el || el->type != GUMBO_NODE_ELEMENT) return 0;
+  GumboElement *ge = &el->v.element;
+  const char *cls = 0, *id = 0;
+  GumboAttribute *at;
+  if ((at = gumbo_get_attribute(&ge->attributes, "class"))) cls = at->value;
+  if ((at = gumbo_get_attribute(&ge->attributes, "id"))) id = at->value;
+
+  int i = s;
+  /* tag or '*' */
+  int ts = i;
+  while (i < e && sel[i] != '.' && sel[i] != '#' && sel[i] != '[' && sel[i] != ':') i++;
+  if (i > ts) {
+    if (!(i - ts == 1 && sel[ts] == '*')) {
+      const char *tag = gumbo_normalized_tagname(ge->tag);
+      if (!tag || (int)strlen(tag) != i - ts) return 0;
+      for (int k = 0; k < i - ts; k++) if (tolower((unsigned char)tag[k]) != tolower((unsigned char)sel[ts + k])) return 0;
+    }
   }
+  while (i < e) {
+    if (sel[i] == '.') {
+      int ns = ++i;
+      while (i < e && sel[i] != '.' && sel[i] != '#' && sel[i] != '[' && sel[i] != ':') i++;
+      if (!class_has(cls, sel + ns, i - ns)) return 0;
+    } else if (sel[i] == '#') {
+      int ns = ++i;
+      while (i < e && sel[i] != '.' && sel[i] != '#' && sel[i] != '[' && sel[i] != ':') i++;
+      if (!id || (int)strlen(id) != i - ns || memcmp(id, sel + ns, (size_t)(i - ns))) return 0;
+    } else if (sel[i] == '[') {
+      /* attribute selectors: accept the ones that are a plain presence test or
+       * an exact value, ignore the rest rather than failing the whole rule */
+      int j = i + 1;
+      while (j < e && sel[j] != ']') j++;
+      int ns = i + 1, ne = j;
+      int eq = -1;
+      for (int k = ns; k < ne; k++) if (sel[k] == '=') { eq = k; break; }
+      char name[48]; int nn = (eq < 0 ? ne : eq) - ns;
+      if (nn > 0 && nn < (int)sizeof name) {
+        memcpy(name, sel + ns, (size_t)nn); name[nn] = 0;
+        GumboAttribute *a2 = gumbo_get_attribute(&ge->attributes, name);
+        if (!a2) return 0;
+        if (eq >= 0) {
+          int vs = eq + 1, ve = ne;
+          if (vs < ve && (sel[vs] == '"' || sel[vs] == '\'')) vs++;
+          if (ve > vs && (sel[ve-1] == '"' || sel[ve-1] == '\'')) ve--;
+          if ((int)strlen(a2->value) != ve - vs || memcmp(a2->value, sel + vs, (size_t)(ve - vs))) return 0;
+        }
+      }
+      i = (j < e) ? j + 1 : e;
+    } else if (sel[i] == ':') {
+      int ps = ++i;
+      if (i < e && sel[i] == ':') i++;     /* ::before */
+      while (i < e && sel[i] != '.' && sel[i] != '#' && sel[i] != '[' && sel[i] != ':') i++;
+      int pn = i - ps;
+      /* pseudo-elements are not this element's box, and :hover has no pointer */
+      if ((pn == 6 && !strncmp(sel + ps, "before", 6)) ||
+          (pn == 5 && !strncmp(sel + ps, "after", 5)) ||
+          (pn == 5 && !strncmp(sel + ps, "hover", 5)) ||
+          (pn == 5 && !strncmp(sel + ps, "focus", 5)) ||
+          (pn == 6 && !strncmp(sel + ps, "active", 6))) return 0;
+      if (pn == 10 && !strncmp(sel + ps, "first-child", 11)) { /* fallthrough below */ }
+      if (pn == 11 && !strncmp(sel + ps, "first-child", 11)) {
+        if (node_index_in_parent(el) != 0) return 0;
+      } else if (pn == 10 && !strncmp(sel + ps, "last-child", 10)) {
+        GumboNode *p = node_parent(el);
+        if (!p || p->type != GUMBO_NODE_ELEMENT) return 0;
+        if ((int)p->v.element.children.length - 1 != node_index_in_parent(el)) return 0;
+      } else if (pn == 4 && !strncmp(sel + ps, "root", 4)) {
+        if (ge->tag != GUMBO_TAG_HTML) return 0;
+      }
+      /* everything else (:not, :nth-child, :link ...) is ignored, which is the
+       * generous direction: better a rule that applies too widely than a page
+       * that loses its layout. */
+    } else {
+      i++;
+    }
+  }
+  return 1;
+}
+
+static int spec_of(const char *sel, int s, int e) {
+  int a = 0, b = 0, c = 0, i = s;
+  while (i < e) {
+    if (sel[i] == '#') { a++; i++; while (i < e && sel[i] != '.' && sel[i] != '#' && sel[i] != '[' && sel[i] != ':') i++; }
+    else if (sel[i] == '.' ) { b++; i++; while (i < e && sel[i] != '.' && sel[i] != '#' && sel[i] != '[' && sel[i] != ':') i++; }
+    else if (sel[i] == '[') { b++; while (i < e && sel[i] != ']') i++; i++; }
+    else if (sel[i] == ':') {
+      i++; if (i < e && sel[i] == ':') i++;
+      int ps = i;
+      while (i < e && sel[i] != '.' && sel[i] != '#' && sel[i] != '[' && sel[i] != ':') i++;
+      int pn = i - ps;
+      if (pn == 6 && !strncmp(sel + ps, "before", 6)) c++;
+      else if (pn == 5 && !strncmp(sel + ps, "after", 5)) c++;
+      else b++;
+    }
+    else if (is_ws(sel[i]) || sel[i] == '>' || sel[i] == '+' || sel[i] == '~') i++;
+    else { c++; while (i < e && !is_ws(sel[i]) && sel[i] != '.' && sel[i] != '#' && sel[i] != '[' && sel[i] != ':') i++; }
+  }
+  return a * 100 + b * 10 + c;
+}
+
+/* Match a full complex selector against an element, walking up its ancestors. */
+static int sel_matches(const char *sel, int len, GumboNode *el) {
+  int s = 0;
+  while (s < len && is_ws(sel[s])) s++;
+  int e = len;
+  while (e > s && is_ws(sel[e-1])) e--;
+  if (s >= e) return 0;
+
+  /* find the rightmost compound: scan back over the last combinator */
+  int cs = s, ce = e, combs[32], ncomb = 0, comps[33][2], ncomp = 0;
+  int i = s, last = s;
+  while (i < e) {
+    int depth = 0;
+    while (i < e) {
+      char ch = sel[i];
+      if (ch == '[' || ch == '(') depth++;
+      else if (ch == ']' || ch == ')') depth--;
+      if (depth == 0 && (ch == '>' || ch == '+' || ch == '~')) break;
+      if (depth == 0 && (ch == ',' )) break;
+      i++;
+    }
+    if (i >= e) break;
+    if (sel[i] == ',') { i++; last = i; continue; }
+    /* a combinator: trim the compound that ended here */
+    int a = last, b = i;
+    while (a < b && is_ws(sel[a])) a++;
+    while (b > a && is_ws(sel[b-1])) b--;
+    if (b > a && ncomp < 32) { comps[ncomp][0] = a; comps[ncomp][1] = b; ncomp++; }
+    if (ncomb < 31) combs[ncomb++] = (sel[i] == '+') ? ' ' : (sel[i] == '~') ? ' ' : sel[i];
+    i++;
+    while (i < e && is_ws(sel[i])) i++;
+    last = i;
+  }
+  { int a = last, b = e;
+    while (a < b && is_ws(sel[a])) a++;
+    while (b > a && is_ws(sel[b-1])) b--;
+    if (b > a && ncomp < 32) { comps[ncomp][0] = a; comps[ncomp][1] = b; ncomp++; } }
+  if (!ncomp) return 0;
+
+  /* rightmost first */
+  GumboNode *cur = el;
+  if (!compound_matches(sel, comps[ncomp-1][0], comps[ncomp-1][1], cur)) return 0;
+  for (int k = ncomp - 2; k >= 0; k--) {
+    char comb = combs[k];
+    cur = node_parent(cur);
+    if (comb == '>') {
+      if (!compound_matches(sel, comps[k][0], comps[k][1], cur)) return 0;
+      continue;
+    }
+    int found = 0;
+    while (cur) {
+      if (compound_matches(sel, comps[k][0], comps[k][1], cur)) { found = 1; break; }
+      cur = node_parent(cur);
+    }
+    if (!found) return 0;
+  }
+  (void)cs; (void)ce;
+  return 1;
+}
+
+/* ---- the sheet scanner ----------------------------------------------------
+ * The old scanner looked for '{' and then the first '}', which is fine until a
+ * stylesheet contains an @media block: the block's body holds whole rules, so
+ * the first '}' ends a nested rule and every brace after that is off by one. On
+ * iana.org - 83 @media blocks in one sheet - that lost all but a handful of
+ * rules. This walks blocks by counting braces, recursing into conditional
+ * groups, skipping comments and strings, and recording custom properties. */
+
+static void css_scan_block(const char *css, int s, int e, int min_px, int max_px, int *order);
+
+static void css_add_rule(const char *sel, int slen, const char *decls, int dlen,
+                         int min_px, int max_px, int *order) {
+  if (nrules >= MAX_RULES) return;
+  int s = 0;
+  while (s < slen && is_ws(sel[s])) s++;
+  int e2 = slen;
+  while (e2 > s && is_ws(sel[e2-1])) e2--;
+  if (e2 <= s) return;
+  rules[nrules].sel = sel + s;
+  rules[nrules].sellen = e2 - s;
+  rules[nrules].decls = decls;
+  rules[nrules].decllen = dlen;
+  rules[nrules].spec = spec_of(sel + s, 0, e2 - s);
+  rules[nrules].order = (*order)++;
+  rules[nrules].min_px = min_px;
+  rules[nrules].max_px = max_px;
+  nrules++;
+}
+
+/* `min-width: 600px` / `max-width: 800px`, in any order, alongside `screen` */
+static void css_media_range(const char *q, int n, int *min_px, int *max_px) {
+  for (int i = 0; i + 9 < n; i++) {
+    int is_min = !strncmp(q + i, "min-width", 9);
+    int is_max = !strncmp(q + i, "max-width", 9);
+    if (!is_min && !is_max) continue;
+    int j = i + 9;
+    while (j < n && (q[j] == ' ' || q[j] == ':')) j++;
+    int v = 0;
+    while (j < n && q[j] >= '0' && q[j] <= '9') { v = v * 10 + (q[j] - '0'); j++; }
+    if (j < n && (q[j] == 'e' || q[j] == 'r')) { /* em/rem */ v *= 16; }
+    if (v > 0) { if (is_min) *min_px = v; else *max_px = v; }
+  }
+}
+
+/* Skip a string, comment or url(...) so braces inside them never count. */
+static int css_skip_atom(const char *css, int i, int e) {
+  if (i >= e) return i;
+  if (css[i] == '/' && i + 1 < e && css[i+1] == '*') {
+    i += 2;
+    while (i + 1 < e && !(css[i] == '*' && css[i+1] == '/')) i++;
+    return (i + 1 < e) ? i + 2 : e;
+  }
+  if (css[i] == '"' || css[i] == '\'') {
+    char q = css[i++];
+    while (i < e && css[i] != q) { if (css[i] == '\\' && i + 1 < e) i++; i++; }
+    return (i < e) ? i + 1 : e;
+  }
+  return -1;
+}
+
+static long css_steps;   /* a scan that loops must not take the browser with it */
+
+static void css_scan_block(const char *css, int s, int e, int min_px, int max_px, int *order) {
+  int i = s;
+  while (i < e && nrules < MAX_RULES) {
+    if (++css_steps > 4000000L) { printf("[css] step limit at %d of %d\n", i, e); return; }
+    while (i < e && is_ws(css[i])) i++;
+    if (i >= e) break;
+
+    int skip = css_skip_atom(css, i, e);
+    if (skip >= 0) { i = skip; continue; }
+
+    if (css[i] == '@') {
+      /* at-rule: name, prelude, then ';' or a block */
+      int ns = ++i;
+      while (i < e && (isalnum((unsigned char)css[i]) || css[i] == '-')) i++;
+      int nlen = i - ns;
+      int ps = i;
+      int depth = 0;
+      while (i < e) {
+        int sk = css_skip_atom(css, i, e);
+        if (sk >= 0) { i = sk; continue; }
+        if (css[i] == '(') depth++;
+        else if (css[i] == ')') depth--;
+        else if (depth == 0 && (css[i] == ';' || css[i] == '{' || css[i] == '}')) break;
+        i++;
+      }
+      if (i >= e) break;
+      if (css[i] == ';') { i++; continue; }              /* @charset, @import */
+      if (css[i] == '}') { i++; continue; }
+      int bs = i + 1, bd = 1;
+      i++;
+      while (i < e && bd > 0) {
+        int sk = css_skip_atom(css, i, e);
+        if (sk >= 0) { i = sk; continue; }
+        if (css[i] == '{') bd++;
+        else if (css[i] == '}') bd--;
+        i++;
+      }
+      int be = (bd == 0) ? i - 1 : e;
+
+      /* apply the contents of conditional groups; skip everything else
+       * (@font-face, @keyframes, @page) - those are not element styles */
+      int is_media = (nlen == 5 && !strncmp(css + ns, "media", 5));
+      int is_cond  = (nlen == 8 && !strncmp(css + ns, "supports", 8)) ||
+                     (nlen == 5 && !strncmp(css + ns, "layer", 5));
+      if (is_media || is_cond) {
+        int mn = min_px, mx = max_px;
+        if (is_media) {
+          int print_only = 0;
+          for (int k = ps; k + 5 <= bs; k++)
+            if (!strncmp(css + k, "print", 5)) { print_only = 1; break; }
+          if (print_only) continue;
+          css_media_range(css + ps, bs - ps, &mn, &mx);
+        }
+        css_scan_block(css, bs, be, mn, mx, order);
+      }
+      continue;
+    }
+
+    /* a normal rule: selector up to '{' */
+    int ss = i, depth2 = 0;
+    while (i < e) {
+      int sk = css_skip_atom(css, i, e);
+      if (sk >= 0) { i = sk; continue; }
+      if (css[i] == '(') depth2++;
+      else if (css[i] == ')') depth2--;
+      else if (depth2 == 0 && css[i] == '{') break;
+      else if (depth2 == 0 && css[i] == '}') break;
+      i++;
+    }
+    if (i >= e || css[i] != '{') { if (i < e) i++; continue; }
+    int se = i;
+    int bs = i + 1, bd = 1;
+    i++;
+    while (i < e && bd > 0) {
+      int sk = css_skip_atom(css, i, e);
+      if (sk >= 0) { i = sk; continue; }
+      if (css[i] == '{') bd++;
+      else if (css[i] == '}') bd--;
+      i++;
+    }
+    int be = (bd == 0) ? i - 1 : e;
+    if (be <= bs) continue;
+
+    /* custom properties first: they are what the rest of the sheet refers to */
+    {
+      int j = bs;
+      while (j < be) {
+        while (j < be && is_ws(css[j])) j++;
+        int ds = j;
+        while (j < be && css[j] != ';') j++;
+        int de = j;
+        if (j < be) j++;
+        while (ds < de && is_ws(css[ds])) ds++;
+        if (de - ds > 3 && css[ds] == '-' && css[ds+1] == '-') {
+          int k = ds;
+          while (k < de && css[k] != ':') k++;
+          if (k < de) {
+            int ns2 = ds, ne2 = k;
+            while (ne2 > ns2 && is_ws(css[ne2-1])) ne2--;
+            int vs = k + 1, ve = de;
+            while (vs < ve && is_ws(css[vs])) vs++;
+            while (ve > vs && is_ws(css[ve-1])) ve--;
+            cssvar_set(css + ns2, ne2 - ns2, css + vs, ve - vs);
+          }
+        }
+      }
+    }
+
+    /* one rule per selector-list entry, so specificity is per-selector */
+    int a = ss;
+    while (a < se) {
+      int b = a;
+      int depth3 = 0;
+      while (b < se) {
+        int sk = css_skip_atom(css, b, se);
+        if (sk >= 0) { b = sk; continue; }
+        if (css[b] == '[' || css[b] == '(') depth3++;
+        else if (css[b] == ']' || css[b] == ')') depth3--;
+        else if (depth3 == 0 && css[b] == ',') break;
+        b++;
+      }
+      css_add_rule(css + a, b - a, css + bs, be - bs, min_px, max_px, order);
+      a = (b < se) ? b + 1 : se;
+    }
+  }
+}
+
+int web_rule_count(void) { return nrules; }
+int web_var_count(void) { return ncssvars; }
+
+static void css_scan(const char *css, int len) {
+  static int scan_order;
+  css_scan_block(css, 0, len, -1, -1, &scan_order);
 }
 
 /* --------------------------------------------------------------- defaults */
@@ -550,9 +1161,9 @@ static void css_scan(const char *css, int len) {
 static void style_for(GumboTag tag, st_t *st) {
   st->font = 0;
   switch (tag) {
-    case GUMBO_TAG_H1: st->font = 1; st->bold = 1; st->mt = 18; st->mb = 8; break;
-    case GUMBO_TAG_H2: st->font = 1; st->bold = 1; st->mt = 16; st->mb = 7; break;
-    case GUMBO_TAG_H3: st->font = 4; st->bold = 1; st->mt = 13; st->mb = 5; break;
+    case GUMBO_TAG_H1: st->font = 1; st->bold = 1; st->mt = 18; st->mb = 8; st->min_px = 26; break;
+    case GUMBO_TAG_H2: st->font = 1; st->bold = 1; st->mt = 16; st->mb = 7; st->min_px = 26; break;
+    case GUMBO_TAG_H3: st->font = 4; st->bold = 1; st->mt = 13; st->mb = 5; st->min_px = 17; break;
     case GUMBO_TAG_H4: case GUMBO_TAG_H5: case GUMBO_TAG_H6:
       st->font = 0; st->bold = 1; st->mt = 8; st->mb = 4; break;
     case GUMBO_TAG_P: st->mt = 0; st->mb = 12; break;
@@ -609,6 +1220,10 @@ static void style_resolve(GumboNode *el, st_t *out, const st_t *inherited) {
   out->pt = out->pb = out->pl = out->pr = 0;
   out->bw_t = out->bw_r = out->bw_b = out->bw_l = 0;
   out->radius = 0;
+  /* Reset with the rest. Left set, a heading's size floor followed the heading
+   * into every descendant and every sibling after it - the whole page came out
+   * 26px and bold. */
+  out->min_px = 0;
   out->has_bg = 0; out->bg = 0;
   out->bcol = 0xE3DED4;
   style_for(e->tag, out);
@@ -620,11 +1235,26 @@ static void style_resolve(GumboNode *el, st_t *out, const st_t *inherited) {
   if ((a = gumbo_get_attribute(&e->attributes, "class"))) cls = a->value;
   if ((a = gumbo_get_attribute(&e->attributes, "id"))) id = a->value;
 
-  for (int i = 0; i < nrules; i++) {
-    if (sel_matches(rules[i].sel, rules[i].sellen, tag, cls, id)) {
-      decl_ctx_simple = sel_is_simple(rules[i].sel, rules[i].sellen);
-      apply_decls(out, rules[i].decls, rules[i].decllen);
+  /* Cascade: every rule that matches, in increasing specificity, then source
+   * order among equals. Applying in sheet order alone let a generic `a {}` run
+   * after `#sidebar a {}` and win, which is not how CSS works. */
+  int hit[160], nhit = 0;
+  for (int i = 0; i < nrules && nhit < 160; i++) {
+    if (rules[i].min_px > 0 && viewport_w < rules[i].min_px) continue;
+    if (rules[i].max_px > 0 && viewport_w > rules[i].max_px) continue;
+    if (sel_matches(rules[i].sel, rules[i].sellen, el)) hit[nhit++] = i;
+  }
+  for (int a = 1; a < nhit; a++) {          /* insertion sort: tiny, stable */
+    int k = hit[a], b = a - 1;
+    while (b >= 0 && (rules[hit[b]].spec > rules[k].spec ||
+                     (rules[hit[b]].spec == rules[k].spec && rules[hit[b]].order > rules[k].order))) {
+      hit[b + 1] = hit[b]; b--;
     }
+    hit[b + 1] = k;
+  }
+  for (int a = 0; a < nhit; a++) {
+    decl_ctx_simple = sel_is_simple(rules[hit[a]].sel, rules[hit[a]].sellen);
+    apply_decls(out, rules[hit[a]].decls, rules[hit[a]].decllen);
   }
   decl_ctx_simple = 0;
 
@@ -639,6 +1269,7 @@ static void style_resolve(GumboNode *el, st_t *out, const st_t *inherited) {
 
 typedef struct { char *t; int font; uint32_t color; uint8_t bold, underline; int w; const char *href; } seg_t;
 static seg_t segs[MAX_SEGS];
+static int line_mul_pct, line_mul_font;   /* the line-height in force, if any */
 static int nsegs, seg_w, seg_maxh;
 static int line_x, line_avail, line_align;
 static int cur_y;
@@ -650,6 +1281,11 @@ static void line_flush(void) {
   else if (line_align == 2) x += line_avail - seg_w;
   if (x < line_x) x = line_x;
   int lh = seg_maxh > 0 ? seg_maxh : 15;
+  if (line_mul_pct > 0) {
+    int base = font_px_of(line_mul_font);
+    int want = (base * line_mul_pct) / 100;
+    if (want > lh) lh = want;
+  }
   for (int i = 0; i < nsegs; i++) {
     seg_t *s = &segs[i];
     if (s->t && s->t[0]) {
@@ -1106,12 +1742,17 @@ static int text_trail_space(const char *s, int len) {
 static int pending_space;
 
 static void layout_text(GumboText *t, st_t *st) {
+  /* The line height in force while this run's lines are flushed. Text nodes are
+   * leaves, so a save/restore here cannot leak into a sibling block. */
+  int save_mul = line_mul_pct, save_font = line_mul_font;
+  line_mul_pct = st->line_mul;
+  line_mul_font = st->font;
   static char buf[4096];
   int raw = (int)t->original_text.length;
   int n = clean_text(t->text, raw, buf, (int)sizeof buf);
   int lead = text_lead_space(t->text, raw);
   int trail = text_trail_space(t->text, raw);
-  if (!n) { pending_space = pending_space || lead; return; }
+  if (!n) { pending_space = pending_space || lead; line_mul_pct = save_mul; line_mul_font = save_font; return; }
   int first = 1;
   int i = 0;
   while (i < n) {
@@ -1125,6 +1766,8 @@ static void layout_text(GumboText *t, st_t *st) {
     first = 0;
   }
   pending_space = trail;
+  line_mul_pct = save_mul;
+  line_mul_font = save_font;
 }
 
 
@@ -1452,10 +2095,106 @@ static void layout_input(GumboNode *node, st_t *st, int x, int avail) {
   cur_y += 24;
 }
 
+/* ------------------------------------------------------------------- flex
+ * `display: flex` over inline-only content - the nav bar, a breadcrumb trail, a
+ * row of footer links - is a single line of inline boxes. Laid out as blocks the
+ * menu stacks, which is the most visible way a page stops looking like itself.
+ *
+ * This is not a flexbox: no growth, no shrinking, no alignment. It only takes the
+ * case where every item is text (however deeply wrapped in <a>/<span>) and puts
+ * the items on one line, wrapped at the container's edge. Anything containing a
+ * block falls back to the normal path rather than being faked. */
+
+static int text_has_content(const char *t) {
+  if (!t) return 0;
+  for (; *t; t++) if (*t != ' ' && *t != '\t' && *t != '\n' && *t != '\r') return 1;
+  return 0;
+}
+
+/* A flex container often holds a single block wrapper (nav > ul > li). Descend
+ * through such a wrapper so the row is built from the items, not the list. */
+static GumboNode *flex_unwrap(GumboNode *n, st_t st, st_t *out) {
+  for (int g = 0; g < 2 && n && n->type == GUMBO_NODE_ELEMENT; g++) {
+    GumboVector *kids = &n->v.element.children;
+    GumboNode *only = 0;
+    int nel = 0, ntext = 0;
+    for (unsigned i = 0; i < kids->length; i++) {
+      GumboNode *k = kids->data[i];
+      if (k->type == GUMBO_NODE_ELEMENT) { nel++; only = k; }
+      else if (k->type == GUMBO_NODE_TEXT && text_has_content(k->v.text.text)) ntext++;
+    }
+    if (nel != 1 || ntext || !only) break;
+    if (!is_block_tag(only->v.element.tag)) break;
+    st_t cs;
+    style_resolve(only, &cs, &st);
+    if (cs.display == 2) break;
+    st = cs; n = only;
+    continue;
+  }
+  *out = st;
+  return n;
+}
+
+/* Pure check: can this subtree be one line? Laid out afterwards, so a failure
+ * half-way through cannot leave half a row on the page. */
+static int has_block_descendant(GumboNode *n, int depth) {
+  if (!n || n->type != GUMBO_NODE_ELEMENT || depth > 4) return 0;
+  GumboVector *kids = &n->v.element.children;
+  for (unsigned i = 0; i < kids->length; i++) {
+    GumboNode *k = kids->data[i];
+    if (k->type != GUMBO_NODE_ELEMENT) continue;
+    if (is_block_tag(k->v.element.tag)) return 1;
+    if (has_block_descendant(k, depth + 1)) return 1;
+  }
+  return 0;
+}
+
+static int flex_ok(GumboNode *n, st_t st, int depth, int *any) {
+  if (!n || n->type != GUMBO_NODE_ELEMENT || depth > 5) return 0;
+  GumboVector *kids = &n->v.element.children;
+  for (unsigned i = 0; i < kids->length; i++) {
+    GumboNode *k = kids->data[i];
+    if (k->type == GUMBO_NODE_TEXT) { if (text_has_content(k->v.text.text)) *any = 1; continue; }
+    if (k->type != GUMBO_NODE_ELEMENT) continue;
+    st_t cs;
+    style_resolve(k, &cs, &st);
+    if (cs.display == 2) continue;
+    if ((is_block_tag(k->v.element.tag) || cs.display == 1) && has_block_descendant(k, 0))
+      return 0;                       /* a real block inside the row: not a row */
+    if (!flex_ok(k, cs, depth + 1, any)) return 0;
+  }
+  return 1;
+}
+
+static void flex_lay(GumboNode *n, st_t st, int depth) {
+  if (!n || n->type != GUMBO_NODE_ELEMENT || depth > 5) return;
+  GumboVector *kids = &n->v.element.children;
+  for (unsigned i = 0; i < kids->length; i++) {
+    GumboNode *k = kids->data[i];
+    if (k->type == GUMBO_NODE_TEXT) { layout_text(&k->v.text, &st); continue; }
+    if (k->type != GUMBO_NODE_ELEMENT) continue;
+    st_t cs;
+    style_resolve(k, &cs, &st);
+    if (cs.display == 2) continue;
+    if (nsegs > 0 || seg_w > 0) pending_space = 1;   /* a space between items */
+    flex_lay(k, cs, depth + 1);
+  }
+}
+
 static void layout_node(GumboNode *node, st_t st, int x, int avail, int depth) {
   if (depth > MAX_DEPTH || !node) return;
   if (st.display == 2) return;
   if (avail < 24) avail = 24;
+
+  /* max-width, and `margin: 0 auto` centered: the content column every site
+   * wraps its text in. Without it a page stretched to the window width and read
+   * like a terminal dump. */
+  if (st.max_w > 0 && st.max_w < avail) {
+    int w = st.max_w;
+    if (st.centered) x += (avail - w) / 2;
+    avail = w;
+    st.max_w = 0;
+  }
 
   if (node->type == GUMBO_NODE_TEXT) { layout_text(&node->v.text, &st); return; }
   if (node->type != GUMBO_NODE_ELEMENT) return;
@@ -1690,13 +2429,26 @@ static void layout_node(GumboNode *node, st_t st, int x, int avail, int depth) {
       int mw = tw(ms.font, mk);
       op_push(1, cx - 14, cur_y, mw, web_line_height(ms.font), ms.color,
               dup_n(mk, (int)strlen(mk)), ms.font, 0, 0);
-    } else {
+    } else if (!ms.list_none) {
       op_push(0, cx - 12, cur_y + 6, 4, 4, ms.color, 0, 0, 0, 0);
     }
   }
 
+  int did_flex = 0;
+  if (st.flex_row) {
+    st_t rs;
+    GumboNode *row = flex_unwrap(node, st, &rs);
+    int any = 0;
+    if (row && flex_ok(row, rs, 0, &any) && any) {
+      pending_space = 0;
+      flex_lay(row, rs, 0);
+      line_flush();
+      did_flex = 1;
+    }
+  }
+
   GumboVector *kids = &node->v.element.children;
-  for (unsigned i = 0; i < kids->length; i++) {
+  for (unsigned i = 0; i < kids->length && !did_flex; i++) {
     GumboNode *k = kids->data[i];
     if (k->type == GUMBO_NODE_TEXT) { layout_text(&k->v.text, &st); continue; }
     if (k->type != GUMBO_NODE_ELEMENT) continue;
@@ -1725,6 +2477,7 @@ static void layout_node(GumboNode *node, st_t st, int x, int avail, int depth) {
   if (brw) op_push(0, bx + bww - brw, top, brw, box_h, st.bcol, 0, 0, 0, 0);
   cur_y += st.mb;
   (void)ordered; (void)lnum;
+
 }
 
 /* -------------------------------------------------------------------- API */
@@ -1813,6 +2566,7 @@ int web_build(const char *html, int len, int width, web_measure_fn measure) {
   web_free();
   meas = measure;
   if (!html || len <= 0 || width < 32) return -1;
+  viewport_w = width;
 
   GumboOutput *out = gumbo_parse_with_options(&kGumboDefaultOptions, html, (size_t)len);
   if (!out) return -1;
@@ -1820,6 +2574,7 @@ int web_build(const char *html, int len, int width, web_measure_fn measure) {
   collect_css(out->root, 0);
 
   st_t base;
+  memset(&base, 0, sizeof base);   /* every field, including ones added later */
   base.display = 1; base.font = 0; base.bold = 0; base.underline = 0; base.italic = 0;
   base.pre = 0; base.color = 0x1A1B1D; base.bg = 0; base.has_bg = 0;
   base.mt = base.mb = base.ml = base.mr = 0;
@@ -1856,6 +2611,7 @@ int web_build(const char *html, int len, int width, web_measure_fn measure) {
   /* the body (or html, if that is where the colour was put) decides the paper */
   {
     st_t bs;
+  memset(&bs, 0, sizeof bs);   /* every field, including ones added later */
     style_resolve(body, &bs, &base);
     if (bs.has_bg) doc_bg = bs.bg & 0x00FFFFFF;
     doc_lum = color_lum(doc_bg);
