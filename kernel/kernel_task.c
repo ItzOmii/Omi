@@ -228,11 +228,17 @@ static int pick_next(int from) {
  * with the task, so they change here, before the frame is restored. */
 static void switch_to(int next, ctx_t *frame) {
   int prev = cur;
+  /* A slot released one switch ago is safe to hand out now: the frame that was
+   * using its stack has long since been switched away from. */
+  for (int i = 1; i < ntasks; i++)
+    if (tasks[i].reclaim == 2) tasks[i].reclaim = 0;
   tasks[prev].rsp = (uint64_t)(uintptr_t)frame;
   /* a task that killed itself must not come back, and a blocked one is waiting
    * for its wake-up rather than for the cpu: leave both alone */
   if (tasks[prev].state != TASK_DEAD && tasks[prev].state != TASK_BLOCKED)
     tasks[prev].state = (prev == 0) ? TASK_RUN : TASK_READY;
+  if (prev > 0 && tasks[prev].state == TASK_DEAD && tasks[prev].reclaim == 1)
+    task_release_dead(prev);
 
   tasks[next].state = TASK_RUN;
   tasks[next].switches++;
@@ -364,6 +370,10 @@ void task_kill_current(uint64_t code) {
     mm_on_exit(&tasks[cur]);       /* last thread out frees the address space */
     tasks[cur].state = TASK_DEAD;
     tasks[cur].work = code;
+    /* A thread, or a task whose parent is already gone, has no reader for its
+     * exit status: its slot is freed by the switch that leaves it. A child with a
+     * live parent keeps its slot, because wait4 reports the status from it. */
+    if (tasks[cur].is_thread || tasks[cur].parent <= 0) tasks[cur].reclaim = 1;
     /* A child's death is the event its parent may be waiting for, and there is
      * no signal to deliver it with, so the parent is woken directly. A parent
      * that was waiting on something else re-checks and sleeps again. */
@@ -381,6 +391,33 @@ void task_kill_current(uint64_t code) {
 void task_block_current(void) {
   if (cur > 0 && cur < ntasks) tasks[cur].state = TASK_BLOCKED;
   task_yield();
+}
+
+/* Give a dead task's slot back. Nothing did this before: task_alloc only ever
+ * appended, so every thread and every reaped child held its slot until reboot.
+ * Called by wait4 once the exit status has been read, and by the switch that
+ * leaves a thread's last frame - never by the dying task itself, because freeing
+ * a slot while its own stack is the one executing hands that stack to whichever
+ * task asks for one next. reclaim == 2 means "released, one switch from safe". */
+void task_release_dead(int id) {
+  if (id <= 0 || id >= ntasks) return;
+  task_t *t = &tasks[id];
+  if (t->state == TASK_RUN || t->state == TASK_READY) return;
+  /* The stack stays with the slot and is reused, so a program that makes threads
+   * in a loop does not leak a kernel stack per thread. */
+  t->state = TASK_FREE;
+  t->reclaim = 2;
+  t->mm = 0;
+  t->cr3 = 0;
+  t->ctid = 0;
+  t->fs_base = 0;
+  t->is_thread = 0;
+  t->parent = 0;
+  t->wait_obj = 0;
+  t->kill_req = 0;
+  t->sig_pending = 0;
+  t->sig_blocked = 0;
+  t->name[0] = 0;
 }
 
 void task_wake(int id) {
@@ -423,23 +460,48 @@ static void task_alloc_fail(const char *why, const char *name) {
 static task_t *task_alloc(const char *name) {
   int irq = irq_save();
   spin_lock(&task_lock);
-  if (ntasks >= TASK_MAX) {
-    spin_unlock(&task_lock); irq_restore(irq);
-    task_alloc_fail("no free slot (TASK_MAX)", name);
-    return 0;
+  /* Recycle a slot that has been given back before growing the table. Slots used
+   * to be appended only, so every thread and every reaped child held its place
+   * for the life of the machine: a program that joins two thousand threads hit
+   * the ceiling with its memory long since freed, and a boot that forks a few
+   * dozen times was quietly eating the table too. A slot released by the switch
+   * that left it (reclaim == 2) is not handed out until one more switch has
+   * happened, because until then its kernel stack may still be in use. */
+  int slot = -1;
+  for (int i = 1; i < ntasks; i++)
+    if (tasks[i].state == TASK_FREE && tasks[i].reclaim == 0) { slot = i; break; }
+  if (slot < 0) {
+    if (ntasks >= TASK_MAX) {
+      spin_unlock(&task_lock); irq_restore(irq);
+      task_alloc_fail("no free slot (TASK_MAX)", name);
+      return 0;
+    }
+    slot = ntasks;
   }
-  task_t *t = &tasks[ntasks];
-  uint8_t *mem = (uint8_t *)kmalloc(TASK_STACK);
+  task_t *t = &tasks[slot];
+  uint8_t *mem = (uint8_t *)t->stack;        /* a recycled slot keeps its stack */
   if (!mem) {
-    spin_unlock(&task_lock); irq_restore(irq);
-    task_alloc_fail("kernel stack allocation failed", name);
-    return 0;
+    mem = (uint8_t *)kmalloc(TASK_STACK);
+    if (!mem) {
+      spin_unlock(&task_lock); irq_restore(irq);
+      task_alloc_fail("kernel stack allocation failed", name);
+      return 0;
+    }
+    t->stack = mem;
   }
   uintptr_t top = ((uintptr_t)mem + TASK_STACK) & ~(uintptr_t)15;
   for (int i = 0; i < TASK_STACK; i += 8) *(uint64_t *)(mem + i) = 0;
 
-  t->stack = mem;
-  t->id = ntasks;
+  /* A recycled slot starts empty apart from its stack: the signal mask, the
+   * thread pointer and the fd table all belonged to the task that lived here,
+   * and a stale fd table would outlive its owner. */
+  {
+    uint32_t keep_stack = (uint32_t)(uintptr_t)0;
+    (void)keep_stack;
+    for (uint32_t b = 0; b < (uint32_t)sizeof *t; b++) ((uint8_t *)t)[b] = 0;
+    t->stack = mem;
+  }
+  t->id = slot;
   t->ticks = 0;
   t->switches = 0;
   t->work = 0;
@@ -462,7 +524,7 @@ static task_t *task_alloc(const char *name) {
   int i = 0;
   while (name[i] && i < 23) { t->name[i] = name[i]; i++; }
   t->name[i] = 0;
-  ntasks++;
+  if (slot == ntasks) ntasks++;
   spin_unlock(&task_lock);
   irq_restore(irq);
   return t;

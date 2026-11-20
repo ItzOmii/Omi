@@ -41,6 +41,7 @@ PROGS += comp.elf
 PROGS += vmtest.elf
 PROGS += shmtest.elf
 PROGS += sigtest.elf
+PROGS += pthreadtest.elf
 PROGS += surfbig.elf
 PROGS += unixpair.elf
 PROGS += scmtest.elf
@@ -200,6 +201,12 @@ vmtest.elf: vmtest.c
 sigtest.elf: sigtest.c
 	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping sigtest"; exit 0; }
 	musl-gcc -static -O2 -no-pie -o $@ $<
+	@echo "built $@"
+
+# Real pthreads: the Linux thread ABI an off-the-shelf program expects.
+pthreadtest.elf: pthreadtest.c
+	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping pthreadtest"; exit 0; }
+	musl-gcc -static -O2 -no-pie -pthread -o $@ $<
 	@echo "built $@"
 
 # The first program that paints its own pixels: a surface, presented whole and

@@ -342,7 +342,7 @@ userland/ominet.elf: userland/ominet.c userland/fetch.c userland/omilayout.c \
                      userland/glyphs.h userland/roots_user.o
 	$(MAKE) -C userland ominet.elf
 
-$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf userland/tlsget.elf userland/surftest.elf userland/scene.elf userland/comp.elf userland/omirender.elf userland/surfexit.elf userland/ominet.elf userland/vmtest.elf userland/shmtest.elf userland/sigtest.elf userland/surfbig.elf userland/unixpair.elf userland/scmtest.elf userland/unixname.elf userland/credtest.elf userland/formtest.elf userland/imgtest.elf userland/memtest.elf userland/sandtest.elf userland/power.elf
+$(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userland/httpget.elf userland/polltest.elf userland/spin.elf userland/pipetest.elf userland/linuxtest.elf userland/muslhello.elf userland/libmap.elf userland/dyntest.elf userland/libgreet.so userland/exectest.elf userland/exectarget.elf userland/epolltest.elf userland/memfdtest.elf userland/socktest.elf userland/tlsget.elf userland/surftest.elf userland/scene.elf userland/comp.elf userland/omirender.elf userland/surfexit.elf userland/ominet.elf userland/vmtest.elf userland/shmtest.elf userland/sigtest.elf userland/pthreadtest.elf userland/surfbig.elf userland/unixpair.elf userland/scmtest.elf userland/unixname.elf userland/credtest.elf userland/formtest.elf userland/imgtest.elf userland/memtest.elf userland/sandtest.elf userland/power.elf
 	@echo "Creating bootable ISO..."
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
@@ -389,6 +389,7 @@ $(ISO): $(KERNEL) $(USER_ELF) $(LIMINE_DIR) limine.conf userland/cat.elf userlan
 	@if [ -f userland/vmtest.elf ]; then cp userland/vmtest.elf $(ISO_ROOT)/apps/vmtest.elf; else echo "no vmtest.elf: skipping"; fi
 	@if [ -f userland/shmtest.elf ]; then cp userland/shmtest.elf $(ISO_ROOT)/apps/shmtest.elf; else echo "no shmtest.elf: skipping"; fi
 	@if [ -f userland/sigtest.elf ]; then cp userland/sigtest.elf $(ISO_ROOT)/apps/sigtest.elf; else echo "no sigtest.elf: skipping"; fi
+	@if [ -f userland/pthreadtest.elf ]; then cp userland/pthreadtest.elf $(ISO_ROOT)/apps/pthreadtest.elf; else echo "no pthreadtest.elf: skipping"; fi
 	@if [ -f userland/surfbig.elf ]; then cp userland/surfbig.elf $(ISO_ROOT)/apps/surfbig.elf; else echo "no surfbig.elf: skipping"; fi
 	@if [ -f userland/unixpair.elf ]; then cp userland/unixpair.elf $(ISO_ROOT)/apps/unixpair.elf; else echo "no unixpair.elf: skipping"; fi
 	@if [ -f userland/scmtest.elf ]; then cp userland/scmtest.elf $(ISO_ROOT)/apps/scmtest.elf; else echo "no scmtest.elf: skipping"; fi

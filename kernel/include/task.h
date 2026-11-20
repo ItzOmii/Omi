@@ -214,6 +214,13 @@ typedef struct {
    * the waiter slot inside that object so a wake must match on both sides: the
    * object alone does not prove the task is still the one that registered. */
   void    *wait_obj;
+  /* A clone with CLONE_THREAD shares its address space with the task that made
+   * it, so no wait4 will ever report its exit status: nothing reads the slot
+   * after it is dead. */
+  uint8_t  is_thread;
+  /* 1 = dead and unread, please release this slot; 2 = released by the switch
+   * that left it, and safe to hand out once one more switch has happened. */
+  uint8_t  reclaim;
   /* Bumped when a task slot is reused. Slots are never reused today (task_alloc
    * only appends), so this guards a future change rather than a live bug - see
    * docs/readiness-design.md. */
@@ -233,6 +240,10 @@ int  task_spawn(const char *name, void (*fn)(void));
 /* A thread made the way Linux's clone() makes one: the caller's saved registers,
  * the caller's next instruction, a stack of the caller's choosing, rax = 0. The
  * frame is the syscall stub's nineteen-qword image, not a ctx_t. */
+/* Give a dead task's slot back: called by wait4 once the status is read, and by
+ * the switch that leaves a thread's last frame. */
+void task_release_dead(int id);
+
 int task_spawn_clone(const char *name, mm_t *mm, const uint64_t *frame,
                      uint64_t child_rsp, uint64_t fs_base, uint64_t ctid);
 int task_spawn_user(const char *name, uint64_t entry, uint64_t user_sp,

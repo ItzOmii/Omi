@@ -1212,6 +1212,8 @@ static int vm_area_slot(mm_t *mm, uint64_t want, const char *what) {
   return -1;
 }
 
+static uint64_t vm_alloc_base(mm_t *mm, uint64_t len);
+
 static long sys_vm_alloc(uint64_t len, uint64_t prot) {
   task_t *t = task_at(task_current());
   if (!t || !t->mm) return -EINVAL;
@@ -1223,9 +1225,8 @@ static long sys_vm_alloc(uint64_t len, uint64_t prot) {
   int slot = vm_area_slot(mm, len, "mmap");
   if (slot < 0) return -ENOMEM;
 
-  if (!mm->mmap_hint) mm->mmap_hint = RING3_MMAP_BASE;
-  uint64_t base = mm->mmap_hint;
-  if (base + len > RING3_MMAP_TOP) return -ENOMEM;
+  uint64_t base = vm_alloc_base(mm, len);
+  if (!base) return -ENOMEM;
 
   uint64_t flags = PTE_P | PTE_U;
   if (prot & 2) flags |= PTE_W;
@@ -1277,6 +1278,39 @@ static int vm_overlaps(mm_t *mm, uint64_t base, uint64_t len) {
     vm_area_t *a = &mm->areas[i];
     if (!a->used) continue;
     if (base < a->base + a->len && a->base < base + len) return 1;
+  }
+  return 0;
+}
+
+/* Where a new region of len bytes goes: the bump hint first, because that is
+ * what a growing heap wants and it costs one comparison; then a first fit from
+ * the bottom of the window, because thread stacks are freed out of the middle
+ * and a pure bump allocator never comes back down for them. Without the second
+ * pass a program that makes and joins a few hundred threads walks off the top
+ * of the window with every one of its stacks already released - musl's
+ * pthread_create starts failing at the ceiling with no memory in use at all. */
+static uint64_t vm_alloc_base(mm_t *mm, uint64_t len) {
+  if (len > (RING3_MMAP_TOP - RING3_MMAP_BASE)) return 0;
+  if (!mm->mmap_hint) mm->mmap_hint = RING3_MMAP_BASE;
+  for (int pass = 0; pass < 2; pass++) {
+    uint64_t base = pass ? RING3_MMAP_BASE : mm->mmap_hint;
+    if (pass && base == mm->mmap_hint) break;   /* the first pass already did this */
+    /* Each pass over the table steps past one overlapping region, so
+     * TASK_AREAS passes is every region there can be. */
+    for (int guard = 0; guard < TASK_AREAS && vm_overlaps(mm, base, len); guard++) {
+      for (int i = 0; i < TASK_AREAS; i++) {
+        vm_area_t *a = &mm->areas[i];
+        if (!a->used) continue;
+        if (base < a->base + a->len && a->base < base + len) {
+          base = a->base + a->len + 0x1000;
+          break;
+        }
+      }
+    }
+    if (vm_overlaps(mm, base, len)) continue;
+    if (base + len > RING3_MMAP_TOP) continue;
+    mm->mmap_hint = base + len + 0x1000;        /* one guard page between regions */
+    return base;
   }
   return 0;
 }
@@ -1634,6 +1668,7 @@ static long linux_wait4(int pid, uint64_t status_u, int options, uint64_t rusage
     for (int i = 1; i < task_count(); i++) {
       task_t *c = task_at(i);
       if (!c || c->parent != me) continue;
+      if (c->is_thread) continue;        /* threads are joined, never waited for */
       mine++;
       if (pid > 0 && c->id != pid) continue;
       if (c->state == TASK_DEAD) { found = i; break; }
@@ -1653,6 +1688,7 @@ static long linux_wait4(int pid, uint64_t status_u, int options, uint64_t rusage
       }
       int id = c->id;
       c->parent = 0;                    /* reaped once, never reported twice */
+      task_release_dead(id);            /* and its slot goes back to the table */
       return id;
     }
     if (!mine) return -ECHILD_L;
@@ -1754,6 +1790,12 @@ static long sys_clone(uint64_t flags, uint64_t child_stack, uint64_t ptid,
   if (id < 0) return -EAGAIN;
 
   uint32_t tid = (uint32_t)id;
+  /* A thread shares our address space, so no wait4 will ever report it and its
+   * slot can be reclaimed as soon as it is off the cpu. */
+  if (flags & CLONE_THREAD) {
+    task_t *child = task_at(id);
+    if (child) child->is_thread = 1;
+  }
   if ((flags & CLONE_PARENT_SETTID) && ptid) user_put(ptid, &tid, 4);
   if ((flags & CLONE_CHILD_SETTID) && ctid) user_put(ctid, &tid, 4);
   return id;
@@ -3512,23 +3554,8 @@ static long linux_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t lfla
     /* The caller is taking these addresses: exactly these, no more. */
     if (vm_unmap_range(t, mm, base, len) != 0) return -ENOMEM;
   } else {
-    if (!mm->mmap_hint) mm->mmap_hint = RING3_MMAP_BASE;
-    base = mm->mmap_hint;
-    /* Skip past anything already here rather than handing out an address that a
-     * MAP_FIXED caller already owns: the overlap is growable, the loop is not. */
-    for (int guard = 0; guard < TASK_AREAS && vm_overlaps(mm, base, len); guard++) {
-      for (int i = 0; i < TASK_AREAS; i++) {
-        vm_area_t *a = &mm->areas[i];
-        if (!a->used) continue;
-        if (base < a->base + a->len && a->base < base + len) {
-          base = a->base + a->len + 0x1000;
-          break;
-        }
-      }
-    }
-    if (vm_overlaps(mm, base, len)) { if (backing_owns_ref) shfile_unref(backing); return -ENOMEM; }
-    if (base + len > RING3_MMAP_TOP) { if (backing_owns_ref) shfile_unref(backing); return -ENOMEM; }
-    mm->mmap_hint = base + len + 0x1000;   /* leave one guard page between regions */
+    base = vm_alloc_base(mm, len);   /* bump first, then fill a hole */
+    if (!base) { if (backing_owns_ref) shfile_unref(backing); return -ENOMEM; }
   }
 
   vm_area_t *a = &mm->areas[slot];

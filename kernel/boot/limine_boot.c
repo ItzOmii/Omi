@@ -576,6 +576,9 @@ void _start(void) {
   /* Signals: handlers, alternate stacks, and faults offered to a handler - the
    * three things a JIT needs before it can run at all. */
   ring3_spawn_elf("sigtest", "sigtest.elf", 0);
+  /* Threads the way a real program asks for them: musl pthread_create over
+  * clone, per-thread %fs, futex, and the join path. */
+  ring3_spawn_elf("pthreadtest", "pthreadtest.elf", 0);
   ring3_spawn_elf("surfbig", "surfbig.elf", 0);
   ring3_spawn_elf("disk",   "init.elf", 10);
   ring3_spawn_elf("unixpair", "unixpair.elf", 0);
