@@ -42,6 +42,15 @@ PROGS += vmtest.elf
 PROGS += shmtest.elf
 PROGS += sigtest.elf
 PROGS += pthreadtest.elf
+
+# C++ with threads and exceptions, which is what a browser engine is made of:
+# Zig ships libc++ and musl together, so this needs no toolchain assembly.
+ZIG ?= $(shell command -v zig || echo $(HOME)/opt/zig/zig)
+cpptest.elf: cpptest.cpp
+	@$(ZIG) version >/dev/null 2>&1 || { echo "no zig: skipping cpptest"; exit 0; }
+	$(ZIG) c++ -target x86_64-linux-musl -static -O2 -no-pie -Wl,--strip-all -o $@ $<
+	@echo "built $@"
+PROGS += cpptest.elf
 PROGS += surfbig.elf
 PROGS += unixpair.elf
 PROGS += scmtest.elf

@@ -579,6 +579,8 @@ void _start(void) {
   /* Threads the way a real program asks for them: musl pthread_create over
   * clone, per-thread %fs, futex, and the join path. */
   ring3_spawn_elf("pthreadtest", "pthreadtest.elf", 0);
+  /* And the layer above it: libc++, std::thread, exceptions. */
+  ring3_spawn_elf("cpptest", "cpptest.elf", 0);
   ring3_spawn_elf("surfbig", "surfbig.elf", 0);
   ring3_spawn_elf("disk",   "init.elf", 10);
   ring3_spawn_elf("unixpair", "unixpair.elf", 0);
