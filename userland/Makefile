@@ -51,6 +51,17 @@ cpptest.elf: cpptest.cpp
 	$(ZIG) c++ -target x86_64-linux-musl -static -O2 -no-pie -Wl,--strip-all -o $@ $<
 	@echo "built $@"
 PROGS += cpptest.elf
+
+# V8 itself, as a static library for musl. The monolith comes from a standalone
+# gn build (see userland/V8.md); if it is not there this target is skipped, so
+# the ISO still builds on a machine without a V8 checkout.
+V8_MONOLITH ?= /home/meep/v8/v8/out/musl/obj/libv8_monolith.a
+V8_INCLUDE  ?= /home/meep/v8/v8/include
+v8hello.elf: v8hello.cpp
+	@[ -f $(V8_MONOLITH) ] || { echo "no v8 monolith: skipping v8hello"; exit 0; }
+	$(ZIG) c++ -target x86_64-linux-musl -std=c++20 -static -O2 -no-pie -Wl,--strip-all -I $(V8_INCLUDE) -o $@ $< $(V8_MONOLITH) -lpthread
+	@echo "built $@"
+PROGS += v8hello.elf
 PROGS += surfbig.elf
 PROGS += unixpair.elf
 PROGS += scmtest.elf

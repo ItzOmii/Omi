@@ -581,6 +581,15 @@ void _start(void) {
   ring3_spawn_elf("pthreadtest", "pthreadtest.elf", 0);
   /* And the layer above it: libc++, std::thread, exceptions. */
   ring3_spawn_elf("cpptest", "cpptest.elf", 0);
+  /* And the engine itself, if this ISO was built with a V8 checkout. */
+  ring3_spawn_elf("v8hello", "v8hello.elf", 0);
+  /* exit() itself, and a thread handoff that catches a lost futex wake. */
+  ring3_spawn_elf("atxit", "atxit.elf", 0);
+  ring3_spawn_elf("handoff", "handoff.elf", 0);
+  /* Skia's CPU backend: shapes, a shader and a PNG encode. */
+  ring3_spawn_elf("skia", "skiahello.elf", 0);
+  /* exit() itself, with threads having existed: the smallest thing that can
+   * hang the same way v8hello does. */
   ring3_spawn_elf("surfbig", "surfbig.elf", 0);
   ring3_spawn_elf("disk",   "init.elf", 10);
   ring3_spawn_elf("unixpair", "unixpair.elf", 0);
