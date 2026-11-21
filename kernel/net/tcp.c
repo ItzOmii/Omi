@@ -59,6 +59,8 @@ typedef struct tcp_conn {
   int      used;
   uint8_t  rx[TCP_RX_MAX];
   int      rx_len;
+  int      rx_max;            /* deepest the reassembly buffer ever got */
+  uint32_t n_frame, n_dup, n_ack;
   /* Readiness callback. The backend reports state changes to whoever owns the
    * endpoint without knowing what a socket is; NULL until somebody binds. */
   void   (*cb)(void *, unsigned);
@@ -171,7 +173,16 @@ static int conn_seg(tcp_conn_t *c, uint8_t flags, const uint8_t *data, int dlen)
   put32(t + 8, c->ack);
   t[12] = 0x50;
   t[13] = flags;
-  put16(t + 14, (uint16_t)TCP_RX_MAX);
+  /* The room that is actually left, not the size of the buffer. Advertising the
+   * full 65535 while 64KB of it was already full invited the peer to send past
+   * the end; those segments were dropped and came back as duplicates (27 of them
+   * on one stylesheet), each one costing the sender a retransmit and us an ACK. */
+  {
+    int room = TCP_RX_MAX - c->rx_len;
+    if (room < 0) room = 0;
+    put16(t + 14, (uint16_t)room);
+  }
+  if (c->n_ack < 0xFFFFFFFFu) c->n_ack++;
   put16(t + 16, 0);
   put16(t + 18, 0);
   if (dlen && data) memcpy(t + 20, data, (size_t)dlen);
@@ -257,11 +268,12 @@ static void tcp_dispatch(const uint8_t *f, int n) {
   }
 
   if (payload > 0) {
-    if (seq != c->ack) { conn_seg(c, TCP_ACK, 0, 0); return; }   /* duplicate or out of order */
+    if (seq != c->ack) { c->n_dup++; conn_seg(c, TCP_ACK, 0, 0); return; }   /* duplicate or out of order */
     int room = TCP_RX_MAX - c->rx_len;
     if (payload > room) { conn_seg(c, TCP_ACK, 0, 0); return; }  /* no room: do not ACK, peer retries */
     memcpy(c->rx + c->rx_len, t + ((t[12] >> 4) * 4), (size_t)payload);
     c->rx_len += payload;
+    if (c->rx_len > c->rx_max) c->rx_max = c->rx_len;
     c->ack += (uint32_t)payload;
     conn_seg(c, TCP_ACK, 0, 0);
     conn_signal(c);              /* data is readable: wake whoever waits */
@@ -365,7 +377,9 @@ tcp_conn_t *tcp_conn_open(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t po
   memcpy(c->dip, ip, 4);
   c->dport = port;
 
-  for (int attempt = 0; attempt < 3 && !c->open; attempt++) {
+  pacer_t dial; pace_begin(&dial);
+  int attempt = 0;
+  for (; attempt < 3 && !c->open; attempt++) {
     /* A fresh 5-tuple per retry: a retried SYN on the same port is often
        dropped by the middlebox that ate the first one, and some hosts
        (neverssl among them) take seconds to answer at all. */
@@ -386,7 +400,20 @@ tcp_conn_t *tcp_conn_open(const net_cfg_t *cfg, const uint8_t ip[4], uint16_t po
     }
   }
 
-  if (!c->open) { c->used = 0; return 0; }
+  if (!c->open) {
+    char m[64]; int o = 0, k; char d[12];
+    const char *pre = "[tcp] dial FAILED ms="; while (*pre) m[o++] = *pre++;
+    uint32_t v = pace_ms(&dial); k = 0; if (!v) d[k++] = '0';
+    while (v) { d[k++] = (char)('0' + v % 10); v /= 10; }
+    while (k) m[o++] = d[--k];
+    const char *p2 = " tries="; while (*p2) m[o++] = *p2++;
+    v = (uint32_t)attempt; k = 0; if (!v) d[k++] = '0';
+    while (v) { d[k++] = (char)('0' + v % 10); v /= 10; }
+    while (k) m[o++] = d[--k];
+    m[o++] = '\n'; m[o] = 0; serial_puts(m);
+    c->used = 0; return 0;
+  }
+  (void)attempt;
 
   /* One line per connection, annotated with the slot: with several in flight
    * the log has to say which connection is which, or a mixed-up stream is
@@ -497,6 +524,9 @@ static int rx_take(tcp_conn_t *c, void *buf, int max) {
   if (n > 0) memcpy(buf, c->rx, (size_t)n);
   if (n < c->rx_len) memmove(c->rx, c->rx + n, (size_t)(c->rx_len - n));
   c->rx_len -= n;
+  /* A window that closed has to be reopened by us: the peer is waiting on a
+   * zero-window probe, and nothing else in this stack will tell it. */
+  if (n > 0 && c->open && c->used) conn_seg(c, TCP_ACK, 0, 0);
   return n;
 }
 
@@ -546,6 +576,27 @@ void tcp_conn_close(tcp_conn_t *c) {
     conn_seg(c, (uint8_t)(TCP_FIN | TCP_ACK), 0, 0);
   }
   conn_log("down", c);
+  {   /* What the transfer actually looked like: a deep buffer and few frames per
+       read means the sender was streaming; a shallow one means it was waiting on
+       us for every segment, which is a different bug with a different fix. */
+    char m[96]; int o = 0;
+    const char *pre = "[tcp] xfer acks=";
+    while (*pre) m[o++] = *pre++;
+    char d[12]; int k;
+    uint32_t v = c->n_ack; k = 0; if (!v) d[k++] = '0';
+    while (v) { d[k++] = (char)('0' + v % 10); v /= 10; }
+    while (k) m[o++] = d[--k];
+    const char *p2 = " dup="; while (*p2) m[o++] = *p2++;
+    v = c->n_dup; k = 0; if (!v) d[k++] = '0';
+    while (v) { d[k++] = (char)('0' + v % 10); v /= 10; }
+    while (k) m[o++] = d[--k];
+    const char *p3 = " rxmax="; while (*p3) m[o++] = *p3++;
+    v = (uint32_t)c->rx_max; k = 0; if (!v) d[k++] = '0';
+    while (v) { d[k++] = (char)('0' + v % 10); v /= 10; }
+    while (k) m[o++] = d[--k];
+    m[o++] = '\n'; m[o] = 0;
+    serial_puts(m);
+  }
   c->used = 0;
   c->rx_len = 0;
   c->cb = 0;                    /* the endpoint is gone: no more news */

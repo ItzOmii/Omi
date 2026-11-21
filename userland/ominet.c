@@ -288,6 +288,8 @@ static void img_resolve(const char *src, char *host, int hcap, char *path, int p
  * routinely 200 KB, and a 48 KB buffer silently cut off most of the page's CSS. */
 static unsigned char *css_buf;
 static int css_cap;
+static int first_pass;         /* lay the words out before any stylesheet or image */
+static long g_launch;            /* ticks at process start, for the load timeline */
 
 /* What was already fetched. A page names the same stylesheet more than once - a
  * theme plus an @import, or two <link> tags to one file - and layout asks for it
@@ -301,6 +303,7 @@ static struct { char url[200]; unsigned char *bytes; int len; } css_memo[CSS_MEM
 static int css_memo_n;
 
 static int provide_css(const char *href, int len, char *out, int cap) {
+  if (first_pass) return 0;      /* first pass: lay the text out without it */
   if (!href || len <= 0 || len >= 200) return 0;
   char url[200];
   int n = len < 199 ? len : 199;
@@ -352,6 +355,7 @@ static int provide_css(const char *href, int len, char *out, int cap) {
 
 static const web_image_t *provide_image(const char *src, int len) {
   if (!src || len <= 0 || len >= 118) return 0;
+  if (first_pass) return 0;   /* first pass: words, not pictures */
   char url[120];
   int n = len < 119 ? len : 119;
   memcpy(url, src, (size_t)n);
@@ -580,6 +584,8 @@ static int user_measure(int font, const char *s) {
  * content_h at 0 when there is nothing to paint. */
 const char *https_get_location(void);   /* fetch.c: the Location header, if any */
 
+static void paint(long win, int off);   /* the painter, defined below */
+
 static long load_page(void) {
   const char *why = "not tried";
   long blen = 0;
@@ -633,6 +639,26 @@ static long load_page(void) {
      * browser is broken". */
     int clipped = fetch_clipped;
     img_cache_reset();
+    /* The text goes up before the stylesheet *and the images* are asked for. On the page this
+     * browser opens with, the sheet is 121KB and worth a second and a half on a
+     * poor link, while the document carrying the words is 12KB and already in
+     * memory - so laying it out with no stylesheet, showing it, and restyling
+     * when the sheet lands turns a blank wait into a readable page. It costs one
+     * extra layout pass; the sheet is memoised, so the second pass is layout and
+     * a repaint, not another download. */
+    first_pass = 1;
+    int built = web_build(page, (int)blen, measure_w, user_measure);
+    first_pass = 0;
+    int painted_early = 0;
+    if (built == 0) {
+      content_h = web_height(); page_gen++; fields_reset();
+      int vp0 = ch - CONTENT_TOP - 4;
+      vmax = content_h > vp0 ? content_h - vp0 : 0;
+      paint(win_id, 0);
+      painted_early = 1;
+      printf("[net] t=text-painted %ldms after launch\n",
+             (sys3(SYS_TICKS, 0, 0, 0) - g_launch) * 10);
+    }
     if (web_build(page, (int)blen, measure_w, user_measure) == 0) {
       content_h = web_height(); page_gen++;
       fields_reset();
@@ -648,6 +674,13 @@ static long load_page(void) {
                clipped, full, blen, page_cap);
     } else {
       printf("[net] the engine refused the page\n");
+    }
+    if (painted_early) {
+      int vp1 = ch - CONTENT_TOP - 4;
+      vmax = content_h > vp1 ? content_h - vp1 : 0;
+      paint(win_id, 0);
+      printf("[net] t=styled-painted %ldms after launch\n",
+             (sys3(SYS_TICKS, 0, 0, 0) - g_launch) * 10);
     }
   } else if (status > 0) {
     /* A redirect with nowhere to go is the only 3xx that is an error. */
@@ -1306,6 +1339,7 @@ int main(void) {
   /* The fetch calls this while it waits, so the window keeps running mid-load. */
   fetch_pump = net_pump;
   long t_start = sys3(SYS_TICKS, 0, 0, 0);
+  g_launch = t_start;
 
   /* First frame, before anything that can fail or take time. The window exists
    * from SYS_WIN_OPEN onward, but its surface holds whatever the compositor last

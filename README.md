@@ -306,9 +306,16 @@ next year.
   list is a fixed 72 entries before it gives up and repaints the screen.
 - **A window without pixels is not a window.** Windows are discovered through their surfaces, so one
   that has opened but not yet allocated a buffer is invisible to the server.
-- **Loading, measured.** The IANA reserved-domains page - one document, one 121 KB stylesheet, one
-  SVG - took 4050 ms to first paint and takes about 2200 ms now; the name lookup inside it went from
-  3660 ms to 20-30 ms. Four things were wrong, and each was found by measuring rather than guessing.
+- **Words in 200 ms.** The IANA reserved-domains page - one 12 KB document, one 121 KB stylesheet,
+  one 34 KB SVG - puts **text on the screen 160-190 ms after launch**, and is fully styled 1.8 s in
+  when the link cooperates. It used to take 4050 ms before the first pixel, and 2400 ms after the
+  first round of work. The difference at the end is not another faster socket: the page is laid out
+  and painted **before the stylesheet and the images are asked for**, then laid out again when they
+  arrive. The words were already in memory - 12 KB of them - while the browser sat on a status strip
+  waiting for 121 KB of decoration and a logo. A reader wants the words.
+- **Loading, measured.** That page took 4050 ms to first paint and takes about 2200 ms to be fully
+  styled; the name lookup inside it went from 3660 ms to 20-30 ms. Six things were wrong, and each
+  was found by measuring rather than guessing.
   The kernel's network pump took **one frame per scheduler tick**, which caps throughput near
   60 KB/s (a 121 KB stylesheet arrived as 202 reads at ~9 ms each). The same stylesheet was fetched
   **twice**, because only images were memoised by URL. Every fetch **re-resolved the host name**, and
@@ -320,7 +327,14 @@ next year.
   reader, a mailbox for the other, the receive ring drained per pass, a reassembly buffer sized so a
   drain cannot overflow it, stylesheets cached by URL and names by host - and the browser drains its
   own event queue while a fetch is in flight, so a window changed mid-load is changed mid-load,
-  instead of sitting there at the size it was until the body lands.
+  instead of sitting there at the size it was until the body lands. Two more came out of the same
+  measurements: the receiver advertised the **size of its buffer** rather than the room left in it,
+  so a full 64 KB invited another 64 KB that had to be dropped and retransmitted (27 duplicate
+  segments on one stylesheet); and BearSSL asks for a TLS record **header** and then for its **body**,
+  and each ask was its own blocking read, so a server sending one record per segment cost two
+  scheduler ticks per 1385 bytes - 133 records and 1.6 s for that stylesheet. Reads are staged in
+  16 KB bites now, so a header and its body come out of one syscall: the same sheet moves in 100-190 ms
+  when the link is willing.
 - **Omi Net is a reader, not a browser.** HTML and a subset of CSS, no JavaScript. Text is TrueType
   through Skia (the font stack above); Greek, Cyrillic, CJK and emoji are dropped rather than drawn
   as boxes. A page body is capped at 256 KB, larger ones are parsed to the

@@ -62,6 +62,8 @@ static char *omi_strcasestr(const char *hay, const char *needle) {
 static br_ssl_client_context       cc;
 static br_x509_minimal_context     xc;
 static unsigned char               iobuf[BR_SSL_BUFSIZE_BIDI];
+static unsigned char               stage[16384];   /* socket read-ahead */
+static int                         stage_len, stage_off;
 static br_x509_trust_anchor        ta[MAX_ROOTS];
 static br_x509_decoder_context     dec[MAX_ROOTS];
 static unsigned char               dnbuf[MAX_ROOTS][DN_MAX];
@@ -150,7 +152,9 @@ static int resolve_host(const char *host, char ip[16]) {
 }
 
 static int dial(const char *addr, int port) {
+  long d0 = sys3(SYS_TICKS, 0, 0, 0);
   int fd = socket(AF_INET, SOCK_STREAM, 0);
+  long d1 = sys3(SYS_TICKS, 0, 0, 0);
   if (fd < 0) return -1;
   struct sockaddr_in sa;
   memset(&sa, 0, sizeof sa);
@@ -158,6 +162,7 @@ static int dial(const char *addr, int port) {
   sa.sin_port = htons((unsigned short)port);
   inet_pton(AF_INET, addr, &sa.sin_addr);
   if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) { close(fd); return -1; }
+  (void)d0; (void)d1;
   return fd;
 }
 
@@ -244,6 +249,7 @@ static long exchange_all(int fd, const char *req, char *out, size_t cap,
   size_t rlen = strlen(req), total = 0;
   fetch_clipped = 0;
   fetch_reads = 0;
+  stage_len = stage_off = 0;     /* a new connection is a new byte stream */
   fetch_bytes = 0;
   fetch_want = -1;
 
@@ -269,12 +275,28 @@ static long exchange_all(int fd, const char *req, char *out, size_t cap,
     } else if (st & BR_SSL_RECVREC) {
       size_t len = 0;
       unsigned char *b = br_ssl_engine_recvrec_buf(&cc.eng, &len);
-      if (fetch_pump) fetch_pump();
-      long r = read(fd, b, len);
-      fetch_reads++;
-      if (r <= 0) break;
-      fetch_bytes += r;
-      br_ssl_engine_recvrec_ack(&cc.eng, (size_t)r);
+      if (!b || !len) break;
+      if (stage_off == stage_len) {
+        /* BearSSL asks for a record header (5 bytes) and then for its body, and
+         * each ask used to be its own read that blocked until those bytes were
+         * there - so a server sending one TLS record per segment cost two
+         * scheduler ticks per 1385 bytes, and a 121KB stylesheet became 133
+         * records and 1.6 seconds of waiting for a link that could carry it in
+         * a tenth of that. Reading into a staging buffer in 16KB bites lets a
+         * header and its body come out of the same syscall. */
+        stage_off = stage_len = 0;
+        if (fetch_pump) fetch_pump();
+        long got = read(fd, stage, sizeof stage);
+        fetch_reads++;
+        if (got <= 0) break;
+        stage_len = (int)got;
+        fetch_bytes += got;
+      }
+      size_t avail = (size_t)(stage_len - stage_off);
+      size_t take = len < avail ? len : avail;
+      memcpy(b, stage + stage_off, take);
+      stage_off += (int)take;
+      br_ssl_engine_recvrec_ack(&cc.eng, take);
     } else if (st & BR_SSL_RECVAPP) {
       size_t len = 0;
       unsigned char *b = br_ssl_engine_recvapp_buf(&cc.eng, &len);
