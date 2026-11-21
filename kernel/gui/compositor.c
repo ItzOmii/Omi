@@ -6115,6 +6115,14 @@ static void keyboard_callback(int key) {
     return;
   }
 
+  /* Ctrl+M: maximise or restore the focused window. Same call the .wctl button
+   * makes, so the two cannot drift apart - and it is the only way to do it when
+   * the pointer is busy, which is the moment you actually want it. It sits above
+   * the client's claim on the keyboard because it is a window-manager key. */
+  if ((key == 'm' || key == 'M') && kb_ctrl_down()) {
+    if (fwin_focus >= 0 && fwin[fwin_focus].used) { fwin_toggle_max(fwin_focus); return; }
+  }
+
   /* keys belong to a focused ring-3 window first */
   if (winipc_key(key)) return;
   

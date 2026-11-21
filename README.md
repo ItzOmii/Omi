@@ -307,17 +307,20 @@ next year.
 - **A window without pixels is not a window.** Windows are discovered through their surfaces, so one
   that has opened but not yet allocated a buffer is invisible to the server.
 - **Loading, measured.** The IANA reserved-domains page - one document, one 121 KB stylesheet, one
-  SVG - took 4050 ms to first paint when this was last measured and takes about 2400 ms now. Three
-  things were wrong, and each was found by measuring rather than guessing: the kernel's network pump
-  took **one frame per scheduler tick**, which caps throughput near 60 KB/s (a 121 KB stylesheet
-  arrived as 202 reads at ~9 ms each), the same stylesheet was downloaded **twice** because only
-  images were memoised by URL, and every fetch **re-resolved the host name** - the resolver's retry
-  ladder is seconds long when the first query is dropped, which is how a load sat for five seconds
-  before a byte moved. The pump now drains the receive ring instead of taking one frame, the
-  reassembly buffer is sized so that one drain cannot overflow it, stylesheets are cached by URL and
-  names by host, and the browser drains its own event queue while a fetch is in flight - so a window
-  changed mid-load is changed mid-load, instead of sitting there as the size it was until the body
-  lands.
+  SVG - took 4050 ms to first paint and takes about 2200 ms now; the name lookup inside it went from
+  3660 ms to 20-30 ms. Four things were wrong, and each was found by measuring rather than guessing.
+  The kernel's network pump took **one frame per scheduler tick**, which caps throughput near
+  60 KB/s (a 121 KB stylesheet arrived as 202 reads at ~9 ms each). The same stylesheet was fetched
+  **twice**, because only images were memoised by URL. Every fetch **re-resolved the host name**, and
+  that resolver's retry ladder costs seconds when the first query is dropped. And - the one that made
+  the browser look broken rather than slow - **the pump was eating the DNS replies**: it drains the
+  NIC now, but the dispatcher only knew about TCP and dropped every UDP datagram it dequeued, so the
+  resolver lost the race for its own answer, timed out three times and reported "load failed" with
+  the reply sitting in the ring. Replies are parked in a mailbox for the resolver instead. So: one
+  reader, a mailbox for the other, the receive ring drained per pass, a reassembly buffer sized so a
+  drain cannot overflow it, stylesheets cached by URL and names by host - and the browser drains its
+  own event queue while a fetch is in flight, so a window changed mid-load is changed mid-load,
+  instead of sitting there at the size it was until the body lands.
 - **Omi Net is a reader, not a browser.** HTML and a subset of CSS, no JavaScript. Text is TrueType
   through Skia (the font stack above); Greek, Cyrillic, CJK and emoji are dropped rather than drawn
   as boxes. A page body is capped at 256 KB, larger ones are parsed to the

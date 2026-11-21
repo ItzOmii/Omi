@@ -200,12 +200,40 @@ static tcp_conn_t *find_conn(uint16_t our_port, uint16_t their_port, const uint8
 /* Every inbound TCP frame goes through here, whoever polled for it. Handing it
  * to the owning connection instead of dropping it is what makes two clients at
  * once possible. */
+/* ---- the resolver's mailbox -------------------------------------------
+   Only one reader may hold the NIC at a time, and that reader is usually the
+   pump. This function used to return immediately for anything that was not TCP,
+   so a DNS reply the pump dequeued was dropped on the floor: the resolver lost
+   the race for its own datagram, timed out, and a lookup failed with a perfectly
+   good answer sitting in the ring. Parking UDP replies here makes the pump a
+   courier instead of a competitor - one reader, one mailbox, no race. */
+static uint8_t dns_mail[1600];
+static int dns_mail_len;
+static uint8_t dns_mail_src[4];
+static volatile int dns_mail_ready;
+
 static void tcp_dispatch(const uint8_t *f, int n) {
   if (n < ETH_LEN + 40) return;
   if (get16(f + 12) != ETH_IPV4) return;
   const uint8_t *ip = f + ETH_LEN;
-  if ((ip[0] >> 4) != 4 || ip[9] != IP_PROTO_TCP) return;
+  if ((ip[0] >> 4) != 4) return;
   int ihl = (ip[0] & 0x0F) * 4;
+  if (ip[9] == IP_PROTO_UDP) {
+    if (n < ETH_LEN + ihl + 8) return;
+    const uint8_t *udp = ip + ihl;
+    if (get16(udp) == 53 && get16(udp + 2) == 5353) {   /* a resolver reply */
+      int plen = get16(udp + 4) - 8;
+      if (plen > 0 && plen <= (int)sizeof dns_mail &&
+          n >= ETH_LEN + ihl + 8 + plen) {
+        memcpy(dns_mail, udp + 8, (size_t)plen);
+        dns_mail_len = plen;
+        memcpy(dns_mail_src, ip + 12, 4);
+        dns_mail_ready = 1;
+      }
+    }
+    return;
+  }
+  if (ip[9] != IP_PROTO_TCP) return;
   const uint8_t *t = ip + ihl;
   if (n < ETH_LEN + ihl + 20) return;
   int payload = get16(ip + 2) - ihl - ((t[12] >> 4) * 4);
@@ -684,6 +712,18 @@ static int dns_resolve_once(const net_cfg_t *cfg, const char *host, uint8_t ip_o
   pace_begin(&p);
   unsigned last_send = 0;
   while (pace_ms(&p) < 700) {
+    /* Whatever the pump dequeued on our behalf first: it holds the NIC most of
+     * the time now, and a reply it parked here is as good as one we read. */
+    if (dns_mail_ready) {
+      int plen = dns_mail_len;
+      dns_mail_ready = 0;
+      if (plen > 0 && dns_parse(dns_mail, plen, id, ip_out)) {
+        extern void net_log_dns_via(const uint8_t *ip);
+        net_log_dns_via(dns_mail_src);
+        dns_cache_put(host, ip_out);
+        return 1;
+      }
+    }
     /* Re-ask everyone on the same id every 300 ms: a single UDP reply can be
      * consumed by another task polling the NIC, and a lost datagram must not
      * become a lost page. */

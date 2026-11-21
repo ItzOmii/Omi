@@ -43,9 +43,16 @@ TESTS ?= 0
 # kernel's own preemption self-test spawns it on every boot, TESTS or not, and
 # removing it turns a passing self-test into a FAILED line. TESTS=0 deletes them from the image
 # and cuts their module_path lines out of the ISO's copy of limine.conf. Anything
-# a default boot needs - init, comp, skiawin, ominet, the loader, the faces, the
-# media - is deliberately not on this list.
-TEST_APPS := cat.elf httpget.elf polltest.elf pipetest.elf linuxtest.elf \
+# a default boot needs - init, skiawin, ominet, the loader, the faces, the media -
+# is deliberately not on this list.
+#
+# comp.elf *is* on it, deliberately, and it is not a test. It is the ring-3
+# compositor demo: it takes the screen and the pointer, then draws its own frames,
+# which have a title bar and a close box and nothing else - no maximise, no
+# minimise. Whichever of it and the kernel desktop claims the screen first wins,
+# and a demo winning means the shipped image has a desktop with no window controls
+# on it. The kernel desktop always has them, so that is the one that boots.
+TEST_APPS := comp.elf cat.elf httpget.elf polltest.elf pipetest.elf linuxtest.elf \
              muslhello.elf muslthreads.elf muslstat.elf muslfork.elf cowlives.elf \
              libprobe.elf libmap.elf dyntest.elf exectest.elf exectarget.elf \
              epolltest.elf memfdtest.elf socktest.elf sandtest.elf power.elf \
