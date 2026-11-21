@@ -5232,12 +5232,32 @@ static void pt_selftest(void) {
 
 /* ------------------------------------------------------------------ setup */
 
-/* The pump is deliberately small: one frame, then a tick of sleep. It is a
- * service, so it must be cheap enough to run for ever and must never hold the
- * NIC while a connection call wants it (tcp_service handles that with rx_busy). */
+/* The pump drains the ring rather than taking one frame, and only sleeps when the
+ * ring was empty. One frame per tick was a ceiling of one segment per 10ms - about
+ * 60KB/s, which is what "loading times are still terrible" measured: a 124KB
+ * stylesheet arrived as 202 reads at ~9ms each. When frames are there the pump
+ * yields instead of sleeping, so a transfer proceeds at scheduler granularity;
+ * when they are not it still costs one wakeup per tick, so an idle machine stays
+ * idle. It must never hold the NIC while a connection call wants it, which
+ * tcp_service/tcp_pump_frame enforce with rx_busy. */
 static void netpump(void) {
+  int idle = 0;
   for (;;) {
-    tcp_service();
+    int n = tcp_pump_drain();
+    /* While frames are arriving, look again at once instead of sleeping a tick.
+     * The peer sends in response to our ACKs, so a pump that looks once per tick
+     * paces the whole transfer at one segment per tick however big the window is -
+     * that, not the link, is why 124KB took 1.6s.
+     *
+     * The rechecks matter as much as the drain: after ACKing the last frame in the
+     * ring there is nothing to read for one round trip, and the next segment lands
+     * a millisecond later. Sleeping a full tick at that point is what made a
+     * transfer larger than the socket buffers ACK-clock at 10ms a segment. Yield
+     * rather than spin - other tasks run on every pass - and only sleep once the
+     * ring has been empty for several looks. */
+    if (n > 0) { idle = 0; task_yield(); continue; }
+    if (idle++ < 8) { task_yield(); continue; }
+    idle = 0;
     task_sleep_ticks(1);
   }
 }

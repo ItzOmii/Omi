@@ -29,6 +29,7 @@
 #define SYS_WIN_CLOSE    10
 #define SYS_WIN_WAIT     12
 #define SYS_WIN_GEOM     14
+#define SYS_WIN_POLL     11   /* the non-blocking sibling of WIN_WAIT: 1 event, 0 none */
 #define SYS_SURF_CREATE  35
 #define SYS_SURF_PRESENT 36
 #define SYS_SURF_RESIZE  37
@@ -287,6 +288,18 @@ static void img_resolve(const char *src, char *host, int hcap, char *path, int p
  * routinely 200 KB, and a 48 KB buffer silently cut off most of the page's CSS. */
 static unsigned char *css_buf;
 static int css_cap;
+
+/* What was already fetched. A page names the same stylesheet more than once - a
+ * theme plus an @import, or two <link> tags to one file - and layout asks for it
+ * once per pass, so the 124KB theme below was downloaded twice and cost 3.7s of a
+ * 5.6s page. The bytes are kept, not just the length, because the second ask wants
+ * them too. Bounded: four sheets, and nothing over a quarter of a megabyte, so a
+ * pathological page cannot turn this into a cache with no ceiling. */
+#define CSS_MEMO_MAX 4
+#define CSS_MEMO_BYTES (256 * 1024)
+static struct { char url[200]; unsigned char *bytes; int len; } css_memo[CSS_MEMO_MAX];
+static int css_memo_n;
+
 static int provide_css(const char *href, int len, char *out, int cap) {
   if (!href || len <= 0 || len >= 200) return 0;
   char url[200];
@@ -304,6 +317,13 @@ static int provide_css(const char *href, int len, char *out, int cap) {
     css_cap = css_buf ? (int)want : 0;
   }
   if (!css_buf) return 0;
+  for (int i = 0; i < css_memo_n; i++) {
+    if (strcmp(css_memo[i].url, url)) continue;
+    int take = css_memo[i].len < cap - 1 ? css_memo[i].len : cap - 1;
+    memcpy(out, css_memo[i].bytes, (size_t)take);
+    printf("[net] css %s: %d bytes (cached)\n", url, take);
+    return take;
+  }
   const char *why = "not tried";
   long blen = 0;
   char ip[16] = {0};
@@ -317,6 +337,16 @@ static int provide_css(const char *href, int len, char *out, int cap) {
   int take = (int)blen < cap - 1 ? (int)blen : cap - 1;
   memcpy(out, css_buf, (size_t)take);
   printf("[net] css %s: %d bytes\n", url, take);
+  if (css_memo_n < CSS_MEMO_MAX && take > 0 && take <= CSS_MEMO_BYTES) {
+    unsigned char *keep = (unsigned char *)malloc((size_t)take);
+    if (keep) {
+      memcpy(keep, css_buf, (size_t)take);
+      snprintf(css_memo[css_memo_n].url, sizeof css_memo[0].url, "%s", url);
+      css_memo[css_memo_n].bytes = keep;
+      css_memo[css_memo_n].len = take;
+      css_memo_n++;
+    }
+  }
   return take;
 }
 
@@ -501,6 +531,36 @@ static const char *find_title(GumboNode *n, char *out, size_t cap) {
 /* 16 bytes, matching win_event_t in kernel/include/guiipc.h: kind, x, y, code. */
 typedef struct { int kind, x, y, code; } win_ev_user_t;
 
+/* True between the first byte of a load and the body being laid out. A fetch is
+ * synchronous, so for its whole duration the event loop is not running: that is
+ * the bug behind "maximise while it loads and the page stays a small box in a
+ * big window" - the resize was queued and nothing drained the queue. */
+static int g_loading;
+static int g_quit;
+
+static void do_resize(int nw, int nh);
+
+/* Called by the fetch while it is waiting for the network, so the window keeps
+ * running: a maximise, a close. Only events that cannot start another fetch are
+ * handled here - a click that navigates would re-enter the loader from inside
+ * the loader. */
+static int g_pumped;      /* events handled while a load was in flight */
+
+static void net_pump(void) {
+  for (int guard = 0; guard < 64; guard++) {
+    win_ev_user_t ev;
+    long r = sys3(SYS_WIN_POLL, win_id, (long)&ev, 0);
+    if (r != 1) { if (r < 0) g_quit = 1; return; }
+    g_pumped++;
+    if (ev.kind == WIN_EV_CLOSE) { g_quit = 1; return; }
+    if (ev.kind == WIN_EV_RESIZE)
+      do_resize((ev.code >> 16) & 0xFFFF, ev.code & 0xFFFF);
+    /* Everything else is dropped, not queued: a click that navigated would
+     * re-enter the loader from inside the loader, and the most useful thing a
+     * keystroke can do mid-load is nothing at all. */
+  }
+}
+
 /* The engine measures through this. A process has one face - 8x16 - so every
  * font index the engine asks about is answered with the same width; the engine
  * keeps its own metrics for placement. */
@@ -531,6 +591,10 @@ static long load_page(void) {
    * minutes with its keyboard dead, and looked exactly like a hang. */
   long status = -1;
   char sb[64];
+  /* From here until the body is in, the network owns this process. The pump keeps
+   * the window alive while it does, and tells do_resize not to rebuild a document
+   * that is still arriving. */
+  g_loading = 1;
   for (unsigned ti = 0; ti < sizeof PAGE_TARGETS / sizeof PAGE_TARGETS[0]; ti++) {
     if (ti) {                       /* the next host, and say so in the log */
       snprintf(cur_host, sizeof cur_host, "%s", PAGE_TARGETS[ti].host);
@@ -551,6 +615,12 @@ static long load_page(void) {
     }
     if (status > 0 && blen > 0) break;
   }
+  g_loading = 0;
+  if (g_pumped) { printf("[net] handled %d window event(s) while loading\n", g_pumped); g_pumped = 0; }
+  /* A resize during the fetch changed the measure; the body arriving now has to be
+   * laid out at the width the window actually has, not the one it had when the
+   * load started. */
+  measure_w = page_measure();
   last_status = status; last_blen = blen;
   memcpy(last_ip, ip, sizeof ip);
   status_msg[0] = 0;                  /* the strip goes back to the URL */
@@ -637,6 +707,42 @@ static int sync_geometry(void) {
   printf("[net] geometry %dx%d, content %d, vmax %d\n", cw, ch, content_h, vmax);
   return 1;
 }
+
+/* Resizing, wherever the request came from: the event loop at rest, or the pump
+ * inside a fetch. Both land here so a maximise mid-load is the same code path as
+ * one at rest.
+ *
+ * While a load is in flight `page` is being written by the fetch, so the document
+ * is deliberately not rebuilt from it: the surface is resized, the frame is
+ * repainted at the new size, and load_page lays the finished body out at the new
+ * measure when it arrives. Rebuilding from a half-written body is the other
+ * option and it is not a reflow - it is a parser pointed at a buffer that is
+ * still being appended to. */
+static void do_resize(int nw, int nh) {
+  if (nw < 80) nw = 80;
+  if (nh < 60) nh = 60;
+  if (nw == cw && nh == ch) return;
+  long r = sys3(SYS_SURF_RESIZE, win_id, nw, nh);
+  printf("[net] resize %dx%d -> %ld%s\n", nw, nh, r, g_loading ? " (loading)" : "");
+  if (r != 0) return;
+  cw = nw; ch = nh;
+  {
+    unsigned *ns = (unsigned *)malloc((size_t)cw * (size_t)ch * sizeof(unsigned));
+    if (ns) { free(shadow); shadow = ns; }
+  }
+  measure_w = page_measure();
+  scroll = 0;
+  if (!g_loading && last_blen > 0 &&
+      web_build(page, (int)last_blen, measure_w, user_measure) == 0) {
+    content_h = web_height(); page_gen++;
+    fields_reset();
+  }
+  int vp = ch - CONTENT_TOP - 4;
+  vmax = content_h > vp ? content_h - vp : 0;
+  text_glyph_pixels = 0;
+  paint(win_id, 0);
+}
+
 
 /* A field is drawn by us, not by the display list: the box comes from the engine,
  * the text in it changes every keystroke. */
@@ -1197,6 +1303,8 @@ int main(void) {
    * load is omi_face_init() at the top of main. */
   (void)font_load;
 
+  /* The fetch calls this while it waits, so the window keeps running mid-load. */
+  fetch_pump = net_pump;
   long t_start = sys3(SYS_TICKS, 0, 0, 0);
 
   /* First frame, before anything that can fail or take time. The window exists
@@ -1377,6 +1485,7 @@ int main(void) {
   if (step < 8) step = LH_BODY;
   printf("[net] scroll 0/%d (content %d, viewport %d, step %d)\n", vmax, content_h, vp, step);
   for (;;) {
+    if (g_quit) break;
     win_ev_user_t ev;
     long w = sys3(SYS_WIN_WAIT, win_id, (long)&ev, 0);
     if (w < 0) break;
@@ -1511,31 +1620,9 @@ int main(void) {
     } else if (ev.kind == WIN_EV_RESIZE) {
       /* The frame changed size. The pixels are ours, so the surface is resized
        * and the document is laid out again for the new measure - the page is
-       * still in `page`, so this is a reflow, not a reload. */
-      int nw = (ev.code >> 16) & 0xFFFF, nh = ev.code & 0xFFFF;
-      if (nw < 80) nw = 80;
-      if (nh < 60) nh = 60;
-      if (nw != cw || nh != ch) {
-        long r = sys3(SYS_SURF_RESIZE, win_id, nw, nh);
-        printf("[net] resize %dx%d -> %ld\n", nw, nh, r);
-        if (r == 0) {
-          cw = nw; ch = nh;
-          {
-            unsigned *ns = (unsigned *)malloc((size_t)cw * (size_t)ch * sizeof(unsigned));
-            if (ns) { free(shadow); shadow = ns; }
-          }
-          measure_w = page_measure();
-          scroll = 0;
-          if (last_blen > 0 && web_build(page, (int)last_blen, measure_w, user_measure) == 0) {
-            content_h = web_height(); page_gen++;
-            fields_reset();
-          }
-          int vp = ch - CONTENT_TOP - 4;
-          vmax = content_h > vp ? content_h - vp : 0;
-          text_glyph_pixels = 0;
-          paint(win_id, 0);
-        }
-      }
+       * still in `page`, so this is a reflow, not a reload. The pump inside a
+       * fetch calls the same function. */
+      do_resize((ev.code >> 16) & 0xFFFF, ev.code & 0xFFFF);
     } else if (ev.kind == WIN_EV_WHEEL) {
       /* The wheel is the pointer's scroll: one notch is one line, the same step
        * the arrow keys use, and positive is away from the user - up the page. */

@@ -40,6 +40,8 @@ void tcp_input(const uint8_t *f, int n);
 /* Drain one frame from the NIC and dispatch it. Safe to call concurrently with a
  * connection call that is inside the NIC: only one of them touches it. */
 void tcp_service(void);
+/* Empty the receive ring; returns how many frames were dispatched. */
+int  tcp_pump_drain(void);
 
 /* Drives tcp_conn_send's "-2 posted, never confirmed" and "-1 nothing posted"
  * outcomes with the card's return value injected. Test-only; called from

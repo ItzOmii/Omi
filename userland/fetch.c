@@ -104,7 +104,25 @@ static long sys3(long n, long a, long b, long c) {
 /* Name resolution is the kernel's: a process asks, the kernel answers with four
  * bytes. Falling back to a pinned address would hide a broken resolver, so a
  * failure here is a failure. */
+/* Names already looked up. A page asks for its document, its stylesheet and its
+ * images on one host, and each fetch was resolving it again - the resolver's retry
+ * ladder is seconds long when the first query is dropped, which is why a load
+ * could sit for five seconds before a byte moved. The cache is small and expires:
+ * it exists to stop asking the same question four times in one page, not to be a
+ * resolver of its own. */
+#define DNS_CACHE_MAX 8
+#define DNS_TTL_TICKS 6000        /* ~60 s at the 100 Hz tick */
+static struct { char host[128]; char ip[16]; unsigned long at; } dns_cache[DNS_CACHE_MAX];
+static int dns_cache_n;
+
 static int resolve_host(const char *host, char ip[16]) {
+  unsigned long now = (unsigned long)sys3(SYS_TICKS, 0, 0, 0);
+  for (int i = 0; i < dns_cache_n; i++) {
+    if (strcmp(dns_cache[i].host, host)) continue;
+    if (now - dns_cache[i].at > DNS_TTL_TICKS) break;
+    snprintf(ip, 16, "%s", dns_cache[i].ip);
+    return 0;
+  }
   /* The resolver answers -ENOENT until the lease has given it a server to ask,
    * and this program can be started before that. Waiting is the browser's job:
    * a client that assumes the network is up is a client that fails on the boot
@@ -122,6 +140,12 @@ static int resolve_host(const char *host, char ip[16]) {
   }
   if (r != 0) return -1;
   snprintf(ip, 16, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+  if (dns_cache_n < DNS_CACHE_MAX && strlen(host) < sizeof dns_cache[0].host) {
+    snprintf(dns_cache[dns_cache_n].host, sizeof dns_cache[0].host, "%s", host);
+    snprintf(dns_cache[dns_cache_n].ip, sizeof dns_cache[0].ip, "%s", ip);
+    dns_cache[dns_cache_n].at = (unsigned long)sys3(SYS_TICKS, 0, 0, 0);
+    dns_cache_n++;
+  }
   return 0;
 }
 
@@ -179,6 +203,7 @@ static int handshake(int fd, const char *sni, const char **why) {
     } else if (st & BR_SSL_RECVREC) {
       size_t len = 0;
       unsigned char *b = br_ssl_engine_recvrec_buf(&cc.eng, &len);
+      if (fetch_pump) fetch_pump();      /* the handshake can take 200ms; the window stays alive */
       long r = read(fd, b, len);
       if (r <= 0) { *why = "eof"; return 0; }
       br_ssl_engine_recvrec_ack(&cc.eng, (size_t)r);
@@ -199,10 +224,28 @@ static int handshake(int fd, const char *sni, const char **why) {
 int fetch_clipped;
 int https_no_reuse;
 
+/* Called while this module is waiting on the network. A fetch here is
+ * synchronous and blocking, which is fine for a program with nothing else to do
+ * and wrong for a browser: a window that cannot repaint until a body lands looks
+ * dead, and a maximise during that time is a resize nobody acts on. The caller
+ * installs something that drains its event queue; this module only has to call it
+ * where it blocks. */
+void (*fetch_pump)(void);
+
+/* Measured, not guessed: how the body arrived. Printed with the phase timings so
+ * a slow load can be told apart from a slow connection. */
+long fetch_reads, fetch_bytes;
+/* -1 when the response did not say how long it was, which is the case that ends
+ * only at EOF: the browser then waits for the server to hang up. */
+long fetch_want;
+
 static long exchange_all(int fd, const char *req, char *out, size_t cap,
                          int *keep_out) {
   size_t rlen = strlen(req), total = 0;
   fetch_clipped = 0;
+  fetch_reads = 0;
+  fetch_bytes = 0;
+  fetch_want = -1;
 
   size_t alen = 0;
   unsigned char *ab = br_ssl_engine_sendapp_buf(&cc.eng, &alen);
@@ -226,8 +269,11 @@ static long exchange_all(int fd, const char *req, char *out, size_t cap,
     } else if (st & BR_SSL_RECVREC) {
       size_t len = 0;
       unsigned char *b = br_ssl_engine_recvrec_buf(&cc.eng, &len);
+      if (fetch_pump) fetch_pump();
       long r = read(fd, b, len);
+      fetch_reads++;
       if (r <= 0) break;
+      fetch_bytes += r;
       br_ssl_engine_recvrec_ack(&cc.eng, (size_t)r);
     } else if (st & BR_SSL_RECVAPP) {
       size_t len = 0;
@@ -381,9 +427,11 @@ long https_get(const char *host, int port, const char *path,
   /* Where the seconds go, in one line: resolve, dial, TLS handshake, body. A
    * "slow" browser is not a diagnosis, and guessing at which stage is wrong
    * about as often as it is right. */
-  printf("[net] timing%s resolve=%ldms dial=%ldms tls=%ldms body=%ldms total=%ldms\n",
+  printf("[net] timing%s resolve=%ldms dial=%ldms tls=%ldms body=%ldms total=%ldms "
+         "bytes=%ld reads=%ld%s\n",
          reused ? " (reused)" : "",
-         (t1 - t0) * 10, (t2 - t1) * 10, (t3 - t2) * 10, (t4 - t3) * 10, (t4 - t0) * 10);
+         (t1 - t0) * 10, (t2 - t1) * 10, (t3 - t2) * 10, (t4 - t3) * 10, (t4 - t0) * 10,
+         fetch_bytes, fetch_reads, fetch_want < 0 ? " no-length" : "");
   if (got < 0) { *why = "exchange"; return -1; }
 
   /* Split the answer. The status is worth reporting: a 301 is a page too, and

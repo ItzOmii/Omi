@@ -23,6 +23,15 @@ extern int fetch_clipped;
  * handful per page, so a fresh connection each time is the cheaper mistake. */
 extern int https_no_reuse;
 
+/* Called while the fetch is blocked on the network, so the caller's window can
+ * keep running. Set it to something that drains your event queue; leave it null
+ * and the fetch behaves exactly as it always did. */
+extern void (*fetch_pump)(void);
+
+/* The last body's arrival, for the timing line: bytes actually read off the
+ * socket and how many read() calls it took. */
+extern long fetch_reads, fetch_bytes;
+
 long https_get(const char *host, int port, const char *path,
                char *out, size_t cap, const char **why, long *body_len,
                char *ip_used);

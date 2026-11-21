@@ -36,7 +36,16 @@ extern void serial_puts(const char *s);
 /* Eight concurrent connections is enough to prove the design and to run a
  * couple of programs at once; the receive buffer is what costs memory. */
 #define TCP_MAX_CONN 8
-#define TCP_RX_MAX   4096
+/* The advertised window, and the size of the reassembly buffer behind it.
+ *
+ * 4096 was the old value and it is what made the pump look slow: the pump now
+ * empties the receive ring in one pass, and a pass can hand a connection up to a
+ * whole ring of data (NRX * 2048 = 64KB). With a 4KB buffer every one of those
+ * extra frames was dropped for want of room, the peer retransmitted, and a 121KB
+ * stylesheet stalled at 8KB with two 5-second timeouts behind it. The buffer has to
+ * be at least as big as what one drain can deliver, or the drain is a drop. 65535
+ * is the largest window this stack can advertise without scaling. */
+#define TCP_RX_MAX   65535
 
 typedef struct tcp_conn {
   net_cfg_t cfg;
@@ -279,18 +288,35 @@ static volatile uint64_t pump_calls;
 
 /* One frame, then get out. If another task is already inside the NIC we do
  * nothing: its pump dispatches our frames for us. */
-static void tcp_pump(void) {
-  if (rx_busy) return;
+/* One frame, and whether there was one. A reader that takes a single frame per
+ * call can never do better than a segment per scheduler tick, which is where the
+ * browser's 60KB/s came from; it needs to be able to drain the ring. */
+static int tcp_pump_frame(void) {
+  if (rx_busy) return 0;
   rx_busy = 1;
   uint8_t r[1600];
   int n = e1000_poll_recv(r, sizeof r);
   if (n > 0 && n < (int)sizeof r) tcp_dispatch(r, n);
   rx_busy = 0;
+  return n > 0;
 }
+
+static void tcp_pump(void) { (void)tcp_pump_frame(); }
 
 /* The pump is a service, not a favour: it is one frame at a time, callable from
  * anywhere, and safe to call while a connection call is also inside the NIC. */
 void tcp_service(void) { tcp_pump(); pump_calls++; }
+
+/* Empty the NIC's receive ring instead of taking one frame. The service loop used
+ * to call tcp_service() once and then sleep a tick, which caps throughput at one
+ * segment per 10ms - about 60KB/s on a 1460-byte MTU, and the reason a 124KB
+ * stylesheet took 1.8s to arrive. Bounded by the ring, so it always terminates. */
+int tcp_pump_drain(void) {
+  int n = 0;
+  while (tcp_pump_frame()) n++;
+  pump_calls++;     /* one service pass, frame or no frame: that is what the counter means */
+  return n;
+}
 
 /* How many times the pump has actually been asked to work. A counter, not a
  * timestamp: "did it run" is the question, and it has to be answerable from
@@ -455,10 +481,14 @@ int tcp_conn_recv(tcp_conn_t *c, void *buf, int max, int timeout_ms) {
   pacer_t p;
   pace_begin(&p);
   while (pace_ms(&p) < (uint32_t)timeout_ms) {
-    tcp_pump();
+    /* Drain what has already arrived before giving up the CPU. Taking one frame
+     * per call and then yielding made a 124KB stylesheet 202 reads at ~9ms each:
+     * 1.8 seconds to move a file the link could carry in a tenth of that. */
+    int frames = 0;
+    while (tcp_pump_frame()) frames++;
     if (c->rx_len > 0) return rx_take(c, buf, max);
     if (c->peer_closed || !c->open) return -1;
-    pace_yield();
+    if (!frames) pace_yield();   /* nothing in the ring: let others run, look again */
   }
   return 0;
 }

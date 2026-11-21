@@ -306,9 +306,21 @@ next year.
   list is a fixed 72 entries before it gives up and repaints the screen.
 - **A window without pixels is not a window.** Windows are discovered through their surfaces, so one
   that has opened but not yet allocated a buffer is invisible to the server.
-- **Omi Net is a reader, not a browser.** HTML and a subset of CSS, no JavaScript. Text is one 8×16
-  bitmap face with Latin-1 and common typography folded to ASCII; Greek, Cyrillic, CJK and emoji are
-  dropped rather than drawn as boxes. A page body is capped at 256 KB, larger ones are parsed to the
+- **Loading, measured.** The IANA reserved-domains page - one document, one 121 KB stylesheet, one
+  SVG - took 4050 ms to first paint when this was last measured and takes about 2400 ms now. Three
+  things were wrong, and each was found by measuring rather than guessing: the kernel's network pump
+  took **one frame per scheduler tick**, which caps throughput near 60 KB/s (a 121 KB stylesheet
+  arrived as 202 reads at ~9 ms each), the same stylesheet was downloaded **twice** because only
+  images were memoised by URL, and every fetch **re-resolved the host name** - the resolver's retry
+  ladder is seconds long when the first query is dropped, which is how a load sat for five seconds
+  before a byte moved. The pump now drains the receive ring instead of taking one frame, the
+  reassembly buffer is sized so that one drain cannot overflow it, stylesheets are cached by URL and
+  names by host, and the browser drains its own event queue while a fetch is in flight - so a window
+  changed mid-load is changed mid-load, instead of sitting there as the size it was until the body
+  lands.
+- **Omi Net is a reader, not a browser.** HTML and a subset of CSS, no JavaScript. Text is TrueType
+  through Skia (the font stack above); Greek, Cyrillic, CJK and emoji are dropped rather than drawn
+  as boxes. A page body is capped at 256 KB, larger ones are parsed to the
   cap and the status line says so. (That cap was 64 KB for a while because a 128 KB page killed the
   parser: a 128-slot per-space area table ran out and Gumbo wrote through a NULL. The table is 512
   now and a 130 KB page reads whole.)
