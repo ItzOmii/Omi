@@ -1,7 +1,10 @@
 # Skia on Omi
 
 Skia's CPU backend builds against the musl target and rasterises correctly on
-Omi. The proof is a pixel-and-hash comparison, not "it linked": `userland/skiahello.cpp`
+Omi, and the browser now draws through it: `userland/omiskia.cpp` replaces Omi
+Net's stb_truetype glyph masks with Skia's text, so a glyph and the box it sits in
+come out of the same rasteriser. The rest of this file is the evidence, in the
+order it was established. The proof is a pixel-and-hash comparison, not "it linked": `userland/skiahello.cpp`
 draws a gradient, an antialiased rounded rect and a stroked star, reads the
 pixels back, checks the two colours it expects, then PNG-encodes the surface.
 
@@ -70,6 +73,32 @@ This Skia is post-refactor and the old recipes do not compile:
   `SkShaders::LinearGradient(pts, SkGradient(SkGradient::Colors(span, mode), SkGradient::Interpolation{}))`
   (colours are `SkColor4f`, not `SkColor`)
 - `SkCanvas::flush()` is gone; a raster surface draws immediately.
+
+## In the browser
+
+`omiskia.cpp` implements omittf.h's contract - `omi_face_init`, `omi_face_line_h`,
+`omi_face_ascent`, `omi_face_measure`, `omi_face_draw` - on top of Skia, and
+omittf.h routes the four functions to it when built with `-DOMI_SKIA_TEXT`. The
+faces still arrive through `SYS_FONT`, so there is no fontconfig and no directory
+scan; the window buffer is wrapped once per target as `BGRA_8888` / `kOpaque`,
+because ominet writes `0x00RRGGBB` words and the screen has no alpha to respect;
+`y` is the baseline, exactly as stb's `yoff` was; the caller's clip rectangle is
+applied around the draw; and synthetic bold is the same glyph twice, one pixel
+apart, so the advances the layout already measured stay true.
+
+Because the browser is now C linked against a C++ library, `ominet.elf` is built
+by zig cc for the C files and linked with zig c++, and the target is skipped
+rather than downgraded when there is no Skia build - an ISO from this tree is
+never half a browser.
+
+Measured on the IANA reserved-domains page, same page and same window rectangle:
+the stb build's text is hard-edged and blocky, the Skia build's is antialiased
+with FreeType's hinting. Line heights are 19/33/19/16/22 px and the ascent is 13,
+from FreeType metrics rather than the mask path's arithmetic. The verification
+boot after the change is unchanged at 398 checks, 0 FAIL.
+
+The cost is size: the browser is 69 MB of statically linked library, so the
+default ISO goes from 77 MB to 144 MB.
 
 ## Text
 

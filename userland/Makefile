@@ -151,10 +151,34 @@ $(GUMBO_LIB): $(GUMBO_SRCS)
 
 # omilayout.c is the layout engine that used to run in the kernel, moved here
 # rather than rewritten: one copy in the tree, and its CSS subset comes with it.
-ominet.elf: ominet.c omifont.c omifont.h imgdec.c imgdec.h stbimg.c ../kernel/include/buildstamp.h fetch.c fetch.h omitext.h glyphs.h omilayout.c omilayout.h roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB)
-	@command -v musl-gcc >/dev/null || { echo "musl-gcc missing: skipping ominet"; exit 0; }
-	@musl-gcc -O2 -static -no-pie $(BEARSSL_INC) -Ishim -I$(GUMBO_USR)/src -I../kernel/include/stb -o $@ \
-	  ominet.c omifont.c imgdec.c stbimg.c fetch.c omilayout.c roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB) \
+#
+# The browser's text is drawn by Skia (omiskia.cpp) instead of stb_truetype, so
+# the whole window - glyphs and the boxes around them - comes out of one
+# rasteriser. That makes this a C program linked as C++: the C files are compiled
+# with zig cc and the link is zig c++, because libskia.a is C++ and musl-gcc
+# cannot pull in its runtime. If there is no Skia build the target is skipped
+# rather than silently falling back, so an ISO built here is never half a
+# browser; build Skia with userland/Skia.md's instructions.
+SKIA_DIR ?= $(HOME)/skia
+SKIA_LIBS := $(SKIA_DIR)/out/musl/libskia.a $(SKIA_DIR)/out/musl/libfreetype2.a \
+             $(SKIA_DIR)/out/musl/libpng.a $(SKIA_DIR)/out/musl/libzlib.a \
+             $(SKIA_DIR)/out/musl/libjpeg.a $(SKIA_DIR)/out/musl/libskcms.a \
+             $(SKIA_DIR)/out/musl/libwuffs.a
+OMINET_C := ominet.c omifont.c imgdec.c stbimg.c fetch.c omilayout.c
+ominet.elf: $(OMINET_C) omifont.h imgdec.h stbimg.c ../kernel/include/buildstamp.h fetch.h omitext.h glyphs.h omilayout.h omiskia.cpp omiskia.h roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB)
+	@[ -f $(SKIA_DIR)/out/musl/libskia.a ] || { echo "no skia build: skipping ominet"; exit 0; }
+	@$(ZIG) version >/dev/null 2>&1 || { echo "no zig: skipping ominet"; exit 0; }
+	@mkdir -p build/ominet
+	@for f in $(OMINET_C); do \
+	  $(ZIG) cc -target x86_64-linux-musl -O2 -static -no-pie -DOMI_SKIA_TEXT \
+	    -D_GNU_SOURCE -Wno-error=implicit-function-declaration \
+	    $(BEARSSL_INC) -Ishim -I$(GUMBO_USR)/src -I../kernel/include/stb \
+	    -c -o build/ominet/$${f%.c}.o $$f || exit 1; \
+	done
+	@$(ZIG) c++ -target x86_64-linux-musl -std=c++20 -O2 -static -fno-exceptions -fno-rtti \
+	  -I $(SKIA_DIR) -c -o build/ominet/omiskia.o omiskia.cpp || exit 1
+	@$(ZIG) c++ -target x86_64-linux-musl -static -no-pie -o $@ build/ominet/*.o \
+	  roots_user.o $(BEARSSL_LIB) $(GUMBO_LIB) $(SKIA_LIBS) -lpthread -lm \
 	  && echo "built $@ ($$(stat -c%s $@) bytes)"
 
 tlsget.elf: tlsget.c roots_user.o $(BEARSSL_LIB)

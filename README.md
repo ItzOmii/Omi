@@ -232,14 +232,15 @@ with specific properties. Here is the honest ledger, in the order the work has t
    the violation. One filtered door is the point - it is also why a musl-linked binary cannot be run
    under a filter today.
 4. **A font stack beyond one 8×16 bitmap face**, and text shaping. Done for both clients: the shell
-   draws with real TrueType, and Omi Net now does too — `SYS_FONT` copies the boot module faces into
-   the process, `userland/omittf.h` rasterises them in ring 3 through stb_truetype, and the wrapper
-   and the painter share one 26.6 accumulation so a line cannot be measured at one width and drawn at
-   another. Glyphs are placed on real advances with kerning from the font's own table, at five sizes
-   (12 / 13 / 14 / 17 / 26), with 8-bit coverage blended through the same rasteriser the rest of the
-   page uses. What shaping still means here is the rest of it: no ligatures, no marks, no bidirectional
-   or complex-script reordering, and no OpenType feature selection — HarfBuzz's real work. Ranges
-   outside Latin-1 draw a box.
+   draws with real TrueType, and Omi Net now does too. There are two paths and both still build:
+   `SYS_FONT` copies the boot module faces into the process and `userland/omittf.h` rasterises them
+   with stb_truetype into 8-bit masks, **or** — what the ISO ships — `userland/omiskia.cpp` hands the
+   same bytes to FreeType inside Skia, so a run of text comes out of the same rasteriser as the boxes
+   and rules around it instead of a second one that only drew glyphs. Five sizes (12 / 13 / 14 / 17 /
+   26), real advances and kerning, and `measure()` and `draw()` are the same `SkFont`, so a line still
+   cannot be wrapped for a width the painter then exceeds. What shaping means beyond that is still
+   missing: no ligatures, no marks, no bidirectional or complex-script reordering, no OpenType feature
+   selection — HarfBuzz's real work. Ranges outside Latin-1 draw a box.
 5. **A GPU or a fast software raster.** Every pixel is composed on the CPU today. The raster is now
    measured rather than described: `make BEN=1` builds a wall-clock frame benchmark (40 frames, timed
    from outside the VM, because the guest cannot time itself honestly). On this machine, virtualised
@@ -344,8 +345,9 @@ proving itself first. `DEV=1` goes further and spawns only the browser.
 The difference is not only what boots, it is what is *in* the image. `TESTS=0` deletes the test
 programs from `iso_root/apps` and cuts their `module_path` lines out of the ISO's copy of
 `limine.conf`, driven by one list in the `Makefile` (`TEST_APPS`), so a shipped ISO cannot run a
-suite even by hand — there is nothing there to run. Measured: **77 MB and five binaries** (init,
-comp, skiawin, ominet, spin) against **233 MB and forty-eight** for the verification image. `spin.elf`
+suite even by hand — there is nothing there to run. Measured: **144 MB and five binaries** (init,
+comp, skiawin, ominet, spin) against **300 MB and forty-eight** for the verification image. The browser accounts for most of the
+difference: Omi Net links Skia, so the browser alone is 69 MB of statically linked library. `spin.elf`
 survives the cut because the kernel's own preemption self-test spawns it on every boot, tests or
 not; removing it turned a passing line into `[pre] FAILED`.
 

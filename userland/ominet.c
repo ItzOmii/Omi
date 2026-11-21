@@ -1164,7 +1164,7 @@ int main(void) {
     omi_faces_ready = 1;
     web_font_metrics(omi_face_line_h, omi_face_ascent);
     printf("[net] faces: display %d bytes, mono %d bytes\n",
-           (int)(omi_font_bytes[0] ? 1 : 0), (int)(omi_font_bytes[1] ? 1 : 0));
+           omi_face_have(0), omi_face_have(1));
     printf("[net] line heights %d/%d/%d/%d/%d ascent %d\n",
            omi_face_line_h(0), omi_face_line_h(1), omi_face_line_h(2),
            omi_face_line_h(3), omi_face_line_h(4), omi_face_ascent(0));

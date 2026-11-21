@@ -22,9 +22,35 @@
  * keeps the bitmap path - a browser with no outlines should still be readable.
  *
  * Include after omitext.h: this depends on its blend_px and on CW/CH.
+ *
+ * Build with -DOMI_SKIA_TEXT to route the same four functions into omiskia.cpp
+ * instead, which draws the runs with Skia and FreeType.
  */
 #ifndef OMI_TTF_H
 #define OMI_TTF_H
+
+#ifdef OMI_SKIA_TEXT
+/* Skia's text backend instead of stb's masks: the same five faces and the same
+ * contract, so nothing above this line changes. The reason is in omiskia.cpp -
+ * glyphs now come out of the same rasteriser as the boxes they sit in, with
+ * FreeType doing the hinting, instead of a second graphics stack that only drew
+ * text. omi_face_init() still returns 0 when it cannot load a face, so a caller
+ * that keeps a bitmap fallback still has one. */
+#include "omiskia.h"
+/* Functions rather than macros, because ominet.c hands two of these to the layout
+ * engine as function pointers (web_font_metrics) and a macro would not expand
+ * there. CW, CH, pix and the clip rectangle all come from omitext.h, which the
+ * includer has already pulled in. */
+static int omi_face_init(void) { return omiskia_init(); }
+static int omi_face_line_h(int font) { return omiskia_line_h(font); }
+static int omi_face_ascent(int font) { return omiskia_ascent(font); }
+static int omi_face_measure(int font, const char *s) { return omiskia_measure(font, s); }
+static int omi_face_widest(int font, const char *s) { return omiskia_measure(font, s); }
+static int omi_face_have(int face) { return omiskia_face_loaded(face); }
+static void omi_face_draw(int font, int x, int y, const char *s, unsigned c) {
+  omiskia_draw(pix, CW, CH, font, x, y, s, c, clip_on, clip_x0, clip_y0, clip_x1, clip_y1);
+}
+#else
 
 #include <stdlib.h>
 #include <string.h>
@@ -101,6 +127,8 @@ static int omi_face_init(void) {
   omi_init_ok = omi_have[0];        /* display face is what body text uses */
   return omi_init_ok;
 }
+
+int omi_face_have(int face) { return (face == 0 || face == 1) ? omi_have[face] : 0; }
 
 static float omi_scale(int face, int px) {
   return stbtt_ScaleForPixelHeight(&omi_fi[face], (float)px);
@@ -250,4 +278,6 @@ void omi_face_draw(int font, int x, int y, const char *s, unsigned c) {
 /* The widest line, for a caller that has to centre something. */
 int omi_face_widest(int font, const char *s) { return omi_face_measure(font, s); }
 
-#endif
+#endif /* OMI_SKIA_TEXT */
+
+#endif /* OMI_TTF_H */
